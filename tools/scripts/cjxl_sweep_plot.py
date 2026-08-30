@@ -53,6 +53,7 @@ TIMING_NUMERIC_FIELDS = (
     "dataset_cpu_ms_p90",
 )
 SIZE_NUMERIC_FIELDS = (
+    "dataset_input_bytes",
     "dataset_encoded_bytes",
     "bits_per_pixel",
     "png_to_jxl_ratio",
@@ -849,6 +850,7 @@ const allParametersLabel = chartData.axis === "distance" ?
 
 parameterLabel.textContent = axisTitle;
 parameterControl.add(new Option(allParametersLabel, "all"));
+parameterControl.add(new Option("Average", "average"));
 for (let index = 0; index < chartData.parameterLabels.length; index++) {
   parameterControl.add(new Option(chartData.parameterLabels[index], String(index)));
 }
@@ -879,6 +881,38 @@ function paretoFrontier(points, minimizeSize) {
   )).sort((first, second) => first.duration - second.duration);
 }
 
+function mean(values) {
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function aggregateCells(cells, field, p10Field, p90Field) {
+  const totalInputBytes = cells.reduce(
+    (sum, cell) => sum + cell.dataset_input_bytes, 0
+  );
+  const totalEncodedBytes = cells.reduce(
+    (sum, cell) => sum + cell.dataset_encoded_bytes, 0
+  );
+  const parameterNoun = chartData.axis === "distance" ?
+    "distances" : "quality values";
+  return {
+    complete: true,
+    parameterText: `Average across ${cells.length} ${parameterNoun}`,
+    [field]: mean(cells.map(cell => cell[field])),
+    [p10Field]: mean(cells.map(cell => cell[p10Field])),
+    [p90Field]: mean(cells.map(cell => cell[p90Field])),
+    bits_per_pixel: mean(cells.map(cell => cell.bits_per_pixel)),
+    dataset_input_bytes: totalInputBytes,
+    dataset_encoded_bytes: mean(
+      cells.map(cell => cell.dataset_encoded_bytes)
+    ),
+    png_to_jxl_ratio: totalInputBytes / totalEncodedBytes,
+    sample_count: cells.reduce((sum, cell) => sum + cell.sample_count, 0),
+    size_sample_count: cells.reduce(
+      (sum, cell) => sum + cell.size_sample_count, 0
+    )
+  };
+}
+
 function buildPlot() {
   const selectedClock = clockControl.value;
   const useBpp = sizeMetricControl.value === "bpp";
@@ -891,10 +925,14 @@ function buildPlot() {
   const field = `dataset_${selectedClock}_ms_median`;
   const p10Field = `dataset_${selectedClock}_ms_p10`;
   const p90Field = `dataset_${selectedClock}_ms_p90`;
-  const statisticLabel = "Median";
+  const averageParameters = parameterControl.value === "average";
+  const statisticLabel = averageParameters ? "Average median" : "Median";
+  const uncertaintyLabel = averageParameters ? "Average p10–p90" : "p10–p90";
+  const scopeLabel = averageParameters ? "Scope" : axisTitle;
   const clockLabel = selectedClock === "wall" ? "wall" : "CPU";
-  const selectedParameterIndex = parameterControl.value === "all" ?
-    null : Number(parameterControl.value);
+  const selectedParameterIndex =
+    parameterControl.value === "all" || averageParameters ?
+      null : Number(parameterControl.value);
   if (dynamicTitle) {
     const titleText = useBpp ?
       "libjxl Encoding Time vs. BPP" :
@@ -917,7 +955,12 @@ function buildPlot() {
     const custom = [];
     const errorPlus = [];
     const errorMinus = [];
-    for (let parameterIndex = 0; parameterIndex < chartData.parameters.length; parameterIndex++) {
+    const cells = [];
+    for (
+      let parameterIndex = 0;
+      parameterIndex < chartData.parameters.length;
+      parameterIndex++
+    ) {
       if (selectedParameterIndex !== null && parameterIndex !== selectedParameterIndex) {
         continue;
       }
@@ -925,6 +968,13 @@ function buildPlot() {
       if (!cell || !cell.complete || cell[field] === null || cell[sizeField] === null) {
         continue;
       }
+      cells.push(cell);
+    }
+    const plotCells = averageParameters ?
+      (cells.length === chartData.parameters.length ?
+        [aggregateCells(cells, field, p10Field, p90Field)] : []) :
+      cells;
+    for (const cell of plotCells) {
       const duration = cell[field] / 1000;
       const p10 = cell[p10Field] / 1000;
       const p90 = cell[p90Field] / 1000;
@@ -958,7 +1008,8 @@ function buildPlot() {
     const color = colors[colorIndex];
     traces.push({
       type: "scatter",
-      mode: selectedParameterIndex === null ? "lines+markers" : "markers",
+      mode: selectedParameterIndex === null && !averageParameters ?
+        "lines+markers" : "markers",
       name: `Effort ${effort}`,
       x: x,
       y: y,
@@ -981,9 +1032,10 @@ function buildPlot() {
         width: 3
       },
       hovertemplate: `<b>Effort ${effort}</b><br>` +
-        `${axisTitle}: %{customdata[0]}<br>` +
+        `${scopeLabel}: %{customdata[0]}<br>` +
         `${statisticLabel} ${clockLabel} time: %{customdata[2]:.3f} s<br>` +
-        "p10–p90: %{customdata[3]:.3f}–%{customdata[4]:.3f} s<br>" +
+        `${uncertaintyLabel}: ` +
+        "%{customdata[3]:.3f}–%{customdata[4]:.3f} s<br>" +
         "Bits per pixel: %{customdata[5]:.4f}<br>" +
         "Encoded dataset: %{customdata[6]:,.0f} bytes<br>" +
         "PNG-to-JXL ratio: %{customdata[7]:.3f}×<br>" +
@@ -992,7 +1044,7 @@ function buildPlot() {
     });
   }
 
-  if (selectedParameterIndex !== null && allPoints.length) {
+  if ((selectedParameterIndex !== null || averageParameters) && allPoints.length) {
     const effortCurve = [...allPoints].sort(
       (first, second) => first.effort - second.effort
     );
@@ -1026,7 +1078,7 @@ function buildPlot() {
       },
       hovertemplate: "<b>Pareto frontier</b><br>" +
         "Effort: %{customdata[1]}<br>" +
-        `${axisTitle}: %{customdata[0]}<br>` +
+        `${scopeLabel}: %{customdata[0]}<br>` +
         `${statisticLabel} ${clockLabel} time: %{customdata[2]:.3f} s<br>` +
         `${sizeHoverLine}<extra></extra>`
     });
