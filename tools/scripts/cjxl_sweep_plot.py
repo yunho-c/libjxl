@@ -679,7 +679,7 @@ buildPlot();
 
 
 def generate_duration_bpp_html(chart_data, title, plotly_js=PLOTLY_CDN):
-    title_text = title or "cjxl encoding duration versus bits per pixel"
+    title_text = title or "libjxl Encoding Time vs. BPP"
     escaped_title = html.escape(title_text)
     data_json = json.dumps(
         chart_data.as_json_value(), separators=(",", ":"), sort_keys=True
@@ -766,6 +766,7 @@ def generate_duration_bpp_html(chart_data, title, plotly_js=PLOTLY_CDN):
       font-weight: 500;
     }
     .checkbox input { margin: 0; }
+    .duration-title { text-align: center; }
     .duration-controls { margin-top: 18px; }
     #chart {
       width: 100%;
@@ -785,7 +786,8 @@ def generate_duration_bpp_html(chart_data, title, plotly_js=PLOTLY_CDN):
 </head>
 <body>
 <main>
-  <h1>__TITLE__</h1>
+  <h1 class="duration-title">__TITLE__</h1>
+  <div id="chart" role="img" aria-label="Encoding Time versus bits per pixel"></div>
   <div class="controls duration-controls" aria-label="Chart controls">
     <label><span id="parameter-label"></span>
       <select id="parameter-filter"></select>
@@ -811,7 +813,6 @@ def generate_duration_bpp_html(chart_data, title, plotly_js=PLOTLY_CDN):
       Show Pareto frontier
     </label>
   </div>
-  <div id="chart" role="img" aria-label="Encoding duration versus bits per pixel"></div>
   <div id="status" aria-live="polite"></div>
 </main>
 <script>
@@ -1009,14 +1010,14 @@ function buildPlot() {
     },
     hovermode: "closest",
     xaxis: {
-      title: {text: `${statisticLabel} ${clockLabel} time per dataset pass (seconds)`},
+      title: {text: `Encoding time (seconds)`},
       type: scaleControl.value,
       gridcolor: resolvedTheme.grid,
       zerolinecolor: resolvedTheme.grid,
       automargin: true
     },
     yaxis: {
-      title: {text: "Compressed size (bits per pixel, lower is smaller)"},
+      title: {text: "Bits per pixel (lower is better)"},
       gridcolor: resolvedTheme.grid,
       zerolinecolor: resolvedTheme.grid,
       automargin: true
@@ -1024,7 +1025,7 @@ function buildPlot() {
     legend: compact ? {
       orientation: "h",
       x: 0,
-      y: -0.38,
+      y: -0.52,
       xanchor: "left",
       yanchor: "top",
       font: {size: 11}
@@ -1044,7 +1045,6 @@ function buildPlot() {
   };
   Plotly.react(chart, traces, layout, config);
   const statusParts = [
-    `${chartData.completeCells}/${chartData.totalCells} complete cells`,
     `${chartData.imageCount} images`,
     `${chartData.expectedRepetitions} dataset passes`
   ];
@@ -1054,10 +1054,7 @@ function buildPlot() {
       `${allPoints.length} effort points`
     );
   }
-  statusParts.push(
-    `${statisticLabel} ${clockLabel} time`,
-    `${frontier.length} Pareto-optimal points`
-  );
+  statusParts.push(`${frontier.length} Pareto-optimal points`);
   status.textContent = statusParts.join(" · ");
 }
 
