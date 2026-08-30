@@ -4,11 +4,13 @@
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
-"""Run reproducible cjxl quality/distance versus effort timing sweeps.
+"""Run reproducible cjxl quality/distance versus effort sweeps.
 
 The raw output is append-only JSON Lines with one record per cjxl invocation.
 The summary is a chart-ready CSV with one row per parameter/effort cell and
-statistics computed from complete dataset passes.
+statistics computed from complete dataset passes. Separate resumable size
+probes add encoded bytes, bits per pixel, and PNG-to-JXL ratios without adding
+output-file I/O to the timed measurements.
 
 Example:
 
@@ -21,7 +23,10 @@ Example:
 
 Runs are resumable when invoked again with the same output directory and
 configuration. Use the summarize subcommand to regenerate summary.csv from
-metadata.json and raw.jsonl.
+metadata.json, raw.jsonl, and optional sizes.jsonl. To enrich an existing run:
+
+  python3 tools/scripts/cjxl_sweep.py sizes \
+      --input build-samply/sweeps/kodak-distance-effort
 """
 
 import argparse
@@ -47,6 +52,7 @@ import time
 
 SCHEMA_VERSION = 1
 RAW_FILENAME = "raw.jsonl"
+SIZE_RAW_FILENAME = "sizes.jsonl"
 METADATA_FILENAME = "metadata.json"
 SUMMARY_FILENAME = "summary.csv"
 RESERVED_CJXL_OPTIONS = (
@@ -98,6 +104,27 @@ class Job:
             self.value.text,
             self.effort,
             self.repetition,
+            self.image.relative_path,
+        )
+
+    @property
+    def cell_id(self):
+        return "%s=%s|effort=%d" % (self.axis, self.value.text, self.effort)
+
+
+@dataclasses.dataclass(frozen=True)
+class SizeJob:
+    axis: str
+    value: SweepValue
+    effort: int
+    image: InputImage
+
+    @property
+    def size_id(self):
+        return "%s=%s|effort=%d|image=%s" % (
+            self.axis,
+            self.value.text,
+            self.effort,
             self.image.relative_path,
         )
 
@@ -291,6 +318,47 @@ def metadata_image(image):
     }
 
 
+def load_metadata_images(config):
+    dataset_root = pathlib.Path(config["dataset_root"]).resolve()
+    images = []
+    for stored in config["images"]:
+        relative_path = stored["path"]
+        path = (dataset_root / relative_path).resolve()
+        try:
+            path.relative_to(dataset_root)
+        except ValueError as error:
+            raise SweepError(
+                "Stored input escapes the dataset root: %s" % relative_path
+            ) from error
+        if not path.is_file():
+            raise SweepError("Stored input no longer exists: %s" % path)
+        width, height = read_png_dimensions(path)
+        size_bytes = path.stat().st_size
+        digest = sha256_file(path)
+        if (
+            width != stored["width"]
+            or height != stored["height"]
+            or size_bytes != stored["size_bytes"]
+            or digest != stored["sha256"]
+        ):
+            raise SweepError("Stored input has changed since the timing run: %s" % path)
+        images.append(
+            InputImage(
+                path=path,
+                relative_path=relative_path,
+                size_bytes=size_bytes,
+                sha256=digest,
+                width=width,
+                height=height,
+            )
+        )
+    if not images:
+        raise SweepError("Stored timing run has no input images")
+    if dataset_manifest_hash(images) != config["dataset_manifest_sha256"]:
+        raise SweepError("Stored dataset manifest does not match its input metadata")
+    return images
+
+
 def create_metadata(args, cjxl, dataset_root, images, values, efforts, repo_root):
     run_config = {
         "axis": args.axis,
@@ -419,6 +487,22 @@ def build_schedule(axis, values, efforts, repetitions, images, seed):
     return jobs
 
 
+def build_size_schedule(axis, values, efforts, images, seed):
+    """Interleaves one size probe for each image and parameter cell."""
+    rng = random.Random(seed ^ 0x51AE5)
+    shuffled_images = list(images)
+    rng.shuffle(shuffled_images)
+    jobs = []
+    cells = [(value, effort) for value in values for effort in efforts]
+    for image in shuffled_images:
+        image_cells = list(cells)
+        rng.shuffle(image_cells)
+        jobs.extend(
+            SizeJob(axis, value, effort, image) for value, effort in image_cells
+        )
+    return jobs
+
+
 def build_cjxl_command(cjxl, job, num_threads, extra_args):
     return (
         [
@@ -431,6 +515,20 @@ def build_cjxl_command(cjxl, job, num_threads, extra_args):
         ]
         + list(extra_args)
         + [str(job.image.path)]
+    )
+
+
+def build_size_cjxl_command(cjxl, job, num_threads, extra_args, output_path):
+    return (
+        [
+            str(cjxl),
+            "--quiet",
+            "--%s=%s" % (job.axis, job.value.text),
+            "--effort=%d" % job.effort,
+            "--num_threads=%d" % num_threads,
+        ]
+        + list(extra_args)
+        + [str(job.image.path), str(output_path)]
     )
 
 
@@ -508,11 +606,71 @@ def execute_job(cjxl, job, num_threads, extra_args, timeout):
     }
 
 
+def execute_size_job(
+    cjxl, job, num_threads, extra_args, timeout, temporary_output_path
+):
+    try:
+        temporary_output_path.unlink()
+    except FileNotFoundError:
+        pass
+    command = build_size_cjxl_command(
+        cjxl, job, num_threads, extra_args, temporary_output_path
+    )
+    result = execute_command(command, timeout)
+    encoded_size_bytes = None
+    if result["status"] == "ok":
+        try:
+            encoded_size_bytes = temporary_output_path.stat().st_size
+        except OSError as error:
+            result["status"] = "error"
+            result["stderr"] = "cjxl produced no readable output: %s" % error
+        else:
+            if encoded_size_bytes <= 0:
+                result["status"] = "error"
+                result["stderr"] = "cjxl produced an empty output"
+                encoded_size_bytes = None
+    try:
+        temporary_output_path.unlink()
+    except FileNotFoundError:
+        pass
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "size_id": job.size_id,
+        "cell_id": job.cell_id,
+        "axis": job.axis,
+        "parameter_text": job.value.text,
+        "parameter_value": job.value.number,
+        "effort": job.effort,
+        "image": job.image.relative_path,
+        "input_size_bytes": job.image.size_bytes,
+        "width": job.image.width,
+        "height": job.image.height,
+        "pixels": job.image.pixels,
+        "encoded_size_bytes": encoded_size_bytes,
+        "command": command[:-1] + ["<temporary-output.jxl>"],
+        "probe_wall_time_ns": result.pop("wall_time_ns"),
+        "probe_user_cpu_time_ns": result.pop("user_cpu_time_ns"),
+        "probe_system_cpu_time_ns": result.pop("system_cpu_time_ns"),
+        **result,
+    }
+
+
 def completed_sample_ids(records):
     return {
         record.get("sample_id")
         for record in records
         if record.get("status") == "ok" and record.get("sample_id")
+    }
+
+
+def completed_size_ids(records):
+    return {
+        record.get("size_id")
+        for record in records
+        if record.get("status") == "ok"
+        and record.get("size_id")
+        and isinstance(record.get("encoded_size_bytes"), int)
+        and record["encoded_size_bytes"] > 0
     }
 
 
@@ -560,14 +718,25 @@ def statistics_fields(prefix, values):
     }
 
 
-def build_summary_rows(metadata, records):
+def build_summary_rows(metadata, records, size_records=None):
     config = metadata["run_config"]
     expected_images = {image["path"] for image in config["images"]}
     expected_per_cell = len(expected_images) * config["repetitions"]
+    expected_size_per_cell = len(expected_images)
+    dataset_input_bytes = sum(image["size_bytes"] for image in config["images"])
     latest_success = {}
     for record in records:
         if record.get("status") == "ok" and record.get("sample_id"):
             latest_success[record["sample_id"]] = record
+    latest_sizes = {}
+    for record in size_records or []:
+        if (
+            record.get("status") == "ok"
+            and record.get("size_id")
+            and isinstance(record.get("encoded_size_bytes"), int)
+            and record["encoded_size_bytes"] > 0
+        ):
+            latest_sizes[record["size_id"]] = record
 
     rows = []
     for value in config["values"]:
@@ -616,6 +785,21 @@ def build_summary_rows(metadata, records):
                 cpu / (pixels / 1_000_000) for _, cpu, pixels in complete_passes
             ]
             dataset_pixels = sum(image["pixels"] for image in config["images"])
+            cell_size_records = [
+                record
+                for record in latest_sizes.values()
+                if record.get("axis") == config["axis"]
+                and record.get("parameter_text") == value["text"]
+                and record.get("effort") == effort
+                and record.get("image") in expected_images
+            ]
+            size_images = {record["image"] for record in cell_size_records}
+            size_complete = size_images == expected_images
+            dataset_encoded_bytes = (
+                sum(record["encoded_size_bytes"] for record in cell_size_records)
+                if size_complete
+                else None
+            )
             row = {
                 "schema_version": SCHEMA_VERSION,
                 "axis": config["axis"],
@@ -631,6 +815,22 @@ def build_summary_rows(metadata, records):
                 "expected_repetitions": config["repetitions"],
                 "image_count": len(expected_images),
                 "dataset_pixels": dataset_pixels,
+                "size_sample_count": len(size_images),
+                "expected_size_sample_count": expected_size_per_cell,
+                "missing_size_sample_count": expected_size_per_cell - len(size_images),
+                "size_complete": size_complete,
+                "dataset_input_bytes": dataset_input_bytes,
+                "dataset_encoded_bytes": dataset_encoded_bytes,
+                "bits_per_pixel": (
+                    dataset_encoded_bytes * 8 / dataset_pixels
+                    if dataset_encoded_bytes is not None and dataset_pixels
+                    else None
+                ),
+                "png_to_jxl_ratio": (
+                    dataset_input_bytes / dataset_encoded_bytes
+                    if dataset_encoded_bytes
+                    else None
+                ),
             }
             row.update(statistics_fields("dataset_wall_ms", wall_values))
             row.update(statistics_fields("dataset_cpu_ms", cpu_values))
@@ -656,6 +856,14 @@ def csv_fieldnames():
         "expected_repetitions",
         "image_count",
         "dataset_pixels",
+        "size_sample_count",
+        "expected_size_sample_count",
+        "missing_size_sample_count",
+        "size_complete",
+        "dataset_input_bytes",
+        "dataset_encoded_bytes",
+        "bits_per_pixel",
+        "png_to_jxl_ratio",
     ]
     statistics_names = []
     for prefix in (
@@ -683,6 +891,9 @@ def write_summary_csv(path, rows):
             for row in rows:
                 serialized = dict(row)
                 serialized["complete"] = "true" if row["complete"] else "false"
+                serialized["size_complete"] = (
+                    "true" if row["size_complete"] else "false"
+                )
                 writer.writerow(serialized)
             output.flush()
             os.fsync(output.fileno())
@@ -698,9 +909,11 @@ def write_summary_csv(path, rows):
 def summarize_directory(output_directory, summary_path=None):
     metadata_path = output_directory / METADATA_FILENAME
     raw_path = output_directory / RAW_FILENAME
+    size_raw_path = output_directory / SIZE_RAW_FILENAME
     metadata = load_json(metadata_path)
     records = read_jsonl(raw_path)
-    rows = build_summary_rows(metadata, records)
+    size_records = read_jsonl(size_raw_path)
+    rows = build_summary_rows(metadata, records, size_records)
     if summary_path is None:
         summary_path = output_directory / SUMMARY_FILENAME
     write_summary_csv(summary_path, rows)
@@ -849,6 +1062,117 @@ def run_sweep(args):
     return 1 if failure else 0
 
 
+def run_size_probes(args):
+    if args.timeout is not None and args.timeout <= 0:
+        raise SweepError("--timeout must be positive")
+    if args.max_jobs < 0:
+        raise SweepError("--max-jobs must be non-negative")
+    if args.progress_every < 0:
+        raise SweepError("--progress-every must be non-negative")
+
+    output_directory = pathlib.Path(args.input).resolve()
+    metadata_path = output_directory / METADATA_FILENAME
+    raw_path = output_directory / RAW_FILENAME
+    size_raw_path = output_directory / SIZE_RAW_FILENAME
+    if not metadata_path.is_file() or not raw_path.is_file():
+        raise SweepError(
+            "%s must contain both %s and %s"
+            % (output_directory, METADATA_FILENAME, RAW_FILENAME)
+        )
+    metadata = load_json(metadata_path)
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        raise SweepError("Unsupported metadata schema in %s" % metadata_path)
+    config = metadata["run_config"]
+    cjxl = pathlib.Path(args.cjxl or config["cjxl_path"]).resolve()
+    if not cjxl.is_file() or not os.access(cjxl, os.X_OK):
+        raise SweepError("cjxl is not an executable file: %s" % cjxl)
+    if sha256_file(cjxl) != config["cjxl_sha256"]:
+        raise SweepError(
+            "Size probes must use the exact cjxl binary from the timing run"
+        )
+
+    images = load_metadata_images(config)
+    values = [SweepValue(value["text"], value["number"]) for value in config["values"]]
+    efforts = list(config["efforts"])
+    extra_args = list(config["extra_cjxl_args"])
+    validate_extra_args(extra_args)
+    jobs = build_size_schedule(config["axis"], values, efforts, images, config["seed"])
+    records = read_jsonl(size_raw_path)
+    completed = completed_size_ids(records)
+    pending = [job for job in jobs if job.size_id not in completed]
+    if args.max_jobs:
+        pending = pending[: args.max_jobs]
+
+    print(
+        "Size probes: %d total, %d already complete, %d pending now"
+        % (len(jobs), len(completed), len(pending))
+    )
+    if pending:
+        existing_wall = [
+            record["probe_wall_time_ns"] / 1_000_000_000
+            for record in records
+            if record.get("status") == "ok" and record.get("probe_wall_time_ns")
+        ]
+        if existing_wall:
+            estimate = statistics.median(existing_wall) * len(pending)
+            print(
+                "Estimated pending runtime from existing probes: %s"
+                % format_duration(estimate)
+            )
+
+    if args.dry_run:
+        for job in pending[:5]:
+            command = build_size_cjxl_command(
+                cjxl,
+                job,
+                config["num_threads"],
+                extra_args,
+                pathlib.Path("<temporary-output.jxl>"),
+            )
+            print("  " + " ".join(str(argument) for argument in command))
+        if len(pending) > 5:
+            print("  ...")
+        return 0
+
+    failure = False
+    recent_wall = []
+    with tempfile.TemporaryDirectory(prefix="cjxl-size-probes-") as temporary:
+        temporary_output_path = pathlib.Path(temporary) / "probe.jxl"
+        for index, job in enumerate(pending, 1):
+            record = execute_size_job(
+                cjxl,
+                job,
+                config["num_threads"],
+                extra_args,
+                args.timeout,
+                temporary_output_path,
+            )
+            append_jsonl(size_raw_path, record)
+            recent_wall.append(record["probe_wall_time_ns"] / 1_000_000_000)
+            recent_wall = recent_wall[-25:]
+            if args.progress_every and (
+                index == 1 or index == len(pending) or index % args.progress_every == 0
+            ):
+                remaining = len(pending) - index
+                estimate = statistics.median(recent_wall) * remaining
+                print(
+                    "[%d/%d] %s (%s remaining)"
+                    % (index, len(pending), job.size_id, format_duration(estimate))
+                )
+            if record["status"] != "ok":
+                failure = True
+                print(
+                    "cjxl size probe failed for %s: %s"
+                    % (job.size_id, record["stderr"].strip()),
+                    file=sys.stderr,
+                )
+                if not args.keep_going:
+                    break
+
+    summarize_directory(output_directory)
+    return 1 if failure else 0
+
+
 def add_run_arguments(parser):
     parser.add_argument("--cjxl", required=True, help="Path to the cjxl executable.")
     parser.add_argument(
@@ -926,11 +1250,48 @@ def add_run_arguments(parser):
     )
 
 
+def add_size_arguments(parser):
+    parser.add_argument(
+        "--input", required=True, help="Existing sweep output directory."
+    )
+    parser.add_argument(
+        "--cjxl",
+        help="Relocated cjxl executable; its hash must match the timing binary.",
+    )
+    parser.add_argument("--timeout", type=float, help="Per-cjxl timeout in seconds.")
+    parser.add_argument(
+        "--max-jobs",
+        type=int,
+        default=0,
+        help="Limit new size probes; 0 means no limit.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        help="Print progress every N probes; 0 disables it.",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="Continue after failed size probes.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and print pending probes without writing files.",
+    )
+
+
 def create_argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     run_parser = subparsers.add_parser("run", help="Run or resume a parameter sweep.")
     add_run_arguments(run_parser)
+    size_parser = subparsers.add_parser(
+        "sizes", help="Run or resume untimed encoded-size probes."
+    )
+    add_size_arguments(size_parser)
     summarize_parser = subparsers.add_parser(
         "summarize", help="Regenerate chart-ready CSV from raw results."
     )
@@ -949,6 +1310,8 @@ def main(argv=None):
     try:
         if args.command == "run":
             return run_sweep(args)
+        if args.command == "sizes":
+            return run_size_probes(args)
         output_directory = pathlib.Path(args.input).resolve()
         summary_path = pathlib.Path(args.output).resolve() if args.output else None
         summarize_directory(output_directory, summary_path)
