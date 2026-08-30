@@ -811,11 +811,11 @@ def generate_duration_bpp_html(chart_data, title, plotly_js=PLOTLY_CDN):
       </select>
     </label>
     <label class="checkbox">
-      <input id="uncertainty" type="checkbox" checked>
+      <input id="uncertainty" type="checkbox">
       Show p10–p90
     </label>
     <label class="checkbox">
-      <input id="frontier" type="checkbox" checked>
+      <input id="frontier" type="checkbox">
       Show Pareto frontier
     </label>
   </div>
@@ -1084,13 +1084,6 @@ function buildPlot() {
     `${chartData.imageCount} images`,
     `${chartData.expectedRepetitions} dataset passes`
   ];
-  if (selectedParameterIndex !== null) {
-    statusParts.push(
-      `${axisTitle} ${chartData.parameterLabels[selectedParameterIndex]}`,
-      `${allPoints.length} effort points`
-    );
-  }
-  statusParts.push(`${frontier.length} Pareto-optimal points`);
   status.textContent = statusParts.join(" · ");
 }
 
