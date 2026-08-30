@@ -314,7 +314,7 @@ def plotly_script_tag(plotly_js):
 
 def replace_template_markers(template, replacements):
     return re.sub(
-        r"__(TITLE|PLOTLY_SCRIPT|CHART_DATA)__",
+        r"__(TITLE|PLOTLY_SCRIPT|CHART_DATA|DYNAMIC_TITLE)__",
         lambda match: replacements[match.group(1)],
         template,
     )
@@ -798,6 +798,12 @@ def generate_duration_bpp_html(chart_data, title, plotly_js=PLOTLY_CDN):
         <option value="cpu">CPU time</option>
       </select>
     </label>
+    <label>Metric
+      <select id="size-metric">
+        <option value="bpp">Bits per pixel</option>
+        <option value="png-ratio">Compression ratio</option>
+      </select>
+    </label>
     <label>Duration scale
       <select id="scale">
         <option value="linear">Linear</option>
@@ -822,10 +828,13 @@ const chart = document.getElementById("chart");
 const parameterControl = document.getElementById("parameter-filter");
 const parameterLabel = document.getElementById("parameter-label");
 const clockControl = document.getElementById("clock");
+const sizeMetricControl = document.getElementById("size-metric");
 const scaleControl = document.getElementById("scale");
 const uncertaintyControl = document.getElementById("uncertainty");
 const frontierControl = document.getElementById("frontier");
 const status = document.getElementById("status");
+const titleElement = document.querySelector(".duration-title");
+const dynamicTitle = __DYNAMIC_TITLE__;
 const axisTitle = chartData.axis[0].toUpperCase() + chartData.axis.slice(1);
 const colors = [
   "#440154", "#482878", "#3e4989", "#31688e", "#26828e",
@@ -854,16 +863,31 @@ function theme() {
   };
 }
 
-function paretoFrontier(points) {
+function paretoFrontier(points, minimizeSize) {
   return points.filter((candidate, candidateIndex) => !points.some(
-    (other, otherIndex) => otherIndex !== candidateIndex &&
-      other.duration <= candidate.duration && other.bpp <= candidate.bpp &&
-      (other.duration < candidate.duration || other.bpp < candidate.bpp)
+    (other, otherIndex) => {
+      if (otherIndex === candidateIndex) {
+        return false;
+      }
+      const noWorseSize = minimizeSize ?
+        other.size <= candidate.size : other.size >= candidate.size;
+      const betterSize = minimizeSize ?
+        other.size < candidate.size : other.size > candidate.size;
+      return other.duration <= candidate.duration && noWorseSize &&
+        (other.duration < candidate.duration || betterSize);
+    }
   )).sort((first, second) => first.duration - second.duration);
 }
 
 function buildPlot() {
   const selectedClock = clockControl.value;
+  const useBpp = sizeMetricControl.value === "bpp";
+  const sizeField = useBpp ? "bits_per_pixel" : "png_to_jxl_ratio";
+  const sizeAxisTitle = useBpp ?
+    "Bits per pixel (lower is better)" :
+    "Compression ratio (PNG/JXL, higher is better)";
+  const sizeHoverLine = useBpp ?
+    "Bits per pixel: %{y:.4f}" : "PNG/JXL ratio: %{y:.3f}×";
   const field = `dataset_${selectedClock}_ms_median`;
   const p10Field = `dataset_${selectedClock}_ms_p10`;
   const p90Field = `dataset_${selectedClock}_ms_p90`;
@@ -871,6 +895,17 @@ function buildPlot() {
   const clockLabel = selectedClock === "wall" ? "wall" : "CPU";
   const selectedParameterIndex = parameterControl.value === "all" ?
     null : Number(parameterControl.value);
+  if (dynamicTitle) {
+    const titleText = useBpp ?
+      "libjxl Encoding Time vs. BPP" :
+      "libjxl Encoding Time vs. Compression Ratio";
+    titleElement.textContent = titleText;
+    document.title = titleText;
+  }
+  chart.setAttribute(
+    "aria-label",
+    `Encoding time versus ${useBpp ? "bits per pixel" : "PNG/JXL ratio"}`
+  );
   const traces = [];
   const allPoints = [];
   const paletteDenominator = Math.max(1, chartData.efforts.length - 1);
@@ -887,7 +922,7 @@ function buildPlot() {
         continue;
       }
       const cell = chartData.cells[effortIndex][parameterIndex];
-      if (!cell || !cell.complete || cell[field] === null || cell.bits_per_pixel === null) {
+      if (!cell || !cell.complete || cell[field] === null || cell[sizeField] === null) {
         continue;
       }
       const duration = cell[field] / 1000;
@@ -906,13 +941,13 @@ function buildPlot() {
         cell.size_sample_count
       ];
       x.push(duration);
-      y.push(cell.bits_per_pixel);
+      y.push(cell[sizeField]);
       custom.push(details);
       errorPlus.push(Math.max(0, p90 - duration));
       errorMinus.push(Math.max(0, duration - p10));
       allPoints.push({
         duration: duration,
-        bpp: cell.bits_per_pixel,
+        size: cell[sizeField],
         effort: effort,
         custom: details
       });
@@ -968,19 +1003,19 @@ function buildPlot() {
       showlegend: false,
       hoverinfo: "skip",
       x: effortCurve.map(point => point.duration),
-      y: effortCurve.map(point => point.bpp),
+      y: effortCurve.map(point => point.size),
       line: {color: theme().muted, width: 1.5}
     });
   }
 
-  const frontier = paretoFrontier(allPoints);
+  const frontier = paretoFrontier(allPoints, useBpp);
   if (frontierControl.checked && frontier.length) {
     traces.push({
       type: "scatter",
       mode: "lines+markers",
       name: "Pareto frontier",
       x: frontier.map(point => point.duration),
-      y: frontier.map(point => point.bpp),
+      y: frontier.map(point => point.size),
       customdata: frontier.map(point => point.custom),
       line: {color: theme().foreground, width: 2.5, dash: "dot"},
       marker: {
@@ -993,7 +1028,7 @@ function buildPlot() {
         "Effort: %{customdata[1]}<br>" +
         `${axisTitle}: %{customdata[0]}<br>` +
         `${statisticLabel} ${clockLabel} time: %{customdata[2]:.3f} s<br>` +
-        "Bits per pixel: %{customdata[5]:.4f}<extra></extra>"
+        `${sizeHoverLine}<extra></extra>`
     });
   }
 
@@ -1017,7 +1052,7 @@ function buildPlot() {
       automargin: true
     },
     yaxis: {
-      title: {text: "Bits per pixel (lower is better)"},
+      title: {text: sizeAxisTitle},
       gridcolor: resolvedTheme.grid,
       zerolinecolor: resolvedTheme.grid,
       automargin: true
@@ -1036,7 +1071,8 @@ function buildPlot() {
       xanchor: "left",
       yanchor: "top"
     },
-    uirevision: `cjxl-duration-bpp-${field}-${scaleControl.value}-${parameterControl.value}`
+    uirevision: `cjxl-duration-bpp-${field}-${sizeMetricControl.value}-` +
+      `${scaleControl.value}-${parameterControl.value}`
   };
   const config = {
     responsive: true,
@@ -1061,6 +1097,7 @@ function buildPlot() {
 for (const control of [
   parameterControl,
   clockControl,
+  sizeMetricControl,
   scaleControl,
   uncertaintyControl,
   frontierControl
@@ -1085,6 +1122,7 @@ buildPlot();
         "TITLE": escaped_title,
         "PLOTLY_SCRIPT": script_tag,
         "CHART_DATA": data_json,
+        "DYNAMIC_TITLE": "true" if title is None else "false",
     }
     return replace_template_markers(template, replacements)
 
