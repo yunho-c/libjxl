@@ -282,13 +282,7 @@ def render_figure(
     if suffix not in OUTPUT_SUFFIXES:
         raise PlotError("Output must be SVG, PDF, or PNG")
 
-    summary = plot_data["summary"]
-    mean_cpu_ms = (
-        summary["mean_cpu_ms"] if scope == "full" else summary["mean_encoder_cpu_ms"]
-    )
-    scope_label = "full command" if scope == "full" else "encoder only"
-    figure_title = title or "cjxl sampled CPU by stage"
-    figure_height = max(3.2, 1.35 + 0.34 * len(stages))
+    figure_height = max(3.0, 0.75 + 0.34 * len(stages))
     narrow = width_inches < 5.5
     label_size = 7.5 if narrow else 8.5
 
@@ -307,30 +301,15 @@ def render_figure(
     with matplotlib.rc_context(rc):
         figure, axis = pyplot.subplots(figsize=(width_inches, figure_height))
 
-        figure.suptitle(
-            figure_title,
-            x=0.08,
-            y=0.985,
-            ha="left",
-            va="top",
-            fontsize=11 if narrow else 12,
-            fontweight="bold",
-            color="#202020",
-        )
-        figure.text(
-            0.08,
-            0.942,
-            (
-                "%s · %d captures\n%s ms mean sampled CPU per capture"
-                if narrow
-                else "%s · %d captures · %s ms mean sampled CPU per capture"
+        if title:
+            axis.set_title(
+                title,
+                loc="left",
+                fontsize=9,
+                fontweight="bold",
+                pad=8,
+                color="#202020",
             )
-            % (scope_label, summary["capture_count"], _format_ms(mean_cpu_ms)),
-            ha="left",
-            va="top",
-            fontsize=8,
-            color="#666666",
-        )
 
         aggregate_total = sum(stage["aggregate_ms"] for stage in stages)
         y_positions = list(range(len(stages)))
@@ -348,7 +327,7 @@ def render_figure(
             axis.text(
                 1.025,
                 y_position,
-                "%s ms · %.1f%%" % (_format_ms(stage["mean_ms"]), share),
+                "%s ms (%.1f%%)" % (_format_ms(stage["mean_ms"]), share),
                 transform=axis.get_yaxis_transform(),
                 ha="left",
                 va="center",
@@ -365,7 +344,7 @@ def render_figure(
         )
         axis.invert_yaxis()
         axis.set_xlim(0, maximum)
-        axis.set_xlabel("Mean sampled CPU per capture (ms)", labelpad=7)
+        axis.set_xlabel("Mean sampled CPU (ms)", labelpad=7)
         axis.grid(
             axis="x",
             color="#E5E5E5",
@@ -379,47 +358,11 @@ def render_figure(
         axis.spines["left"].set_visible(False)
         axis.spines["bottom"].set_color("#777777")
 
-        footer_context = "%d samples · %.2f%% symbols · %s attribution" % (
-            summary["sample_count"],
-            summary["resolved_leaf_percent"],
-            plot_data["delta_attribution"],
-        )
-        if narrow:
-            figure.text(
-                0.08,
-                0.012,
-                "Sampled thread CPU attribution, not instrumented wall time.\n"
-                + footer_context,
-                ha="left",
-                va="bottom",
-                fontsize=6.2,
-                linespacing=1.25,
-                color="#666666",
-            )
-        else:
-            figure.text(
-                0.08,
-                0.018,
-                "Sampled thread CPU attribution, not instrumented wall time.",
-                ha="left",
-                va="bottom",
-                fontsize=6.8,
-                color="#666666",
-            )
-            figure.text(
-                0.92,
-                0.018,
-                footer_context,
-                ha="right",
-                va="bottom",
-                fontsize=6.8,
-                color="#777777",
-            )
         figure.subplots_adjust(
             left=0.38,
             right=0.77 if narrow else 0.82,
-            top=0.80 if narrow else 0.84,
-            bottom=0.20 if narrow else 0.16,
+            top=0.91 if title else 0.98,
+            bottom=0.15 if narrow else 0.13,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(
@@ -458,7 +401,7 @@ def parse_args(argv):
         default="encoder",
         help="show encoder-only work or the full command (default: encoder)",
     )
-    parser.add_argument("--title", help="figure title")
+    parser.add_argument("--title", help="optional figure title (omitted by default)")
     parser.add_argument(
         "--width",
         type=float,
