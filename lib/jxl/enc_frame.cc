@@ -2210,6 +2210,10 @@ JXL_NOINLINE Status EncodeFrameStreaming(
         cparams, frame_info, metadata, frame_data, jpeg_data.get(), x0, y0,
         xsize, ysize, cms, pool, frame_header, *enc_modular, *enc_state,
         &group_codes, aux_out));
+    EncoderStageProfilePhaseTimer assembly_phase(
+        EncoderProfilePhase::kFramingAndAssembly);
+    EncoderStageProfileWorkTimer assembly_work(
+        EncoderProfileWork::kOutputAssemblyAndCopying);
     JXL_ENSURE(enc_state->special_frames.empty());
     if (i == 0) {
       BitWriter writer{memory_manager};
@@ -2265,16 +2269,32 @@ JXL_NOINLINE Status EncodeFrameStreaming(
     }
   }
   if (frame_header.encoding == FrameEncoding::kVarDCT) {
-    JXL_ASSIGN_OR_RETURN(
-        std::unique_ptr<BitWriter> writer,
-        OutputAcGlobal(*enc_state, frame_header.ToFrameDimensions(), aux_out));
-    JXL_RETURN_IF_ERROR(writer->Shrink());
-    if (streaming) {
-      JXL_RETURN_IF_ERROR(write_group_section(std::move(*writer).TakeBytes()));
-    } else {
-      global_group_codes[1 + dc_group_order.size()] = std::move(writer);
+    std::unique_ptr<BitWriter> writer;
+    {
+      EncoderStageProfilePhaseTimer emission_phase(
+          EncoderProfilePhase::kModelAndTokenEmission);
+      JXL_ASSIGN_OR_RETURN(
+          writer,
+          OutputAcGlobal(*enc_state, frame_header.ToFrameDimensions(), aux_out));
+    }
+    {
+      EncoderStageProfilePhaseTimer assembly_phase(
+          EncoderProfilePhase::kFramingAndAssembly);
+      EncoderStageProfileWorkTimer assembly_work(
+          EncoderProfileWork::kOutputAssemblyAndCopying);
+      JXL_RETURN_IF_ERROR(writer->Shrink());
+      if (streaming) {
+        JXL_RETURN_IF_ERROR(
+            write_group_section(std::move(*writer).TakeBytes()));
+      } else {
+        global_group_codes[1 + dc_group_order.size()] = std::move(writer);
+      }
     }
   } else {
+    EncoderStageProfilePhaseTimer assembly_phase(
+        EncoderProfilePhase::kFramingAndAssembly);
+    EncoderStageProfileWorkTimer assembly_work(
+        EncoderProfileWork::kOutputAssemblyAndCopying);
     if (streaming) {
       JXL_RETURN_IF_ERROR(write_group_section(PaddedBytes{memory_manager}));
     } else {
@@ -2282,6 +2302,10 @@ JXL_NOINLINE Status EncodeFrameStreaming(
           jxl::make_unique<BitWriter>(memory_manager);
     }
   }
+  EncoderStageProfilePhaseTimer final_assembly_phase(
+      EncoderProfilePhase::kFramingAndAssembly);
+  EncoderStageProfileWorkTimer final_assembly_work(
+      EncoderProfileWork::kOutputAssemblyAndCopying);
   if (streaming_output) {
     JXL_ENSURE(group_sizes.size() == permutation.size());
     size_t end_pos = output_processor->CurrentPosition();
