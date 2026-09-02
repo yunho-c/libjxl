@@ -25,8 +25,16 @@
 
 namespace jxl {
 
+#if JPEGXL_ENABLE_STAGE_PROFILER
+struct EncoderStageProfileSink;
+#endif
+
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct CompressParams {
+#if JPEGXL_ENABLE_STAGE_PROFILER
+  // Benchmark-only and unavailable in ordinary builds.
+  EncoderStageProfileSink* stage_profile = nullptr;
+#endif
   float butteraugli_distance = 1.0f;
 
   // explicit distances for extra channels (defaults to butteraugli_distance

@@ -34,6 +34,7 @@
 #include "lib/jxl/enc_huffman.h"
 #include "lib/jxl/enc_lz77.h"
 #include "lib/jxl/enc_params.h"
+#include "lib/jxl/enc_stage_profile.h"
 #include "lib/jxl/fields.h"
 #include "lib/jxl/memory_manager_internal.h"
 #include "lib/jxl/modular/options.h"
@@ -713,6 +714,8 @@ Status EntropyEncodingData::ChooseUintConfigs(
     JxlMemoryManager* memory_manager, const HistogramParams& params,
     const std::vector<std::vector<Token>>& tokens,
     std::vector<Histogram>& clustered_histograms) {
+  EncoderStageProfileWorkTimer profile_work(
+      EncoderProfileWork::kHybridUintSelection);
   // Set sane default `log_alpha_size`.
   if (use_prefix_code) {
     log_alpha_size = PREFIX_MAX_BITS;
@@ -928,9 +931,13 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
   if (builder.size() > 1) {
     if (!ans_fuzzer_friendly_) {
       std::vector<uint32_t> histogram_symbols;
-      JXL_RETURN_IF_ERROR(ClusterHistograms(params, builder, kClustersLimit,
-                                            &clustered_histograms,
-                                            &histogram_symbols));
+      {
+        EncoderStageProfileWorkTimer profile_work(
+            EncoderProfileWork::kHistogramClustering);
+        JXL_RETURN_IF_ERROR(ClusterHistograms(params, builder, kClustersLimit,
+                                              &clustered_histograms,
+                                              &histogram_symbols));
+      }
       for (size_t c = 0; c < builder.size(); ++c) {
         context_map[context_offset + c] =
             static_cast<uint8_t>(histogram_symbols[c]);
@@ -950,6 +957,8 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
       }
     }
     if (writer != nullptr) {
+      EncoderStageProfileWorkTimer profile_work(
+          EncoderProfileWork::kHistogramSerialization);
       JXL_RETURN_IF_ERROR(EncodeContextMap(
           context_map, clustered_histograms.size(), writer, layer, aux_out));
     }
@@ -967,23 +976,31 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
   JXL_RETURN_IF_ERROR(
       ChooseUintConfigs(memory_manager, params, tokens, clustered_histograms));
 
+  EncoderStageProfileAddCount(
+      EncoderProfileCount::kHistogramCount,
+      static_cast<uint64_t>(clustered_histograms.size() - prev_histograms));
+
   SizeWriter size_writer;  // Used if writer == nullptr to estimate costs.
   size_t cost = use_prefix_code ? 1 : 3;
 
-  if (writer) writer->Write(1, TO_JXL_BOOL(use_prefix_code));
-  if (writer == nullptr) {
-    EncodeUintConfigs(uint_config, &size_writer, log_alpha_size);
-  } else {
-    if (!use_prefix_code) writer->Write(2, log_alpha_size - 5);
-    EncodeUintConfigs(uint_config, writer, log_alpha_size);
-  }
-  if (use_prefix_code) {
-    for (const auto& histo : clustered_histograms) {
-      size_t alphabet_size = std::max<size_t>(1, histo.alphabet_size());
-      if (writer) {
-        StoreVarLenUint16(alphabet_size - 1, writer);
-      } else {
-        StoreVarLenUint16(alphabet_size - 1, &size_writer);
+  {
+    EncoderStageProfileWorkTimer profile_work(
+        EncoderProfileWork::kHistogramSerialization);
+    if (writer) writer->Write(1, TO_JXL_BOOL(use_prefix_code));
+    if (writer == nullptr) {
+      EncodeUintConfigs(uint_config, &size_writer, log_alpha_size);
+    } else {
+      if (!use_prefix_code) writer->Write(2, log_alpha_size - 5);
+      EncodeUintConfigs(uint_config, writer, log_alpha_size);
+    }
+    if (use_prefix_code) {
+      for (const auto& histo : clustered_histograms) {
+        size_t alphabet_size = std::max<size_t>(1, histo.alphabet_size());
+        if (writer) {
+          StoreVarLenUint16(alphabet_size - 1, writer);
+        } else {
+          StoreVarLenUint16(alphabet_size - 1, &size_writer);
+        }
       }
     }
   }
@@ -998,6 +1015,8 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
       histo_writer = &encoded_histograms.back();
     }
     const auto& body = [&]() -> Status {
+      EncoderStageProfileWorkTimer profile_work(
+          EncoderProfileWork::kEntropyModelConstruction);
       JXL_ASSIGN_OR_RETURN(size_t ans_cost,
                            BuildAndStoreANSEncodingData(
                                memory_manager, params.ans_histogram_strategy,
@@ -1013,6 +1032,8 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
       JXL_RETURN_IF_ERROR(body());
     }
     if (params.streaming_mode) {
+      EncoderStageProfileWorkTimer profile_work(
+          EncoderProfileWork::kHistogramSerialization);
       JXL_RETURN_IF_ERROR(writer->AppendUnaligned(*histo_writer));
     }
   }
@@ -1046,6 +1067,8 @@ template void EncodeUintConfigs(const std::vector<HybridUintConfig>&,
 
 Status EncodeHistograms(const EntropyEncodingData& codes, BitWriter* writer,
                         LayerType layer, AuxOut* aux_out) {
+  EncoderStageProfileWorkTimer profile_work(
+      EncoderProfileWork::kHistogramSerialization);
   return writer->WithMaxBits(
       128 + kClustersLimit * 136, layer, aux_out,
       [&]() -> Status {
@@ -1084,6 +1107,8 @@ StatusOr<size_t> BuildAndEncodeHistograms(
     size_t num_contexts, std::vector<std::vector<Token>>& tokens,
     EntropyEncodingData* codes, BitWriter* writer, LayerType layer,
     AuxOut* aux_out) {
+  const size_t profile_model_bits_begin =
+      writer == nullptr ? 0 : writer->BitsWritten();
   // TODO(Ivan): presumably not needed - default
   // if (params.initialize_global_state) codes->lz77.enabled = false;
   codes->lz77.nonserialized_distance_context = num_contexts;
@@ -1129,31 +1154,36 @@ StatusOr<size_t> BuildAndEncodeHistograms(
     if (ans_fuzzer_friendly_) {
       uint_config = HybridUintConfig(10, 0, 0);
     }
-    for (const auto& stream : tokens) {
-      if (codes->lz77.enabled) {
-        for (const auto& token : stream) {
-          total_tokens++;
-          uint32_t tok, nbits, bits;
-          (token.is_lz77_length ? codes->lz77.length_uint_config : uint_config)
-              .Encode(token.value, &tok, &nbits, &bits);
-          tok += token.is_lz77_length ? codes->lz77.min_symbol : 0;
-          JXL_DASSERT(token.context < num_contexts);
-          builder[token.context].Add(tok);
-        }
-      } else if (num_contexts == 1) {
-        for (const auto& token : stream) {
-          total_tokens++;
-          uint32_t tok, nbits, bits;
-          uint_config.Encode(token.value, &tok, &nbits, &bits);
-          builder[0].Add(tok);
-        }
-      } else {
-        for (const auto& token : stream) {
-          total_tokens++;
-          uint32_t tok, nbits, bits;
-          uint_config.Encode(token.value, &tok, &nbits, &bits);
-          JXL_DASSERT(token.context < num_contexts);
-          builder[token.context].Add(tok);
+    {
+      EncoderStageProfileWorkTimer profile_work(
+          EncoderProfileWork::kHistogramPopulation);
+      for (const auto& stream : tokens) {
+        if (codes->lz77.enabled) {
+          for (const auto& token : stream) {
+            total_tokens++;
+            uint32_t tok, nbits, bits;
+            (token.is_lz77_length ? codes->lz77.length_uint_config
+                                  : uint_config)
+                .Encode(token.value, &tok, &nbits, &bits);
+            tok += token.is_lz77_length ? codes->lz77.min_symbol : 0;
+            JXL_DASSERT(token.context < num_contexts);
+            builder[token.context].Add(tok);
+          }
+        } else if (num_contexts == 1) {
+          for (const auto& token : stream) {
+            total_tokens++;
+            uint32_t tok, nbits, bits;
+            uint_config.Encode(token.value, &tok, &nbits, &bits);
+            builder[0].Add(tok);
+          }
+        } else {
+          for (const auto& token : stream) {
+            total_tokens++;
+            uint32_t tok, nbits, bits;
+            uint_config.Encode(token.value, &tok, &nbits, &bits);
+            JXL_DASSERT(token.context < num_contexts);
+            builder[token.context].Add(tok);
+          }
         }
       }
     }
@@ -1231,6 +1261,12 @@ StatusOr<size_t> BuildAndEncodeHistograms(
   if (aux_out != nullptr) {
     aux_out->layer(layer).num_clustered_histograms +=
         codes->encoding_info.size();
+  }
+  if (writer != nullptr) {
+    EncoderStageProfileAddCount(
+        EncoderProfileCount::kModelBits,
+        static_cast<uint64_t>(writer->BitsWritten() -
+                              profile_model_bits_begin));
   }
   return cost;
 }
@@ -1324,8 +1360,13 @@ size_t WriteTokens(const std::vector<Token>& tokens,
 Status WriteTokens(const std::vector<Token>& tokens,
                    const EntropyEncodingData& codes, size_t context_offset,
                    BitWriter* writer, LayerType layer, AuxOut* aux_out) {
+  EncoderStageProfileWorkTimer profile_work(
+      EncoderProfileWork::kTokenEncodingAndBitWriting);
+  const size_t profile_bits_begin = writer->BitsWritten();
+  EncoderStageProfileAddCount(EncoderProfileCount::kTokenCount,
+                              static_cast<uint64_t>(tokens.size()));
   // Theoretically, we could have 15 prefix code bits + 31 extra bits.
-  return writer->WithMaxBits(
+  const Status status = writer->WithMaxBits(
       46 * tokens.size() + 32 * 1024 * 4, layer, aux_out, [&] {
         size_t num_extra_bits =
             WriteTokens(tokens, codes, context_offset, writer);
@@ -1334,6 +1375,12 @@ Status WriteTokens(const std::vector<Token>& tokens,
         }
         return true;
       });
+  if (status) {
+    EncoderStageProfileAddCount(
+        EncoderProfileCount::kTokenBits,
+        static_cast<uint64_t>(writer->BitsWritten() - profile_bits_begin));
+  }
+  return status;
 }
 
 void SetANSFuzzerFriendly(bool ans_fuzzer_friendly) {

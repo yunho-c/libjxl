@@ -46,6 +46,7 @@
 #include "lib/jxl/enc_frame.h"
 #include "lib/jxl/enc_icc_codec.h"
 #include "lib/jxl/enc_params.h"
+#include "lib/jxl/enc_stage_profile.h"
 #include "lib/jxl/encode_internal.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/image_metadata.h"
@@ -2713,6 +2714,17 @@ JxlEncoderStatus JxlEncoderProcessOutput(JxlEncoder* enc, uint8_t** next_out,
   }
   return JxlErrorOrStatus::Success();
 }
+
+#if JPEGXL_ENABLE_STAGE_PROFILER
+extern "C" JXL_EXPORT JxlEncoderStatus
+JxlEncoderFrameSettingsSetStageProfileForBenchmark(
+    JxlEncoderFrameSettings* frame_settings,
+    jxl::EncoderStageProfileSink* profile) {
+  if (frame_settings == nullptr) return JXL_ENC_ERROR;
+  frame_settings->values.cparams.stage_profile = profile;
+  return JXL_ENC_SUCCESS;
+}
+#endif
 
 JxlEncoderStatus JxlEncoderSetFrameHeader(
     JxlEncoderFrameSettings* frame_settings,

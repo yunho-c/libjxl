@@ -375,6 +375,7 @@ libjxl_enc_sources = [
     "jxl/enc_quant_weights.h",
     "jxl/enc_splines.cc",
     "jxl/enc_splines.h",
+    "jxl/enc_stage_profile.h",
     "jxl/enc_toc.cc",
     "jxl/enc_toc.h",
     "jxl/enc_transforms-inl.h",

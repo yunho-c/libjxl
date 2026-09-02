@@ -63,6 +63,7 @@
 #include "lib/jxl/enc_progressive_split.h"
 #include "lib/jxl/enc_quant_weights.h"
 #include "lib/jxl/enc_splines.h"
+#include "lib/jxl/enc_stage_profile.h"
 #include "lib/jxl/enc_toc.h"
 #include "lib/jxl/enc_xyb.h"
 #include "lib/jxl/encode_internal.h"
@@ -1204,13 +1205,20 @@ Status TokenizeAllCoefficients(const FrameHeader& frame_header,
                                PassesEncoderState* enc_state) {
   PassesSharedState& shared = enc_state->shared;
   std::vector<EncCache> group_caches;
+  const bool profiling = CurrentEncoderStageProfile() != nullptr;
+  std::vector<EncoderStageProfileAccumulator> profile_workers;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
   const auto tokenize_group_init = [&](const size_t num_threads) -> Status {
     group_caches.resize(num_threads);
+    if (profiling) profile_workers.resize(num_threads);
     return true;
   };
   const auto tokenize_group = [&](const uint32_t group_index,
                                   const size_t thread) -> Status {
+    EncoderStageProfileScope profile_scope(profiling ? &profile_workers[thread]
+                                                     : nullptr);
+    EncoderStageProfileWorkTimer profile_work(
+        EncoderProfileWork::kCoefficientTokenization);
     // Tokenize coefficients.
     const Rect rect = shared.frame_dim.BlockGroupRect(group_index);
     for (size_t idx_pass = 0; idx_pass < enc_state->passes.size(); idx_pass++) {
@@ -1234,6 +1242,9 @@ Status TokenizeAllCoefficients(const FrameHeader& frame_header,
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, shared.frame_dim.num_groups,
                                 tokenize_group_init, tokenize_group,
                                 "TokenizeGroup"));
+  for (const EncoderStageProfileAccumulator& worker : profile_workers) {
+    MergeEncoderStageProfile(worker);
+  }
   return true;
 }
 
@@ -1331,6 +1342,8 @@ Status EncodeGroups(const FrameHeader& frame_header,
                     ModularFrameEncoder* enc_modular, ThreadPool* pool,
                     std::vector<std::unique_ptr<BitWriter>>* group_codes,
                     AuxOut* aux_out) {
+  EncoderStageProfilePhaseTimer emission_phase(
+      EncoderProfilePhase::kModelAndTokenEmission);
   const PassesSharedState& shared = enc_state->shared;
   JxlMemoryManager* memory_manager = shared.memory_manager;
   const FrameDimensions& frame_dim = shared.frame_dim;
@@ -1358,6 +1371,8 @@ Status EncodeGroups(const FrameHeader& frame_header,
   };
 
   if (enc_state->initialize_global_state) {
+    EncoderStageProfileWorkTimer side_data_work(
+        EncoderProfileWork::kModularAndDcSideDataEncoding);
     if (frame_header.flags & FrameHeader::kPatches) {
       JXL_RETURN_IF_ERROR(PatchDictionaryEncoder::Encode(
           shared.image_features.patches, get_output(0), LayerType::Dictionary,
@@ -1387,8 +1402,13 @@ Status EncodeGroups(const FrameHeader& frame_header,
   }
 
   std::vector<std::unique_ptr<AuxOut>> aux_outs;
-  auto resize_aux_outs = [&aux_outs,
-                          aux_out](const size_t num_threads) -> Status {
+  const bool profiling = CurrentEncoderStageProfile() != nullptr;
+  std::vector<EncoderStageProfileAccumulator> profile_workers;
+  auto resize_aux_outs = [&aux_outs, aux_out, profiling, &profile_workers](
+                             const size_t num_threads) -> Status {
+    if (profiling && profile_workers.size() < num_threads) {
+      profile_workers.resize(num_threads);
+    }
     if (aux_out == nullptr) {
       aux_outs.resize(num_threads);
     } else {
@@ -1405,6 +1425,10 @@ Status EncodeGroups(const FrameHeader& frame_header,
 
   const auto process_dc_group = [&](const uint32_t group_index,
                                     const size_t thread) -> Status {
+    EncoderStageProfileScope profile_scope(profiling ? &profile_workers[thread]
+                                                     : nullptr);
+    EncoderStageProfileWorkTimer side_data_work(
+        EncoderProfileWork::kModularAndDcSideDataEncoding);
     AuxOut* my_aux_out = aux_outs[thread].get();
     uint32_t input_index = enc_state->streaming_mode ? 0 : group_index;
     BitWriter* output = get_output(input_index + 1);
@@ -1448,13 +1472,20 @@ Status EncodeGroups(const FrameHeader& frame_header,
                                   resize_aux_outs, process_dc_group,
                                   "EncodeDCGroup"));
   }
+  emission_phase.Stop();
   if (frame_header.encoding == FrameEncoding::kVarDCT) {
+    EncoderStageProfilePhaseTimer model_phase(
+        EncoderProfilePhase::kEntropyModelConstruction);
     JXL_RETURN_IF_ERROR(EncodeGlobalACInfo(
         enc_state, get_output(global_ac_index), enc_modular, aux_out));
   }
 
+  EncoderStageProfilePhaseTimer token_emission_phase(
+      EncoderProfilePhase::kModelAndTokenEmission);
   const auto process_group = [&](const uint32_t group_index,
                                  const size_t thread) -> Status {
+    EncoderStageProfileScope profile_scope(profiling ? &profile_workers[thread]
+                                                     : nullptr);
     AuxOut* my_aux_out = aux_outs[thread].get();
 
     size_t ac_group_id =
@@ -1472,9 +1503,14 @@ Status EncodeGroups(const FrameHeader& frame_header,
             ac_group_code(i, group_index), my_aux_out));
       }
       // Write all modular encoded data (color?, alpha, depth, extra channels)
-      JXL_RETURN_IF_ERROR(enc_modular->EncodeStream(
-          ac_group_code(i, group_index), my_aux_out, LayerType::ModularAcGroup,
-          ModularStreamId::ModularAC(ac_group_id, i)));
+      {
+        EncoderStageProfileWorkTimer side_data_work(
+            EncoderProfileWork::kModularAndDcSideDataEncoding);
+        JXL_RETURN_IF_ERROR(enc_modular->EncodeStream(
+            ac_group_code(i, group_index), my_aux_out,
+            LayerType::ModularAcGroup,
+            ModularStreamId::ModularAC(ac_group_id, i)));
+      }
       JXL_DEBUG_V(2,
                   "AC group %u [abs %" PRIuS "] pass %" PRIuS
                   " encoded size is %" PRIuS " bits",
@@ -1493,6 +1529,9 @@ Status EncodeGroups(const FrameHeader& frame_header,
       bw->ZeroPadToByte();  // end of group.
       return true;
     }));
+  }
+  for (const EncoderStageProfileAccumulator& worker : profile_workers) {
+    MergeEncoderStageProfile(worker);
   }
   return true;
 }
@@ -1675,11 +1714,19 @@ Status ComputeEncodingData(
       shared.num_histograms = 1;
       enc_state.histogram_idx.resize(frame_dim.num_groups);
     }
-    JXL_RETURN_IF_ERROR(
-        TokenizeAllCoefficients(frame_header, pool, &enc_state));
+    {
+      EncoderStageProfilePhaseTimer tokenization_phase(
+          EncoderProfilePhase::kCoefficientTokenization);
+      JXL_RETURN_IF_ERROR(
+          TokenizeAllCoefficients(frame_header, pool, &enc_state));
+    }
   }
 
   if (cparams.modular_mode || !extra_channels.empty()) {
+    EncoderStageProfilePhaseTimer tokenization_phase(
+        EncoderProfilePhase::kCoefficientTokenization);
+    EncoderStageProfileWorkTimer tokenization_work(
+        EncoderProfileWork::kCoefficientTokenization);
     JXL_RETURN_IF_ERROR(enc_modular.ComputeEncodingData(
         frame_header, metadata->m, &color, extra_channels, group_rect,
         frame_dim, frame_area_rect, &enc_state, cms, pool, aux_out,
@@ -1697,6 +1744,10 @@ Status ComputeEncodingData(
         (!(cparams.responsive == 1 && cparams.IsLossless()) &&
          cparams.buffering < 3) ||
         !cparams.custom_fixed_tree.empty()) {
+      EncoderStageProfilePhaseTimer tokenization_phase(
+          EncoderProfilePhase::kCoefficientTokenization);
+      EncoderStageProfileWorkTimer tokenization_work(
+          EncoderProfileWork::kCoefficientTokenization);
       JXL_RETURN_IF_ERROR(enc_modular.ComputeTree(pool));
       JXL_RETURN_IF_ERROR(enc_modular.ComputeTokens(pool));
     }
@@ -2335,6 +2386,10 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
       frame_data.xsize, frame_data.ysize, cms, pool, frame_header, *enc_modular,
       *enc_state, &group_codes, aux_out));
 
+  EncoderStageProfilePhaseTimer assembly_phase(
+      EncoderProfilePhase::kFramingAndAssembly);
+  EncoderStageProfileWorkTimer assembly_work(
+      EncoderProfileWork::kOutputAssemblyAndCopying);
   BitWriter writer{memory_manager};
   JXL_RETURN_IF_ERROR(writer.AppendByteAligned(enc_state->special_frames));
   JXL_RETURN_IF_ERROR(WriteFrameHeader(frame_header, &writer, aux_out));
@@ -2694,6 +2749,10 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
   if (frame_data.IsJPEG() && cparams.color_transform == ColorTransform::kXYB) {
     return JXL_FAILURE("Can't add JPEG frame to XYB codestream");
   }
+
+#if JPEGXL_ENABLE_STAGE_PROFILER
+  EncoderStageProfileSession profile_session(cparams.stage_profile);
+#endif
 
   if (CanDoStreamingEncoding(cparams, frame_info, *metadata, frame_data)) {
     return EncodeFrameStreaming(memory_manager, cparams, frame_info, metadata,
