@@ -16,7 +16,8 @@ The experiment deliberately keeps four measurements separate:
 The input is canonical three-channel, linear-sRGB, 32-bit-float PFM. Reading
 the PFM and writing the final JXL are outside the API harness's timed region.
 Runs are append-only and resumable. A unique codestream is retained for every
-image/quality/effort tuple.
+image/quality/effort tuple. By default, complete timing, stage, and sampled
+profile results are collected for each effort before advancing to the next.
 """
 
 import argparse
@@ -45,6 +46,13 @@ DEFAULT_EFFORTS = tuple(range(1, 11))
 PROFILE_DIAGNOSTIC_QUALITIES = frozenset((30, 90))
 PROFILE_DIAGNOSTIC_EFFORTS = frozenset((3, 7, 10))
 PFM_COLOR_ENCODING = "RGB_D65_SRG_Rel_Lin"
+SCHEDULE_EFFORT_MAJOR = "effort-major"
+SCHEDULE_PHASE_MAJOR_SHUFFLED = "phase-major-shuffled"
+PHASE_SEED_OFFSETS = {
+    "timing": 0,
+    "stages": 100_000,
+    "profiles": 200_000,
+}
 
 CLIC_2024_TEST_URL = "https://downloads.compression.cc/clic2024_image_test.zip"
 CLIC_2024_TEST_SHA256 = (
@@ -85,6 +93,19 @@ HIGH_RESOLUTION_TARGETS = (12_000_000, 24_000_000, 48_000_000)
 
 class StudyError(Exception):
     """An expected input, configuration, or subprocess failure."""
+
+
+@dataclasses.dataclass
+class JobBudget:
+    limit: object
+    executed: int = 0
+
+    @property
+    def exhausted(self):
+        return self.limit is not None and self.executed >= self.limit
+
+    def completed_one(self):
+        self.executed += 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -642,6 +663,10 @@ def load_or_create_metadata(args, corpus_value, tools):
             "stage_phase_nanoseconds": "wall-clock barrier time",
             "stage_work_nanoseconds": "aggregate worker time, not latency",
             "samply": "sampled thread CPU, not wall time",
+            "execution_order": (
+                "Scheduling policy, seed, filters, and invocation boundaries are "
+                "recorded in execution-events.jsonl"
+            ),
             "input_layout": corpus_value["input_layout"],
             "color_encoding": corpus_value["color_encoding"],
         },
@@ -670,6 +695,44 @@ def all_tuple_jobs(images, qualities, efforts):
     ]
 
 
+def phase_shuffle_seed(base_seed, phase, repetition=0, effort=None):
+    seed = base_seed + PHASE_SEED_OFFSETS[phase] + repetition
+    if effort is not None:
+        seed += effort * 1_000
+    return seed
+
+
+def shuffled_tuple_jobs(
+    images, qualities, efforts, base_seed, phase, repetition, schedule
+):
+    if schedule == SCHEDULE_PHASE_MAJOR_SHUFFLED:
+        seed = phase_shuffle_seed(base_seed, phase, repetition)
+        jobs = all_tuple_jobs(images, qualities, efforts)
+        random.Random(seed).shuffle(jobs)
+        return jobs
+
+    jobs = []
+    for effort in efforts:
+        block = all_tuple_jobs(images, qualities, (effort,))
+        seed = phase_shuffle_seed(base_seed, phase, repetition, effort)
+        random.Random(seed).shuffle(block)
+        jobs.extend(block)
+    return jobs
+
+
+def execution_plan(phase, schedule, efforts):
+    phases = (
+        ("timing", "stages", "profiles") if phase == "all" else (phase,)
+    )
+    if schedule == SCHEDULE_EFFORT_MAJOR:
+        return [
+            (selected_phase, (effort,))
+            for effort in efforts
+            for selected_phase in phases
+        ]
+    return [(selected_phase, tuple(efforts)) for selected_phase in phases]
+
+
 def completed_ids(path, field):
     return {record[field] for record in read_jsonl(path)}
 
@@ -694,23 +757,29 @@ def benchmark_command(binary, image, raw, quality, effort, threads, warmups, sam
     ]
 
 
-def command_timing(args, images, benchmark):
+def command_timing(args, images, benchmark, efforts, budget):
     records_path = args.output / "timings.jsonl"
     existing_records = read_jsonl(records_path)
     done = {record["sample_id"] for record in existing_records}
     output_hashes = {}
     for record in existing_records:
         output_hashes.setdefault(record["job_id"], record["output_sha256"])
-    executed = 0
     for repetition in range(args.repetitions):
-        jobs = all_tuple_jobs(images, args.qualities, args.efforts)
-        random.Random(args.shuffle_seed + repetition).shuffle(jobs)
+        jobs = shuffled_tuple_jobs(
+            images,
+            args.qualities,
+            efforts,
+            args.shuffle_seed,
+            "timing",
+            repetition,
+            args.schedule,
+        )
         for position, (image, quality, effort) in enumerate(jobs):
             sample_id = "%s|repetition=%d" % (job_id(image, quality, effort), repetition)
             if sample_id in done:
                 continue
-            if args.max_jobs is not None and executed >= args.max_jobs:
-                return
+            if budget.exhausted:
+                return False
             final_output = output_path(args.output, image, quality, effort)
             final_output.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix="cjxl-timing-") as temporary:
@@ -750,6 +819,22 @@ def command_timing(args, images, benchmark):
                     "job_id": identifier,
                     "repetition": repetition,
                     "schedule_position": position,
+                    "schedule_position_scope": (
+                        "effort_repetition"
+                        if args.schedule == SCHEDULE_EFFORT_MAJOR
+                        else "repetition"
+                    ),
+                    "schedule_policy": args.schedule,
+                    "schedule_seed": phase_shuffle_seed(
+                        args.shuffle_seed,
+                        "timing",
+                        repetition,
+                        (
+                            effort
+                            if args.schedule == SCHEDULE_EFFORT_MAJOR
+                            else None
+                        ),
+                    ),
                     "image_id": image.image_id,
                     "corpus": image.corpus,
                     "resolution_class": image.resolution_class,
@@ -768,7 +853,8 @@ def command_timing(args, images, benchmark):
                 }
                 append_jsonl(records_path, record)
                 done.add(sample_id)
-                executed += 1
+                budget.completed_one()
+    return True
 
 
 def median_mapping(samples, key):
@@ -779,18 +865,24 @@ def median_mapping(samples, key):
     }
 
 
-def command_stages(args, images, benchmark):
+def command_stages(args, images, benchmark, efforts, budget):
     records_path = args.output / "stage-profiles.jsonl"
     done = completed_ids(records_path, "job_id")
-    executed = 0
-    jobs = all_tuple_jobs(images, args.qualities, args.efforts)
-    random.Random(args.shuffle_seed + 100_000).shuffle(jobs)
-    for image, quality, effort in jobs:
+    jobs = shuffled_tuple_jobs(
+        images,
+        args.qualities,
+        efforts,
+        args.shuffle_seed,
+        "stages",
+        0,
+        args.schedule,
+    )
+    for position, (image, quality, effort) in enumerate(jobs):
         identifier = job_id(image, quality, effort)
         if identifier in done:
             continue
-        if args.max_jobs is not None and executed >= args.max_jobs:
-            return
+        if budget.exhausted:
+            return False
         final_output = output_path(args.output, image, quality, effort)
         if not final_output.is_file():
             raise StudyError("Run timing phase first; missing %s" % final_output)
@@ -824,6 +916,20 @@ def command_stages(args, images, benchmark):
                 "schema_version": SCHEMA_VERSION,
                 "recorded_at": utc_now(),
                 "job_id": identifier,
+                "schedule_position": position,
+                "schedule_position_scope": (
+                    "effort"
+                    if args.schedule == SCHEDULE_EFFORT_MAJOR
+                    else "phase"
+                ),
+                "schedule_policy": args.schedule,
+                "schedule_seed": phase_shuffle_seed(
+                    args.shuffle_seed,
+                    "stages",
+                    effort=(
+                        effort if args.schedule == SCHEDULE_EFFORT_MAJOR else None
+                    ),
+                ),
                 "image_id": image.image_id,
                 "corpus": image.corpus,
                 "resolution_class": image.resolution_class,
@@ -858,7 +964,8 @@ def command_stages(args, images, benchmark):
             }
             append_jsonl(records_path, record)
             done.add(identifier)
-            executed += 1
+            budget.completed_one()
+    return True
 
 
 def representative_images(images):
@@ -887,28 +994,37 @@ def profile_sidecar(path):
     return pathlib.Path(text[: -len(suffix)] + ".json.syms.json")
 
 
-def command_profiles(args, images, cjxl, samply):
+def command_profiles(args, images, cjxl, samply, efforts, budget):
     if args.profile_policy == "none":
-        return
+        return True
+    efforts = tuple(efforts)
     candidates = images if args.profile_policy == "all" else representative_images(images)
-    modes = [("workers", args.num_threads, args.qualities, args.efforts)]
+    modes = [("workers", args.num_threads, args.qualities, efforts)]
     if args.profile_no_worker_diagnostics:
         modes.append(
             (
                 "no_workers_diagnostic",
                 0,
                 tuple(q for q in args.qualities if q in PROFILE_DIAGNOSTIC_QUALITIES),
-                tuple(e for e in args.efforts if e in PROFILE_DIAGNOSTIC_EFFORTS),
+                tuple(e for e in efforts if e in PROFILE_DIAGNOSTIC_EFFORTS),
             )
         )
     jobs = []
-    for mode, threads, qualities, efforts in modes:
+    for mode, threads, qualities, mode_efforts in modes:
         for image in candidates:
             for quality in qualities:
-                for effort in efforts:
+                for effort in mode_efforts:
                     jobs.append((mode, threads, image, quality, effort))
-    random.Random(args.shuffle_seed + 200_000).shuffle(jobs)
-    executed = 0
+    schedule_effort = (
+        efforts[0]
+        if args.schedule == SCHEDULE_EFFORT_MAJOR and len(efforts) == 1
+        else None
+    )
+    random.Random(
+        phase_shuffle_seed(
+            args.shuffle_seed, "profiles", effort=schedule_effort
+        )
+    ).shuffle(jobs)
     for mode, threads, image, quality, effort in jobs:
         profile = (
             args.output
@@ -920,8 +1036,8 @@ def command_profiles(args, images, cjxl, samply):
         sidecar = profile_sidecar(profile)
         if profile.is_file() and profile.stat().st_size and sidecar.is_file() and sidecar.stat().st_size:
             continue
-        if args.max_jobs is not None and executed >= args.max_jobs:
-            return
+        if budget.exhausted:
+            return False
         profile.parent.mkdir(parents=True, exist_ok=True)
         profile.unlink(missing_ok=True)
         sidecar.unlink(missing_ok=True)
@@ -953,7 +1069,53 @@ def command_profiles(args, images, cjxl, samply):
         run_command(command, capture=False)
         if not profile.is_file() or not sidecar.is_file():
             raise StudyError("Samply did not emit both capture and symbol sidecar")
-        executed += 1
+        budget.completed_one()
+    return True
+
+
+def has_existing_measurements(output):
+    for name in ("timings.jsonl", "stage-profiles.jsonl"):
+        path = output / name
+        if path.is_file() and path.stat().st_size:
+            return True
+    samply = output / "samply"
+    return samply.is_dir() and next(samply.rglob("*.json.gz"), None) is not None
+
+
+def record_execution_invocation(args, image_count):
+    path = args.output / "execution-events.jsonl"
+    if not path.is_file() and has_existing_measurements(args.output):
+        append_jsonl(
+            path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "recorded_at": utc_now(),
+                "event": "legacy_results_detected",
+                "schedule_policy": SCHEDULE_PHASE_MAJOR_SHUFFLED,
+                "shuffle_seed_persisted": False,
+                "note": (
+                    "Existing results predate execution event logging; their records "
+                    "retain repetition and schedule_position"
+                ),
+            },
+        )
+    append_jsonl(
+        path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "recorded_at": utc_now(),
+            "event": "run_invocation",
+            "phase": args.phase,
+            "schedule_policy": args.schedule,
+            "shuffle_seed": args.shuffle_seed,
+            "effort_order": list(args.efforts),
+            "image_filter": args.image_filter,
+            "selected_image_count": image_count,
+            "max_jobs_per_phase": args.max_jobs,
+            "power": optional_command_output(("pmset", "-g", "batt")),
+            "thermal": optional_command_output(("pmset", "-g", "therm")),
+        },
+    )
 
 
 def command_run(args):
@@ -972,12 +1134,33 @@ def command_run(args):
         "samply": file_identity(samply),
     }
     load_or_create_metadata(args, corpus_value, tools)
-    if args.phase in ("timing", "all"):
-        command_timing(args, images, ordinary)
-    if args.phase in ("stages", "all"):
-        command_stages(args, images, stage)
-    if args.phase in ("profiles", "all"):
-        command_profiles(args, images, cjxl, samply)
+    record_execution_invocation(args, len(images))
+    budgets = {
+        selected_phase: JobBudget(args.max_jobs)
+        for selected_phase in ("timing", "stages", "profiles")
+    }
+    for selected_phase, efforts in execution_plan(
+        args.phase, args.schedule, args.efforts
+    ):
+        print(
+            "schedule %s phase=%s efforts=%s"
+            % (args.schedule, selected_phase, ",".join(map(str, efforts))),
+            flush=True,
+        )
+        if selected_phase == "timing":
+            complete = command_timing(
+                args, images, ordinary, efforts, budgets[selected_phase]
+            )
+        elif selected_phase == "stages":
+            complete = command_stages(
+                args, images, stage, efforts, budgets[selected_phase]
+            )
+        else:
+            complete = command_profiles(
+                args, images, cjxl, samply, efforts, budgets[selected_phase]
+            )
+        if not complete:
+            return
 
 
 def percentile(values, fraction):
@@ -1194,6 +1377,7 @@ attribution and are likewise not wall-clock timings.
   aggregate worker measurements.
 - `aggregated.csv`: sums across each corpus/resolution/quality/effort cell.
 - `samply-operations.csv`: operation attribution for stratified captures.
+- `../execution-events.jsonl`: append-only scheduling and invocation history.
 - `../outputs`: one deterministic JXL codestream per unique tuple.
 """.format(
         generated=utc_now(),
@@ -1299,6 +1483,15 @@ def add_run_arguments(parser):
     parser.add_argument("--samply-rate", type=int, default=1000)
     parser.add_argument("--profile-policy", choices=("none", "stratified", "all"), default="stratified")
     parser.add_argument("--profile-no-worker-diagnostics", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--schedule",
+        choices=(SCHEDULE_EFFORT_MAJOR, SCHEDULE_PHASE_MAJOR_SHUFFLED),
+        default=SCHEDULE_EFFORT_MAJOR,
+        help=(
+            "effort-major completes timing, stages, and profiles for each effort "
+            "before advancing; phase-major-shuffled preserves the original policy"
+        ),
+    )
     parser.add_argument("--shuffle-seed", type=int, default=20260903)
     parser.add_argument("--image-filter", help="run only image IDs containing this text")
     parser.add_argument("--max-jobs", type=int, help="execute at most this many pending jobs in each selected phase")
