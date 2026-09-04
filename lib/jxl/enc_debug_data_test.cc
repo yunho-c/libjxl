@@ -36,6 +36,7 @@ struct CapturedTensor {
   std::vector<std::string> axes;
   std::vector<std::string> channel_names;
   size_t num_categories = 0;
+  int64_t iteration = -1;
   DebugGridInfo grid;
 };
 
@@ -76,6 +77,7 @@ class RecordingDebugDataSink : public EncoderDebugDataSink {
       captured.channel_names.emplace_back(info.channel_names[i]);
     }
     captured.num_categories = info.num_categories;
+    captured.iteration = info.iteration;
 
     size_t num_elements = 1;
     for (size_t dimension : captured.shape) num_elements *= dimension;
@@ -177,7 +179,7 @@ std::vector<uint8_t> EncodeTestImage(EncoderDebugDataSink* sink,
 }
 
 #if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
-TEST(EncoderDebugDataTest, CapturesOverviewFieldsWithoutChangingOutput) {
+TEST(EncoderDebugDataTest, CapturesEffortSevenFieldsWithoutChangingOutput) {
   RecordingDebugDataSink sink;
   const std::vector<uint8_t> traced = EncodeTestImage(&sink);
   ASSERT_TRUE(sink.Finish());
@@ -201,6 +203,8 @@ TEST(EncoderDebugDataTest, CapturesOverviewFieldsWithoutChangingOutput) {
       "aq/initial/mask_block",
       "aq/initial/mask_pixel",
       "aq/initial/quant_field",
+      "aq/post_ac_adjust/quant_field",
+      "aq/post_ac_adjust/raw_quant_field",
       "cfl/base/color_factor",
       "cfl/base/ytob",
       "cfl/base/ytox",
@@ -269,6 +273,10 @@ TEST(EncoderDebugDataTest, CapturesOverviewFieldsWithoutChangingOutput) {
   const CapturedTensor& raw_quant = sink.tensors.at("aq/final/raw_quant_field");
   EXPECT_EQ((std::vector<size_t>{2, 3}), final_quant.shape);
   EXPECT_EQ(DebugDataType::kInt32, raw_quant.dtype);
+  EXPECT_EQ(sink.tensors.at("aq/post_ac_adjust/quant_field").values,
+            final_quant.values);
+  EXPECT_EQ(sink.tensors.at("aq/post_ac_adjust/raw_quant_field").values,
+            raw_quant.values);
   for (size_t i = 0; i < raw_quant.values.size() / sizeof(int32_t); ++i) {
     EXPECT_GT(CapturedValue<int32_t>(raw_quant, i), 0);
   }
@@ -311,7 +319,8 @@ TEST(EncoderDebugDataTest, CapturesOverviewFieldsWithoutChangingOutput) {
   }
 }
 
-TEST(EncoderDebugDataTest, CapturesLinearRgbWhenEncoderProducesIt) {
+TEST(EncoderDebugDataTest,
+     CapturesButteraugliAqIterationsWithoutChangingOutput) {
   RecordingDebugDataSink sink;
   const std::vector<uint8_t> traced = EncodeTestImage(&sink, 8);
   ASSERT_TRUE(sink.Finish());
@@ -324,6 +333,121 @@ TEST(EncoderDebugDataTest, CapturesLinearRgbWhenEncoderProducesIt) {
   EXPECT_EQ((std::vector<std::string>{"r", "g", "b"}), linear.channel_names);
   for (size_t i = 0; i < linear.values.size() / sizeof(float); ++i) {
     EXPECT_TRUE(std::isfinite(CapturedValue<float>(linear, i)));
+  }
+
+  const CapturedTensor& post_ac_quant =
+      sink.tensors.at("aq/post_ac_adjust/quant_field");
+  const CapturedTensor& post_ac_raw =
+      sink.tensors.at("aq/post_ac_adjust/raw_quant_field");
+  EXPECT_EQ((std::vector<size_t>{2, 3}), post_ac_quant.shape);
+  EXPECT_EQ(DebugDataType::kInt32, post_ac_raw.dtype);
+
+  static const char* const kIterationLeaves[] = {
+      "butteraugli_diffmap",
+      "clamped_high",
+      "clamped_low",
+      "dc_quantizer",
+      "decoded_linear_rgb",
+      "encoder_target",
+      "error_ratio",
+      "initial_field_clamp",
+      "quant_field_in",
+      "quant_field_lower_bound",
+      "quant_field_out",
+      "quant_field_pre_update",
+      "quant_field_upper_bound",
+      "quant_rounding_stall",
+      "quant_update_multiplier",
+      "raw_quant_field",
+      "score",
+      "target",
+      "tile_distmap",
+      "update_applied",
+      "update_exponent",
+  };
+  for (int iteration = 0; iteration < 3; ++iteration) {
+    const std::string prefix = "aq/iter_00" + std::to_string(iteration) + "/";
+    for (const char* leaf : kIterationLeaves) {
+      const auto found = sink.tensors.find(prefix + leaf);
+      ASSERT_NE(sink.tensors.end(), found) << leaf;
+      EXPECT_EQ(iteration, found->second.iteration) << leaf;
+    }
+
+    const CapturedTensor& decoded =
+        sink.tensors.at(prefix + "decoded_linear_rgb");
+    const CapturedTensor& diffmap =
+        sink.tensors.at(prefix + "butteraugli_diffmap");
+    const CapturedTensor& tile = sink.tensors.at(prefix + "tile_distmap");
+    const CapturedTensor& ratio = sink.tensors.at(prefix + "error_ratio");
+    EXPECT_EQ((std::vector<size_t>{3, 9, 17}), decoded.shape);
+    EXPECT_EQ((std::vector<std::string>{"r", "g", "b"}), decoded.channel_names);
+    EXPECT_EQ((std::vector<size_t>{9, 17}), diffmap.shape);
+    EXPECT_EQ((std::vector<size_t>{2, 3}), tile.shape);
+    EXPECT_EQ(tile.shape, ratio.shape);
+    const double target =
+        CapturedValue<double>(sink.tensors.at(prefix + "target"), 0);
+    for (size_t j = 0; j < tile.values.size() / sizeof(float); ++j) {
+      EXPECT_FLOAT_EQ(CapturedValue<float>(tile, j) / target,
+                      CapturedValue<float>(ratio, j));
+    }
+    const CapturedTensor& multiplier =
+        sink.tensors.at(prefix + "quant_update_multiplier");
+    if (iteration < 2) {
+      const double exponent =
+          CapturedValue<double>(sink.tensors.at(prefix + "update_exponent"), 0);
+      for (size_t j = 0; j < ratio.values.size() / sizeof(float); ++j) {
+        const float error_ratio = CapturedValue<float>(ratio, j);
+        const float expected =
+            error_ratio <= 1.0f
+                ? static_cast<float>(std::pow(error_ratio, exponent))
+                : error_ratio;
+        EXPECT_FLOAT_EQ(expected, CapturedValue<float>(multiplier, j));
+      }
+    }
+
+    const CapturedTensor& quant_in = sink.tensors.at(prefix + "quant_field_in");
+    const CapturedTensor& quant_pre =
+        sink.tensors.at(prefix + "quant_field_pre_update");
+    const CapturedTensor& quant_out =
+        sink.tensors.at(prefix + "quant_field_out");
+    EXPECT_EQ((std::vector<size_t>{2, 3}), quant_in.shape);
+    EXPECT_EQ(quant_in.shape, quant_pre.shape);
+    EXPECT_EQ(quant_in.shape, quant_out.shape);
+    const double lower = CapturedValue<double>(
+        sink.tensors.at(prefix + "quant_field_lower_bound"), 0);
+    const double upper = CapturedValue<double>(
+        sink.tensors.at(prefix + "quant_field_upper_bound"), 0);
+    for (size_t j = 0; j < quant_out.values.size() / sizeof(float); ++j) {
+      const float value = CapturedValue<float>(quant_out, j);
+      EXPECT_TRUE(std::isfinite(value));
+      EXPECT_GE(value, lower);
+      EXPECT_LE(value, upper);
+    }
+
+    for (const char* leaf : {"clamped_low", "clamped_high",
+                             "quant_rounding_stall", "initial_field_clamp"}) {
+      const CapturedTensor& mask = sink.tensors.at(prefix + leaf);
+      EXPECT_EQ(DebugDataType::kUint8, mask.dtype);
+      EXPECT_EQ((std::vector<size_t>{2, 3}), mask.shape);
+      for (uint8_t value : mask.values) EXPECT_LE(value, 1);
+    }
+  }
+
+  EXPECT_EQ(sink.tensors.at("aq/iter_000/quant_field_out").values,
+            sink.tensors.at("aq/iter_001/quant_field_in").values);
+  EXPECT_EQ(sink.tensors.at("aq/iter_001/quant_field_out").values,
+            sink.tensors.at("aq/iter_002/quant_field_in").values);
+  EXPECT_EQ(sink.tensors.at("aq/iter_002/quant_field_in").values,
+            sink.tensors.at("aq/iter_002/quant_field_out").values);
+  EXPECT_EQ(sink.tensors.at("aq/iter_002/quant_field_out").values,
+            sink.tensors.at("aq/final/quant_field").values);
+  EXPECT_DOUBLE_EQ(0.0, CapturedValue<double>(
+                            sink.tensors.at("aq/iter_002/update_applied"), 0));
+  const CapturedTensor& terminal_multiplier =
+      sink.tensors.at("aq/iter_002/quant_update_multiplier");
+  for (size_t i = 0; i < terminal_multiplier.values.size() / sizeof(float);
+       ++i) {
+    EXPECT_FLOAT_EQ(1.0f, CapturedValue<float>(terminal_multiplier, i));
   }
 }
 #endif

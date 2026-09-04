@@ -18,6 +18,7 @@
 #include "lib/jxl/image.h"
 #include "lib/jxl/image_bundle.h"
 #include "lib/jxl/image_metadata.h"
+#include "lib/jxl/image_ops.h"
 
 namespace jxl {
 
@@ -53,6 +54,12 @@ Status JxlButteraugliComparator::SetLinearReferenceImage(
 
 Status JxlButteraugliComparator::CompareWith(const ImageBundle& actual,
                                              ImageF* diffmap, float* score) {
+  return CompareWith(actual, diffmap, score, nullptr);
+}
+
+Status JxlButteraugliComparator::CompareWith(const ImageBundle& actual,
+                                             ImageF* diffmap, float* score,
+                                             Image3F* actual_linear_srgb_out) {
   if (!comparator_) {
     return JXL_FAILURE("Must set reference image first");
   }
@@ -92,6 +99,13 @@ Status JxlButteraugliComparator::CompareWith(const ImageBundle& actual,
         }
       }
     }
+  }
+  if (actual_linear_srgb_out != nullptr) {
+    JXL_ASSIGN_OR_RETURN(*actual_linear_srgb_out,
+                         Image3F::Create(memory_manager, xsize_, ysize_));
+    JXL_RETURN_IF_ERROR(CopyImageTo(
+        Rect(*scaled_actual_linear_srgb), *scaled_actual_linear_srgb,
+        Rect(*actual_linear_srgb_out), actual_linear_srgb_out));
   }
   JXL_RETURN_IF_ERROR(
       comparator_->Diffmap(*scaled_actual_linear_srgb, temp_diffmap));

@@ -1674,6 +1674,27 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
 #if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
   if (cparams.debug_data != nullptr) {
+    static const char* const kBlockAxes[] = {"block_y", "block_x"};
+    DebugArtifactInfo aq_info;
+    aq_info.name = "aq/post_ac_adjust/quant_field";
+    aq_info.stage = "adaptive_quantization";
+    aq_info.units = "relative_inverse_quantization_step";
+    aq_info.semantic =
+        "Continuous quantization field after per-transform AC adjustment and "
+        "before optional Butteraugli refinement";
+    aq_info.axes = kBlockAxes;
+    aq_info.num_axes = 2;
+    aq_info.grid = DebugBlockGrid(frame_dim, cparams);
+    JXL_RETURN_IF_ERROR(
+        EmitDebugImageF(cparams.debug_data, aq_info, initial_quant_field));
+    aq_info.name = "aq/post_ac_adjust/raw_quant_field";
+    aq_info.units = "raw_quantizer_index";
+    aq_info.semantic =
+        "Integer raw quantizer field corresponding to the post-AC-adjusted "
+        "continuous field";
+    JXL_RETURN_IF_ERROR(
+        EmitDebugImageI(cparams.debug_data, aq_info, raw_quant_field));
+
     JXL_RETURN_IF_ERROR(EmitCflBase(cparams.debug_data, cmap.base()));
     if (capture_cfl_pass0) {
       JXL_RETURN_IF_ERROR(

@@ -30,6 +30,12 @@ class JxlButteraugliComparator : public Comparator {
   Status CompareWith(const ImageBundle& actual, ImageF* diffmap,
                      float* score) override;
 
+  // As above, but optionally copies the exact linear-light sRGB image passed
+  // to Butteraugli. This is an internal observation hook; a null output keeps
+  // the ordinary path allocation-free.
+  Status CompareWith(const ImageBundle& actual, ImageF* diffmap, float* score,
+                     Image3F* actual_linear_srgb);
+
   float GoodQualityScore() const override;
   float BadQualityScore() const override;
 

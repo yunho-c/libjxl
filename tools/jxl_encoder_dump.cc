@@ -42,7 +42,7 @@ struct EncoderDumpArgs {
                             "directory for .npy files and manifest.json",
                             &dump_dir, &ParseString);
     cmdline->AddOptionValue('\0', "debug_dump_profile", "PROFILE",
-                            "artifact profile: overview (default) or all",
+                            "artifact profile: overview (default), aq, or all",
                             &profile, &ParseString);
     cmdline->AddOptionValue('d', "distance", "DISTANCE",
                             "VarDCT target distance, default = 1.0", &distance,
@@ -76,6 +76,10 @@ void AttachDebugDataSink(JxlEncoderFrameSettings* settings, void* opaque) {
 bool ConfigureProfile(const std::string& profile,
                       jxl::extras::FileEncoderDebugDataSinkOptions* options) {
   if (profile == "all") return true;
+  if (profile == "aq") {
+    options->include_prefixes = {"aq/"};
+    return true;
+  }
   if (profile != "overview") {
     fprintf(stderr, "Unknown debug dump profile: %s\n", profile.c_str());
     return false;

@@ -46,6 +46,7 @@
 #include "lib/jxl/enc_aux_out.h"
 #include "lib/jxl/enc_butteraugli_comparator.h"
 #include "lib/jxl/enc_cache.h"
+#include "lib/jxl/enc_debug_data_internal.h"
 #include "lib/jxl/enc_debug_image.h"
 #include "lib/jxl/enc_group.h"
 #include "lib/jxl/enc_modular.h"
@@ -720,6 +721,161 @@ namespace {
 // If true, prints the quantization maps at each iteration.
 constexpr bool FLAGS_dump_quant_state = false;
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+
+std::string AqIterationArtifactName(int iteration, const char* leaf) {
+  char prefix[32];
+  snprintf(prefix, sizeof(prefix), "aq/iter_%03d/", iteration);
+  return std::string(prefix) + leaf;
+}
+
+DebugGridInfo AqPixelGrid(size_t xsize, size_t ysize) {
+  DebugGridInfo grid;
+  grid.kind = DebugGridKind::kPixel;
+  grid.valid_rect = DebugRect{0, 0, xsize, ysize};
+  grid.padded_rect = grid.valid_rect;
+  return grid;
+}
+
+DebugGridInfo AqBlockGrid(const FrameDimensions& frame_dim,
+                          const CompressParams& cparams) {
+  DebugGridInfo grid;
+  grid.kind = DebugGridKind::kBlock;
+  grid.spacing_x = kBlockDim * cparams.resampling;
+  grid.spacing_y = kBlockDim * cparams.resampling;
+  grid.footprint_x = kBlockDim * cparams.resampling;
+  grid.footprint_y = kBlockDim * cparams.resampling;
+  grid.valid_rect =
+      DebugRect{0, 0, frame_dim.xsize_upsampled, frame_dim.ysize_upsampled};
+  grid.padded_rect = DebugRect{0, 0, frame_dim.xsize_upsampled_padded,
+                               frame_dim.ysize_upsampled_padded};
+  return grid;
+}
+
+DebugArtifactInfo AqBlockArtifactInfo(const std::string& name, int iteration,
+                                      const FrameDimensions& frame_dim,
+                                      const CompressParams& cparams,
+                                      const char* units, const char* semantic) {
+  static const char* const kAxes[] = {"block_y", "block_x"};
+  DebugArtifactInfo info;
+  info.name = name.c_str();
+  info.stage = "butteraugli_aq";
+  info.iteration = iteration;
+  info.grid = AqBlockGrid(frame_dim, cparams);
+  info.units = units;
+  info.semantic = semantic;
+  info.axes = kAxes;
+  info.num_axes = 2;
+  return info;
+}
+
+DebugArtifactInfo AqPixelArtifactInfo(const std::string& name, int iteration,
+                                      size_t xsize, size_t ysize,
+                                      const char* units, const char* semantic) {
+  static const char* const kAxes[] = {"y", "x"};
+  DebugArtifactInfo info;
+  info.name = name.c_str();
+  info.stage = "butteraugli_aq";
+  info.iteration = iteration;
+  info.grid = AqPixelGrid(xsize, ysize);
+  info.units = units;
+  info.semantic = semantic;
+  info.axes = kAxes;
+  info.num_axes = 2;
+  return info;
+}
+
+bool WantsAqBlockArtifact(EncoderDebugDataSink* sink, const std::string& name,
+                          int iteration, const FrameDimensions& frame_dim,
+                          const CompressParams& cparams, const char* units,
+                          const char* semantic) {
+  if (sink == nullptr) return false;
+  const DebugArtifactInfo info =
+      AqBlockArtifactInfo(name, iteration, frame_dim, cparams, units, semantic);
+  return sink->Wants(info);
+}
+
+bool WantsAqPixelArtifact(EncoderDebugDataSink* sink, const std::string& name,
+                          int iteration, size_t xsize, size_t ysize,
+                          const char* units, const char* semantic) {
+  if (sink == nullptr) return false;
+  const DebugArtifactInfo info =
+      AqPixelArtifactInfo(name, iteration, xsize, ysize, units, semantic);
+  return sink->Wants(info);
+}
+
+Status EmitAqBlockImageF(EncoderDebugDataSink* sink, const std::string& name,
+                         int iteration, const FrameDimensions& frame_dim,
+                         const CompressParams& cparams, const char* units,
+                         const char* semantic, const ImageF& image,
+                         const char* const* derived_from = nullptr,
+                         size_t num_derived_from = 0,
+                         const char* formula = nullptr) {
+  DebugArtifactInfo info =
+      AqBlockArtifactInfo(name, iteration, frame_dim, cparams, units, semantic);
+  info.derived_from = derived_from;
+  info.num_derived_from = num_derived_from;
+  info.formula = formula;
+  return EmitDebugImageF(sink, info, image);
+}
+
+Status EmitAqBlockImageI(EncoderDebugDataSink* sink, const std::string& name,
+                         int iteration, const FrameDimensions& frame_dim,
+                         const CompressParams& cparams, const char* units,
+                         const char* semantic, const ImageI& image) {
+  const DebugArtifactInfo info =
+      AqBlockArtifactInfo(name, iteration, frame_dim, cparams, units, semantic);
+  return EmitDebugImageI(sink, info, image);
+}
+
+Status EmitAqBlockImageB(EncoderDebugDataSink* sink, const std::string& name,
+                         int iteration, const FrameDimensions& frame_dim,
+                         const CompressParams& cparams, const char* semantic,
+                         const ImageB& image) {
+  const DebugArtifactInfo info = AqBlockArtifactInfo(
+      name, iteration, frame_dim, cparams, "boolean", semantic);
+  return EmitDebugImageB(sink, info, image);
+}
+
+Status EmitAqPixelImageF(EncoderDebugDataSink* sink, const std::string& name,
+                         int iteration, const char* units, const char* semantic,
+                         const ImageF& image) {
+  const DebugArtifactInfo info = AqPixelArtifactInfo(
+      name, iteration, image.xsize(), image.ysize(), units, semantic);
+  return EmitDebugImageF(sink, info, image);
+}
+
+Status EmitAqPixelImage3F(EncoderDebugDataSink* sink, const std::string& name,
+                          int iteration, const char* units,
+                          const char* semantic, const Image3F& image) {
+  static const char* const kAxes[] = {"channel", "y", "x"};
+  static const char* const kChannels[] = {"r", "g", "b"};
+  DebugArtifactInfo info = AqPixelArtifactInfo(name, iteration, image.xsize(),
+                                               image.ysize(), units, semantic);
+  info.axes = kAxes;
+  info.num_axes = 3;
+  info.channel_names = kChannels;
+  info.num_channel_names = 3;
+  return EmitDebugImage3F(sink, info, image, image.xsize(), image.ysize());
+}
+
+Status EmitAqScalar(EncoderDebugDataSink* sink, const std::string& name,
+                    int iteration, const char* units, const char* semantic,
+                    double value) {
+  if (sink == nullptr) return true;
+  DebugArtifactInfo info;
+  info.name = name.c_str();
+  info.stage = "butteraugli_aq";
+  info.iteration = iteration;
+  info.grid.kind = DebugGridKind::kOther;
+  info.units = units;
+  info.semantic = semantic;
+  if (!sink->Wants(info)) return true;
+  return sink->EmitScalar(info, value);
+}
+
+#endif  // JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+
 Status DumpHeatmap(const CompressParams& cparams, const AuxOut* aux_out,
                    const std::string& label, const ImageF& image,
                    float good_threshold, float bad_threshold) {
@@ -942,6 +1098,9 @@ Status FindBestQuantization(const FrameHeader& frame_header,
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
   Quantizer& quantizer = enc_state->shared.quantizer;
   ImageI& raw_quant_field = enc_state->shared.raw_quant_field;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  const FrameDimensions& frame_dim = enc_state->shared.frame_dim;
+#endif
 
   const float butteraugli_target = cparams.butteraugli_distance;
   const float original_butteraugli = cparams.original_butteraugli_distance;
@@ -982,7 +1141,22 @@ Status FindBestQuantization(const FrameHeader& frame_header,
   if (cparams.speed_tier <= SpeedTier::kTortoise) {
     iters = kMaxButteraugliIters;
   }
+  const double kPow[8] = {
+      0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  };
+  const double kPowMod[8] = {
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  };
   for (int i = 0; i < iters + 1; ++i) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    if (cparams.debug_data != nullptr) {
+      JXL_RETURN_IF_ERROR(EmitAqBlockImageF(
+          cparams.debug_data, AqIterationArtifactName(i, "quant_field_in"), i,
+          frame_dim, cparams, "relative_inverse_quantization_step",
+          "Continuous quantization field entering this AQ comparison",
+          quant_field));
+    }
+#endif
     if (JXL_DEBUG_ADAPTIVE_QUANTIZATION) {
       printf("\nQuantization field:\n");
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
@@ -994,12 +1168,52 @@ Status FindBestQuantization(const FrameHeader& frame_header,
     }
     JXL_RETURN_IF_ERROR(quantizer.SetQuantField(initial_quant_dc, quant_field,
                                                 &raw_quant_field));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    if (cparams.debug_data != nullptr) {
+      JXL_RETURN_IF_ERROR(EmitAqBlockImageI(
+          cparams.debug_data, AqIterationArtifactName(i, "raw_quant_field"), i,
+          frame_dim, cparams, "raw_quantizer_index",
+          "Integer quantizer field used for this AQ round trip",
+          raw_quant_field));
+    }
+#endif
     JXL_ASSIGN_OR_RETURN(
         ImageBundle dec_linear,
         RoundtripImage(frame_header, opsin, enc_state, cms, pool));
     float score;
     ImageF diffmap;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    Image3F debug_decoded_linear;
+    std::string decoded_linear_name;
+    bool want_decoded_linear = false;
+    if (cparams.debug_data != nullptr) {
+      decoded_linear_name = AqIterationArtifactName(i, "decoded_linear_rgb");
+      want_decoded_linear = WantsAqPixelArtifact(
+          cparams.debug_data, decoded_linear_name, i, dec_linear.xsize(),
+          dec_linear.ysize(), "linear_srgb",
+          "Exact linear-light sRGB reconstruction supplied to Butteraugli");
+    }
+    JXL_RETURN_IF_ERROR(comparator.CompareWith(
+        dec_linear, &diffmap, &score,
+        want_decoded_linear ? &debug_decoded_linear : nullptr));
+    const float raw_score = score;
+    if (want_decoded_linear) {
+      JXL_RETURN_IF_ERROR(EmitAqPixelImage3F(
+          cparams.debug_data, decoded_linear_name, i, "linear_srgb",
+          "Exact linear-light sRGB reconstruction supplied to Butteraugli",
+          debug_decoded_linear));
+    }
+    if (cparams.debug_data != nullptr) {
+      JXL_RETURN_IF_ERROR(EmitAqPixelImageF(
+          cparams.debug_data, AqIterationArtifactName(i, "butteraugli_diffmap"),
+          i, "butteraugli_distance",
+          "Raw per-pixel difference field returned by the Butteraugli "
+          "comparator before visualization or direction normalization",
+          diffmap));
+    }
+#else
     JXL_RETURN_IF_ERROR(comparator.CompareWith(dec_linear, &diffmap, &score));
+#endif
     if (!lower_is_better) {
       score = -score;
       ScaleImage(-1.0f, &diffmap);
@@ -1007,6 +1221,165 @@ Status FindBestQuantization(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(tile_distmap,
                          TileDistMap(diffmap, 8 * cparams.resampling, 0,
                                      enc_state->shared.ac_strategy));
+
+    double cur_pow = 0.0;
+    if (i < 7) {
+      cur_pow = kPow[i] + (original_butteraugli - 1.0) * kPowMod[i];
+      if (cur_pow < 0) {
+        cur_pow = 0;
+      }
+    }
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    std::string error_ratio_name;
+    std::string tile_distmap_name;
+    std::string update_multiplier_name;
+    std::string clamped_low_name;
+    std::string clamped_high_name;
+    std::string rounding_stall_name;
+    std::string initial_clamp_name;
+    bool want_error_ratio = false;
+    bool want_update_multiplier = false;
+    bool want_clamped_low = false;
+    bool want_clamped_high = false;
+    bool want_rounding_stall = false;
+    bool want_initial_clamp = false;
+    if (cparams.debug_data != nullptr) {
+      error_ratio_name = AqIterationArtifactName(i, "error_ratio");
+      tile_distmap_name = AqIterationArtifactName(i, "tile_distmap");
+      update_multiplier_name =
+          AqIterationArtifactName(i, "quant_update_multiplier");
+      clamped_low_name = AqIterationArtifactName(i, "clamped_low");
+      clamped_high_name = AqIterationArtifactName(i, "clamped_high");
+      rounding_stall_name = AqIterationArtifactName(i, "quant_rounding_stall");
+      initial_clamp_name = AqIterationArtifactName(i, "initial_field_clamp");
+      want_error_ratio = WantsAqBlockArtifact(
+          cparams.debug_data, error_ratio_name, i, frame_dim, cparams,
+          "ratio_to_target", "Tile distance divided by the AQ target");
+      want_update_multiplier = WantsAqBlockArtifact(
+          cparams.debug_data, update_multiplier_name, i, frame_dim, cparams,
+          "multiplier", "Unclamped multiplicative AQ quant-field update");
+      want_clamped_low = WantsAqBlockArtifact(
+          cparams.debug_data, clamped_low_name, i, frame_dim, cparams,
+          "boolean",
+          "One where the iteration reached the lower quant-field bound");
+      want_clamped_high = WantsAqBlockArtifact(
+          cparams.debug_data, clamped_high_name, i, frame_dim, cparams,
+          "boolean",
+          "One where the iteration reached the upper quant-field bound");
+      want_rounding_stall = WantsAqBlockArtifact(
+          cparams.debug_data, rounding_stall_name, i, frame_dim, cparams,
+          "boolean",
+          "One where an increasing update rounded to the old raw quantizer "
+          "and was advanced by one quantizer step");
+      want_initial_clamp = WantsAqBlockArtifact(
+          cparams.debug_data, initial_clamp_name, i, frame_dim, cparams,
+          "boolean",
+          "One where the original-field blend clamped the iteration input");
+    }
+
+    ImageF debug_error_ratio;
+    ImageF debug_update_multiplier;
+    ImageB debug_clamped_low;
+    ImageB debug_clamped_high;
+    ImageB debug_rounding_stall;
+    ImageB debug_initial_clamp;
+    if (want_error_ratio) {
+      JXL_ASSIGN_OR_RETURN(debug_error_ratio,
+                           ImageF::Create(memory_manager, quant_field.xsize(),
+                                          quant_field.ysize()));
+      for (size_t y = 0; y < quant_field.ysize(); ++y) {
+        const float* JXL_RESTRICT row_dist = tile_distmap.ConstRow(y);
+        float* JXL_RESTRICT row_ratio = debug_error_ratio.Row(y);
+        for (size_t x = 0; x < quant_field.xsize(); ++x) {
+          row_ratio[x] = row_dist[x] / original_butteraugli;
+        }
+      }
+    }
+    if (want_update_multiplier) {
+      JXL_ASSIGN_OR_RETURN(debug_update_multiplier,
+                           ImageF::Create(memory_manager, quant_field.xsize(),
+                                          quant_field.ysize()));
+      FillImage(1.0f, &debug_update_multiplier);
+    }
+    if (want_clamped_low) {
+      JXL_ASSIGN_OR_RETURN(debug_clamped_low,
+                           ImageB::Create(memory_manager, quant_field.xsize(),
+                                          quant_field.ysize()));
+      FillImage(static_cast<uint8_t>(0), &debug_clamped_low);
+    }
+    if (want_clamped_high) {
+      JXL_ASSIGN_OR_RETURN(debug_clamped_high,
+                           ImageB::Create(memory_manager, quant_field.xsize(),
+                                          quant_field.ysize()));
+      FillImage(static_cast<uint8_t>(0), &debug_clamped_high);
+    }
+    if (want_rounding_stall) {
+      JXL_ASSIGN_OR_RETURN(debug_rounding_stall,
+                           ImageB::Create(memory_manager, quant_field.xsize(),
+                                          quant_field.ysize()));
+      FillImage(static_cast<uint8_t>(0), &debug_rounding_stall);
+    }
+    if (want_initial_clamp) {
+      JXL_ASSIGN_OR_RETURN(debug_initial_clamp,
+                           ImageB::Create(memory_manager, quant_field.xsize(),
+                                          quant_field.ysize()));
+      FillImage(static_cast<uint8_t>(0), &debug_initial_clamp);
+    }
+
+    if (cparams.debug_data != nullptr) {
+      JXL_RETURN_IF_ERROR(EmitAqBlockImageF(
+          cparams.debug_data, tile_distmap_name, i, frame_dim, cparams,
+          "butteraugli_distance",
+          "Native per-transform 16th-norm distance field used by the AQ "
+          "update, repeated over covered blocks",
+          tile_distmap));
+      if (want_error_ratio) {
+        const char* const derived_from[] = {tile_distmap_name.c_str()};
+        JXL_RETURN_IF_ERROR(EmitAqBlockImageF(
+            cparams.debug_data, error_ratio_name, i, frame_dim, cparams,
+            "ratio_to_target", "Tile distance divided by the AQ target",
+            debug_error_ratio, derived_from, 1, "tile_distmap / target"));
+      }
+      JXL_RETURN_IF_ERROR(EmitAqScalar(
+          cparams.debug_data, AqIterationArtifactName(i, "score"), i,
+          "butteraugli_distance",
+          "Raw scalar score returned by the Butteraugli comparator",
+          raw_score));
+      JXL_RETURN_IF_ERROR(EmitAqScalar(
+          cparams.debug_data, AqIterationArtifactName(i, "target"), i,
+          "butteraugli_distance", "AQ update target", original_butteraugli));
+      JXL_RETURN_IF_ERROR(EmitAqScalar(
+          cparams.debug_data, AqIterationArtifactName(i, "encoder_target"), i,
+          "butteraugli_distance",
+          "Encoder Butteraugli target before original-distance correction",
+          butteraugli_target));
+      JXL_RETURN_IF_ERROR(
+          EmitAqScalar(cparams.debug_data,
+                       AqIterationArtifactName(i, "quant_field_lower_bound"), i,
+                       "relative_inverse_quantization_step",
+                       "Lower continuous quant-field bound", qf_lower));
+      JXL_RETURN_IF_ERROR(
+          EmitAqScalar(cparams.debug_data,
+                       AqIterationArtifactName(i, "quant_field_upper_bound"), i,
+                       "relative_inverse_quantization_step",
+                       "Upper continuous quant-field bound", qf_higher));
+      JXL_RETURN_IF_ERROR(EmitAqScalar(
+          cparams.debug_data, AqIterationArtifactName(i, "dc_quantizer"), i,
+          "relative_inverse_quantization_step",
+          "DC quantizer used for this round trip", initial_quant_dc));
+      JXL_RETURN_IF_ERROR(EmitAqScalar(
+          cparams.debug_data, AqIterationArtifactName(i, "update_exponent"), i,
+          "exponent",
+          "Exponent applied when reducing quantization in blocks below the "
+          "target",
+          cur_pow));
+      JXL_RETURN_IF_ERROR(EmitAqScalar(
+          cparams.debug_data, AqIterationArtifactName(i, "update_applied"), i,
+          "boolean", "One when this comparison is followed by an AQ update",
+          i == iters ? 0.0 : 1.0));
+    }
+#endif
     if (JXL_DEBUG_ADAPTIVE_QUANTIZATION && WantDebugOutput(cparams)) {
       JXL_RETURN_IF_ERROR(DumpImage(cparams, ("dec" + ToString(i)).c_str(),
                                     *dec_linear.color()));
@@ -1028,15 +1401,7 @@ Status FindBestQuantization(const FrameHeader& frame_header,
       }
     }
 
-    if (i == iters) break;
-
-    double kPow[8] = {
-        0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    };
-    double kPowMod[8] = {
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    };
-    if (i == kOriginalComparisonRound) {
+    if (i != iters && i == kOriginalComparisonRound) {
       // Don't allow optimization to make the quant field a lot worse than
       // what the initial guess was. This allows the AC field to have enough
       // precision to reduce the oscillations due to the dc reconstruction.
@@ -1045,31 +1410,115 @@ Status FindBestQuantization(const FrameHeader& frame_header,
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
         float* const JXL_RESTRICT row_q = quant_field.Row(y);
         const float* const JXL_RESTRICT row_init = initial_quant_field.Row(y);
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+        uint8_t* const JXL_RESTRICT row_initial_clamp =
+            want_initial_clamp ? debug_initial_clamp.Row(y) : nullptr;
+        uint8_t* const JXL_RESTRICT row_clamped_low =
+            want_clamped_low ? debug_clamped_low.Row(y) : nullptr;
+        uint8_t* const JXL_RESTRICT row_clamped_high =
+            want_clamped_high ? debug_clamped_high.Row(y) : nullptr;
+#endif
         for (size_t x = 0; x < quant_field.xsize(); ++x) {
           double clamp = kOneMinusInitMul * row_q[x] + kInitMul * row_init[x];
           if (row_q[x] < clamp) {
             row_q[x] = clamp;
-            if (row_q[x] > qf_higher) row_q[x] = qf_higher;
-            if (row_q[x] < qf_lower) row_q[x] = qf_lower;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            if (row_initial_clamp != nullptr) row_initial_clamp[x] = 1;
+#endif
+            if (row_q[x] > qf_higher) {
+              row_q[x] = qf_higher;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+              if (row_clamped_high != nullptr) row_clamped_high[x] = 1;
+#endif
+            }
+            if (row_q[x] < qf_lower) {
+              row_q[x] = qf_lower;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+              if (row_clamped_low != nullptr) row_clamped_low[x] = 1;
+#endif
+            }
           }
         }
       }
     }
 
-    double cur_pow = 0.0;
-    if (i < 7) {
-      cur_pow = kPow[i] + (original_butteraugli - 1.0) * kPowMod[i];
-      if (cur_pow < 0) {
-        cur_pow = 0;
-      }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    if (cparams.debug_data != nullptr) {
+      JXL_RETURN_IF_ERROR(EmitAqBlockImageF(
+          cparams.debug_data,
+          AqIterationArtifactName(i, "quant_field_pre_update"), i, frame_dim,
+          cparams, "relative_inverse_quantization_step",
+          "Quantization field after any original-field clamp and immediately "
+          "before the multiplicative AQ update",
+          quant_field));
     }
+#endif
+
+    if (i == iters) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      if (cparams.debug_data != nullptr) {
+        if (want_update_multiplier) {
+          JXL_RETURN_IF_ERROR(EmitAqBlockImageF(
+              cparams.debug_data, update_multiplier_name, i, frame_dim, cparams,
+              "multiplier",
+              "Identity multiplier because the terminal comparison has no "
+              "following update",
+              debug_update_multiplier));
+        }
+        if (want_clamped_low) {
+          JXL_RETURN_IF_ERROR(EmitAqBlockImageB(
+              cparams.debug_data, clamped_low_name, i, frame_dim, cparams,
+              "No lower-bound clamps in the terminal comparison",
+              debug_clamped_low));
+        }
+        if (want_clamped_high) {
+          JXL_RETURN_IF_ERROR(EmitAqBlockImageB(
+              cparams.debug_data, clamped_high_name, i, frame_dim, cparams,
+              "No upper-bound clamps in the terminal comparison",
+              debug_clamped_high));
+        }
+        if (want_rounding_stall) {
+          JXL_RETURN_IF_ERROR(EmitAqBlockImageB(
+              cparams.debug_data, rounding_stall_name, i, frame_dim, cparams,
+              "No quantizer-rounding corrections in the terminal comparison",
+              debug_rounding_stall));
+        }
+        if (want_initial_clamp) {
+          JXL_RETURN_IF_ERROR(EmitAqBlockImageB(
+              cparams.debug_data, initial_clamp_name, i, frame_dim, cparams,
+              "No original-field clamp in the terminal comparison",
+              debug_initial_clamp));
+        }
+        JXL_RETURN_IF_ERROR(EmitAqBlockImageF(
+            cparams.debug_data, AqIterationArtifactName(i, "quant_field_out"),
+            i, frame_dim, cparams, "relative_inverse_quantization_step",
+            "Unchanged quantization field after the terminal comparison",
+            quant_field));
+      }
+#endif
+      break;
+    }
+
     if (cur_pow == 0.0) {
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
         const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
         float* const JXL_RESTRICT row_q = quant_field.Row(y);
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+        float* const JXL_RESTRICT row_multiplier =
+            want_update_multiplier ? debug_update_multiplier.Row(y) : nullptr;
+        uint8_t* const JXL_RESTRICT row_stall =
+            want_rounding_stall ? debug_rounding_stall.Row(y) : nullptr;
+        uint8_t* const JXL_RESTRICT row_clamped_low =
+            want_clamped_low ? debug_clamped_low.Row(y) : nullptr;
+        uint8_t* const JXL_RESTRICT row_clamped_high =
+            want_clamped_high ? debug_clamped_high.Row(y) : nullptr;
+#endif
         for (size_t x = 0; x < quant_field.xsize(); ++x) {
           const float diff = row_dist[x] / original_butteraugli;
           if (diff > 1.0f) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            if (row_multiplier != nullptr) row_multiplier[x] = diff;
+#endif
             float old = row_q[x];
             row_q[x] *= diff;
             int qf_old =
@@ -1078,21 +1527,52 @@ Status FindBestQuantization(const FrameHeader& frame_header,
                 std::lround(row_q[x] * quantizer.InvGlobalScale()));
             if (qf_old == qf_new) {
               row_q[x] = old + quantizer.Scale();
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+              if (row_stall != nullptr) row_stall[x] = 1;
+#endif
             }
           }
-          if (row_q[x] > qf_higher) row_q[x] = qf_higher;
-          if (row_q[x] < qf_lower) row_q[x] = qf_lower;
+          if (row_q[x] > qf_higher) {
+            row_q[x] = qf_higher;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            if (row_clamped_high != nullptr) row_clamped_high[x] = 1;
+#endif
+          }
+          if (row_q[x] < qf_lower) {
+            row_q[x] = qf_lower;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            if (row_clamped_low != nullptr) row_clamped_low[x] = 1;
+#endif
+          }
         }
       }
     } else {
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
         const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
         float* const JXL_RESTRICT row_q = quant_field.Row(y);
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+        float* const JXL_RESTRICT row_multiplier =
+            want_update_multiplier ? debug_update_multiplier.Row(y) : nullptr;
+        uint8_t* const JXL_RESTRICT row_stall =
+            want_rounding_stall ? debug_rounding_stall.Row(y) : nullptr;
+        uint8_t* const JXL_RESTRICT row_clamped_low =
+            want_clamped_low ? debug_clamped_low.Row(y) : nullptr;
+        uint8_t* const JXL_RESTRICT row_clamped_high =
+            want_clamped_high ? debug_clamped_high.Row(y) : nullptr;
+#endif
         for (size_t x = 0; x < quant_field.xsize(); ++x) {
           const float diff = row_dist[x] / original_butteraugli;
           if (diff <= 1.0f) {
             row_q[x] *= std::pow(diff, cur_pow);
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            if (row_multiplier != nullptr) {
+              row_multiplier[x] = static_cast<float>(std::pow(diff, cur_pow));
+            }
+#endif
           } else {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            if (row_multiplier != nullptr) row_multiplier[x] = diff;
+#endif
             float old = row_q[x];
             row_q[x] *= diff;
             int qf_old =
@@ -1101,13 +1581,65 @@ Status FindBestQuantization(const FrameHeader& frame_header,
                 std::lround(row_q[x] * quantizer.InvGlobalScale()));
             if (qf_old == qf_new) {
               row_q[x] = old + quantizer.Scale();
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+              if (row_stall != nullptr) row_stall[x] = 1;
+#endif
             }
           }
-          if (row_q[x] > qf_higher) row_q[x] = qf_higher;
-          if (row_q[x] < qf_lower) row_q[x] = qf_lower;
+          if (row_q[x] > qf_higher) {
+            row_q[x] = qf_higher;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            if (row_clamped_high != nullptr) row_clamped_high[x] = 1;
+#endif
+          }
+          if (row_q[x] < qf_lower) {
+            row_q[x] = qf_lower;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            if (row_clamped_low != nullptr) row_clamped_low[x] = 1;
+#endif
+          }
         }
       }
     }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    if (cparams.debug_data != nullptr) {
+      if (want_update_multiplier) {
+        JXL_RETURN_IF_ERROR(EmitAqBlockImageF(
+            cparams.debug_data, update_multiplier_name, i, frame_dim, cparams,
+            "multiplier", "Unclamped multiplicative AQ quant-field update",
+            debug_update_multiplier));
+      }
+      if (want_clamped_low) {
+        JXL_RETURN_IF_ERROR(EmitAqBlockImageB(
+            cparams.debug_data, clamped_low_name, i, frame_dim, cparams,
+            "One where the iteration reached the lower quant-field bound",
+            debug_clamped_low));
+      }
+      if (want_clamped_high) {
+        JXL_RETURN_IF_ERROR(EmitAqBlockImageB(
+            cparams.debug_data, clamped_high_name, i, frame_dim, cparams,
+            "One where the iteration reached the upper quant-field bound",
+            debug_clamped_high));
+      }
+      if (want_rounding_stall) {
+        JXL_RETURN_IF_ERROR(EmitAqBlockImageB(
+            cparams.debug_data, rounding_stall_name, i, frame_dim, cparams,
+            "One where an increasing update rounded to the old raw quantizer "
+            "and was advanced by one quantizer step",
+            debug_rounding_stall));
+      }
+      if (want_initial_clamp) {
+        JXL_RETURN_IF_ERROR(EmitAqBlockImageB(
+            cparams.debug_data, initial_clamp_name, i, frame_dim, cparams,
+            "One where the original-field blend clamped the iteration input",
+            debug_initial_clamp));
+      }
+      JXL_RETURN_IF_ERROR(EmitAqBlockImageF(
+          cparams.debug_data, AqIterationArtifactName(i, "quant_field_out"), i,
+          frame_dim, cparams, "relative_inverse_quantization_step",
+          "Continuous quantization field after this AQ update", quant_field));
+    }
+#endif
   }
   JXL_RETURN_IF_ERROR(
       quantizer.SetQuantField(initial_quant_dc, quant_field, &raw_quant_field));

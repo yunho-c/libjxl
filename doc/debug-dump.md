@@ -4,8 +4,8 @@
 
 This document describes development-only infrastructure for dumping
 image-shaped intermediate state from the VarDCT encoder frontend. Phases 1
-and 2 are implemented; the later phases remain an implementation plan. None
-of this is a stable public API.
+through 3 are implemented; the later phases remain an implementation plan.
+None of this is a stable public API.
 
 The Phase 1 implementation provides:
 
@@ -25,6 +25,11 @@ Phase 2 adds the `jxl_encoder_dump` developer frontend and the `overview`
 profile. The profile captures native input and color-transform fields,
 inverse-Gaborish input and output, initial and final AQ fields, both CfL
 passes, final AC strategy maps, and EPF candidate and selection fields.
+
+Phase 3 adds the `aq` profile. At efforts that run Butteraugli refinement, it
+records every explicitly numbered comparison and update in native pixel and
+block spaces, including the comparator input and diffmap, 16th-norm tile
+field, quant-field snapshots, update multiplier, and clamp/stall masks.
 
 The primary recommendation is:
 
@@ -306,9 +311,9 @@ jxl_encoder_dump input.png output.jxl \
 The frontend deliberately accepts only a single, non-animated, one-shot
 pixel frame; it rejects JPEG input and forces VarDCT. `--num_threads` controls
 the worker count, and `--color_space` supplies a color-space hint for raw
-formats. The supported profiles are `overview` and `all`. `overview` selects
-the Phase 2 artifact families; `all` requests every capture point compiled
-into the current build.
+formats. The supported profiles are `overview`, `aq`, and `all`. `overview`
+selects the Phase 2 artifact families, `aq` selects every artifact below
+`aq/`, and `all` requests every capture point compiled into the current build.
 
 The overview profile can contain the following artifacts, depending on which
 heuristics the chosen effort and distance normally execute:
@@ -326,6 +331,35 @@ heuristics the chosen effort and distance normally execute:
 linear-light image (currently efforts 8 through 10). Likewise, candidate or
 multi-pass heuristic fields are omitted when the selected settings skip the
 corresponding computation. No diagnostic request enables a slower path.
+
+At efforts 8 through 10, the `aq` profile additionally contains a numbered
+directory for every Butteraugli comparison. Effort 8 normally writes
+`iter_000` through `iter_002`; efforts 9 and 10 normally write `iter_000`
+through `iter_004`. Each iteration contains:
+
+* the comparator input and output fields: `decoded_linear_rgb`,
+  `butteraugli_diffmap`, `tile_distmap`, and `error_ratio`;
+* `quant_field_in`, `raw_quant_field`, `quant_field_pre_update`, and
+  `quant_field_out`;
+* `quant_update_multiplier`, `clamped_low`, `clamped_high`,
+  `quant_rounding_stall`, and `initial_field_clamp`;
+* scalar `score`, `target`, `encoder_target`, quant-field bounds,
+  `dc_quantizer`, `update_exponent`, and `update_applied` artifacts.
+
+The last numbered record is a terminal comparison rather than an update. Its
+`update_applied` scalar is zero, its multiplier is one, its masks are zero,
+and `quant_field_out` equals `quant_field_in`. Iteration names and metadata
+come directly from the loop index and do not depend on `AuxOut` counters.
+
+For example:
+
+```text
+jxl_encoder_dump input.png output.jxl \
+  --debug_dump_dir aq-dump \
+  --debug_dump_profile aq \
+  --distance 1.0 \
+  --effort 8
+```
 
 ## Artifact format
 
@@ -722,6 +756,13 @@ byte-for-byte with the same encode performed without a sink.
 * Verify the instrumented and non-instrumented codestreams are identical.
 
 ### Phase 3: AQ and Butteraugli iteration profile
+
+Implemented. The `aq` profile captures post-AC quant fields and each
+Butteraugli comparison/update with an explicit zero-based iteration context.
+Raw comparator and 16th-norm fields are emitted before the legacy heatmap
+path, and diagnostic arrays are allocated only after a successful `Wants`
+query. The terminal comparison uses an explicit identity update record so all
+iterations share one analyzable schema.
 
 * Add an explicit iteration context independent of `AuxOut` counters.
 * Capture raw comparator and tile fields before visualization.
