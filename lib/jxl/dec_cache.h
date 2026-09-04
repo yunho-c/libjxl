@@ -81,6 +81,17 @@ struct ImageOutput {
   size_t stride;
 };
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+struct RenderPipelineDebugTaps {
+  Image3F* before_loop_filter = nullptr;
+  Image3F* after_gaborish = nullptr;
+  Image3F* after_epf0 = nullptr;
+  Image3F* after_epf1 = nullptr;
+  Image3F* after_epf2 = nullptr;
+  Image3F* after_loop_filter = nullptr;
+};
+#endif
+
 // Per-frame decoder state. All the images here should be accessed through a
 // group rect (either with block units or pixel units).
 struct PassesDecoderState {
@@ -144,6 +155,9 @@ struct PassesDecoderState {
     bool coalescing;
     bool render_spotcolors;
     bool render_noise;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    RenderPipelineDebugTaps debug_taps;
+#endif
   };
 
   JxlMemoryManager* memory_manager() const { return shared->memory_manager; }

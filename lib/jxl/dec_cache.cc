@@ -148,9 +148,22 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
     }
   }
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (options.debug_taps.before_loop_filter != nullptr) {
+    JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImage3FStage(
+        memory_manager, options.debug_taps.before_loop_filter)));
+  }
+#endif
+
   if (frame_header.loop_filter.gab) {
     JXL_RETURN_IF_ERROR(
         builder.AddStage(GetGaborishStage(frame_header.loop_filter)));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    if (options.debug_taps.after_gaborish != nullptr) {
+      JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImage3FStage(
+          memory_manager, options.debug_taps.after_gaborish)));
+    }
+#endif
   }
 
   {
@@ -158,16 +171,41 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
     if (lf.epf_iters >= 3) {
       JXL_RETURN_IF_ERROR(
           builder.AddStage(GetEPFStage(lf, sigma, EpfStage::Zero)));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      if (options.debug_taps.after_epf0 != nullptr) {
+        JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImage3FStage(
+            memory_manager, options.debug_taps.after_epf0)));
+      }
+#endif
     }
     if (lf.epf_iters >= 1) {
       JXL_RETURN_IF_ERROR(
           builder.AddStage(GetEPFStage(lf, sigma, EpfStage::One)));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      if (options.debug_taps.after_epf1 != nullptr) {
+        JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImage3FStage(
+            memory_manager, options.debug_taps.after_epf1)));
+      }
+#endif
     }
     if (lf.epf_iters >= 2) {
       JXL_RETURN_IF_ERROR(
           builder.AddStage(GetEPFStage(lf, sigma, EpfStage::Two)));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      if (options.debug_taps.after_epf2 != nullptr) {
+        JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImage3FStage(
+            memory_manager, options.debug_taps.after_epf2)));
+      }
+#endif
     }
   }
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (options.debug_taps.after_loop_filter != nullptr) {
+    JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImage3FStage(
+        memory_manager, options.debug_taps.after_loop_filter)));
+  }
+#endif
 
   bool late_ec_upsample = frame_header.upsampling != 1;
   for (auto ecups : frame_header.extra_channel_upsampling) {

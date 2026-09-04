@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 from pathlib import Path, PurePosixPath
 import sys
 from typing import Any
@@ -32,6 +34,10 @@ GRID_KINDS = {
 
 class ManifestError(ValueError):
   """Raised when a debug-data manifest is malformed or unsupported."""
+
+
+class VisualizationError(ValueError):
+  """Raised when an artifact cannot be rendered with the requested options."""
 
 
 def _expect_type(value: object, expected: type | tuple[type, ...],
@@ -311,11 +317,455 @@ class DebugDump:
     return x, y
 
 
+def parse_selections(values: list[str]) -> dict[str, int]:
+  """Parses repeated AXIS=INDEX selections used for higher-rank tensors."""
+  selections: dict[str, int] = {}
+  for value in values:
+    if "=" not in value:
+      raise VisualizationError(
+          f"invalid selection {value!r}; expected AXIS=INDEX")
+    axis, index_string = value.split("=", 1)
+    if not axis or axis in selections:
+      raise VisualizationError(f"invalid or duplicate selection axis {axis!r}")
+    try:
+      selections[axis] = int(index_string)
+    except ValueError as error:
+      raise VisualizationError(
+          f"selection index for {axis!r} must be an integer") from error
+  return selections
+
+
+def select_artifact(array: Any, artifact: dict[str, Any],
+                    selections: dict[str, int],
+                    channel: str | None = None) -> tuple[Any, list[str],
+                                                         dict[str, int]]:
+  """Applies named integer indexing without changing the stored array."""
+  axes = list(artifact["axes"])
+  unknown = selections.keys() - set(axes)
+  if unknown:
+    raise VisualizationError(
+        f"unknown selection axes: {', '.join(sorted(unknown))}")
+  chosen = dict(selections)
+  if channel is not None:
+    if "channel" not in axes:
+      raise VisualizationError("--channel requires an artifact channel axis")
+    if "channel" in chosen:
+      raise VisualizationError("select channel with either --channel or "
+                               "--select, not both")
+    channel_axis = axes.index("channel")
+    names = artifact.get("channel_names", [])
+    try:
+      channel_index = int(channel)
+    except ValueError:
+      if channel not in names:
+        raise VisualizationError(
+            f"unknown channel {channel!r}; choices are {names}")
+      channel_index = names.index(channel)
+    if not 0 <= channel_index < array.shape[channel_axis]:
+      raise VisualizationError(
+          f"channel index {channel_index} is outside axis size "
+          f"{array.shape[channel_axis]}")
+    chosen["channel"] = channel_index
+
+  index: list[int | slice] = []
+  remaining_axes: list[str] = []
+  normalized: dict[str, int] = {}
+  for axis, size in zip(axes, array.shape):
+    if axis not in chosen:
+      index.append(slice(None))
+      remaining_axes.append(axis)
+      continue
+    coordinate = chosen[axis]
+    if coordinate < 0:
+      coordinate += size
+    if not 0 <= coordinate < size:
+      raise VisualizationError(
+          f"selection {axis}={chosen[axis]} is outside axis size {size}")
+    index.append(coordinate)
+    normalized[axis] = coordinate
+  return array[tuple(index)], remaining_axes, normalized
+
+
+def _spatial_extent(
+    artifact: dict[str, Any],
+    shape: tuple[int, ...]) -> tuple[float, float, float, float]:
+  grid = artifact["grid"]
+  origin_x, origin_y = grid["origin_px"]
+  spacing_x, spacing_y = grid["spacing_px"]
+  footprint_x, footprint_y = grid["footprint_px"]
+  ysize, xsize = shape[-2:]
+  right = origin_x + (xsize - 1) * spacing_x + footprint_x
+  bottom = origin_y + (ysize - 1) * spacing_y + footprint_y
+  return float(origin_x), float(right), float(bottom), float(origin_y)
+
+
+def _validate_spatial_axes(artifact: dict[str, Any], axes: list[str]) -> None:
+  expected = artifact["axes"][-2:]
+  if len(expected) != 2 or len(axes) < 2 or axes[-2:] != expected:
+    raise VisualizationError(
+        f"remaining axes {axes} do not preserve spatial axes {expected}; "
+        "select only non-spatial tensor axes")
+
+
+def _continuous_limits(array: Any, mapping: str, vmin: float | None,
+                       vmax: float | None,
+                       percentiles: tuple[float, float] | None
+                       ) -> tuple[float, float]:
+  import numpy as np
+  usable = np.asarray(array)[np.isfinite(array)]
+  if mapping == "log":
+    usable = usable[usable > 0]
+  if usable.size == 0:
+    qualifier = "positive " if mapping == "log" else "finite "
+    raise VisualizationError(f"artifact has no {qualifier}values to render")
+  if percentiles is not None:
+    low, high = percentiles
+    if not 0 <= low < high <= 100:
+      raise VisualizationError("percentiles must satisfy 0 <= LOW < HIGH <= 100")
+    default_min, default_max = np.percentile(usable, [low, high])
+  else:
+    default_min = np.min(usable)
+    default_max = np.max(usable)
+  lower = float(default_min if vmin is None else vmin)
+  upper = float(default_max if vmax is None else vmax)
+  if not math.isfinite(lower) or not math.isfinite(upper):
+    raise VisualizationError("render range must be finite")
+  if mapping == "log" and lower <= 0:
+    raise VisualizationError("log mapping requires a positive lower bound")
+  if lower > upper:
+    raise VisualizationError("render range lower bound exceeds upper bound")
+  if lower == upper:
+    delta = max(abs(lower), 1.0) * 1e-6
+    lower -= delta
+    upper += delta
+    if mapping == "log" and lower <= 0:
+      lower = max(upper * 1e-6, float(np.finfo(np.float32).tiny))
+  return lower, upper
+
+
+def _write_sidecar(output: Path, metadata: dict[str, Any]) -> Path:
+  sidecar = output.with_suffix(output.suffix + ".json")
+  sidecar.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+                     encoding="utf-8")
+  return sidecar
+
+
+def render_artifact(dump: DebugDump, name: str, output: str | Path,
+                    selections: dict[str, int] | None = None,
+                    channel: str | None = None, rgb: bool = False,
+                    mapping: str = "auto", vmin: float | None = None,
+                    vmax: float | None = None,
+                    percentiles: tuple[float, float] | None = None,
+                    linthresh: float = 1e-3, cmap: str | None = None,
+                    colorbar: bool = True, legend: bool = True,
+                    overlay: str | Path | None = None,
+                    overlay_alpha: float = 0.45,
+                    title: str | None = None) -> Path:
+  """Renders one selected artifact to PNG and records the mapping sidecar."""
+  try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.colors as colors
+    import matplotlib.patches as patches
+    import matplotlib.pyplot as plt
+    import numpy as np
+  except ImportError as error:
+    raise RuntimeError(
+        "Matplotlib and NumPy are required for PNG rendering") from error
+
+  if name not in dump.artifacts:
+    raise KeyError(name)
+  artifact = dump.artifacts[name]
+  selected, axes, normalized_selections = select_artifact(
+      dump.load(name), artifact, selections or {}, channel)
+  _validate_spatial_axes(artifact, axes)
+  output_path = Path(output)
+  if output_path.suffix.lower() != ".png":
+    raise VisualizationError("render output must use a .png extension")
+  if not 0 <= overlay_alpha <= 1:
+    raise VisualizationError("overlay alpha must be between zero and one")
+
+  channel_axis = axes.index("channel") if "channel" in axes else None
+  if rgb:
+    if selected.ndim != 3 or channel_axis is None or \
+        selected.shape[channel_axis] != 3:
+      raise VisualizationError(
+          "--rgb requires exactly three remaining values on a channel axis")
+    display = np.moveaxis(np.asarray(selected, dtype=np.float64),
+                          channel_axis, -1)
+    spatial_shape = display.shape[:2]
+  else:
+    if selected.ndim != 2:
+      raise VisualizationError(
+          f"rendering requires a 2D field after selection; remaining axes are "
+          f"{axes}. Use --select or --channel, or --rgb for three channels")
+    display = np.asarray(selected)
+    spatial_shape = display.shape
+
+  categories = artifact.get("categories", [])
+  selected_mapping = mapping
+  if mapping == "auto":
+    selected_mapping = "categorical" if categories and not rgb else "linear"
+  if selected_mapping not in {"linear", "log", "symlog", "categorical"}:
+    raise VisualizationError(f"unknown mapping {selected_mapping!r}")
+  if rgb and selected_mapping == "categorical":
+    raise VisualizationError("categorical mapping cannot render an RGB image")
+  if selected_mapping == "symlog" and linthresh <= 0:
+    raise VisualizationError("symmetric-log linthresh must be positive")
+  if (selected_mapping == "categorical" and
+      (vmin is not None or vmax is not None or percentiles is not None)):
+    raise VisualizationError(
+        "range and percentile options do not apply to categorical mapping")
+
+  source = None
+  if overlay is not None:
+    try:
+      from PIL import Image, ImageOps
+    except ImportError as error:
+      raise RuntimeError(
+          "Pillow is required for source-image overlays") from error
+    with Image.open(overlay) as image:
+      source = np.asarray(ImageOps.exif_transpose(image).convert("RGB"))
+    frame = dump.manifest["frame"]
+    if source.shape[:2] != (frame["ysize"], frame["xsize"]):
+      raise VisualizationError(
+          f"overlay is {source.shape[1]}x{source.shape[0]}, expected "
+          f"{frame['xsize']}x{frame['ysize']}")
+
+  figure, axis = plt.subplots(figsize=(8.0, 6.0), constrained_layout=True)
+  frame = dump.manifest["frame"]
+  if source is not None:
+    axis.imshow(source, extent=(0, frame["xsize"], frame["ysize"], 0),
+                interpolation="nearest")
+  extent = _spatial_extent(artifact, tuple(spatial_shape))
+  alpha = overlay_alpha if source is not None else 1.0
+  render_metadata: dict[str, Any] = {
+      "artifact": name,
+      "source_dtype": artifact["dtype"],
+      "source_shape": artifact["shape"],
+      "selected_axes": axes,
+      "selections": normalized_selections,
+      "mapping": selected_mapping,
+      "grid_extent_px": list(extent),
+      "colormap": cmap,
+      "colorbar": colorbar,
+      "legend": legend,
+      "overlay": str(overlay) if overlay is not None else None,
+      "overlay_alpha": alpha,
+  }
+
+  if selected_mapping == "categorical":
+    finite_values = np.asarray(display)[np.isfinite(display)]
+    unique_values = sorted(int(value) for value in np.unique(finite_values))
+    category_by_value = {int(item["value"]): item for item in categories}
+    labels = [
+        category_by_value.get(value, {"name": f"unknown ({value})"})["name"]
+        for value in unique_values
+    ]
+    indexed = np.full(display.shape, np.nan, dtype=np.float64)
+    for index, value in enumerate(unique_values):
+      indexed[display == value] = index
+    palette_name = cmap or "tab20"
+    palette = plt.colormaps[palette_name].resampled(max(len(unique_values), 1))
+    axis.imshow(indexed, origin="upper", extent=extent,
+                interpolation="nearest", cmap=palette,
+                vmin=-0.5, vmax=max(len(unique_values) - 0.5, 0.5),
+                alpha=alpha)
+    if legend and unique_values:
+      handles = [
+          patches.Patch(color=palette(index / max(len(unique_values) - 1, 1)),
+                        label=f"{value}: {label}")
+          for index, (value, label) in enumerate(zip(unique_values, labels))
+      ]
+      axis.legend(handles=handles, title=artifact["units"], loc="upper left",
+                  bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+    render_metadata["categories"] = [
+        {"value": value, "label": label}
+        for value, label in zip(unique_values, labels)
+    ]
+    render_metadata["colormap"] = palette_name
+  else:
+    lower, upper = _continuous_limits(display, selected_mapping, vmin, vmax,
+                                      percentiles)
+    if selected_mapping == "linear":
+      norm = colors.Normalize(vmin=lower, vmax=upper, clip=False)
+    elif selected_mapping == "log":
+      norm = colors.LogNorm(vmin=lower, vmax=upper, clip=False)
+    else:
+      norm = colors.SymLogNorm(linthresh=linthresh, vmin=lower, vmax=upper,
+                               clip=False)
+    masked = np.ma.masked_invalid(display)
+    if selected_mapping == "log":
+      masked = np.ma.masked_less_equal(masked, 0)
+    if rgb:
+      axis.imshow(norm(masked).filled(0), origin="upper", extent=extent,
+                  interpolation="nearest", alpha=alpha)
+    else:
+      palette_name = cmap or "viridis"
+      image = axis.imshow(masked, origin="upper", extent=extent,
+                          interpolation="nearest", cmap=palette_name,
+                          norm=norm, alpha=alpha)
+      if colorbar:
+        bar = figure.colorbar(image, ax=axis)
+        bar.set_label(artifact["units"])
+      render_metadata["colormap"] = palette_name
+    render_metadata["range"] = [lower, upper]
+    render_metadata["percentiles"] = (list(percentiles)
+                                        if percentiles is not None else None)
+    if selected_mapping == "symlog":
+      render_metadata["linthresh"] = linthresh
+
+  axis.set_title(title or name)
+  axis.set_xlabel("full-frame x (pixels)")
+  axis.set_ylabel("full-frame y (pixels)")
+  axis.set_xlim(0, frame["xsize"])
+  axis.set_ylim(frame["ysize"], 0)
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  figure.savefig(output_path, dpi=150)
+  plt.close(figure)
+  _write_sidecar(output_path, render_metadata)
+  return output_path
+
+
+def export_exr(dump: DebugDump, name: str, output: str | Path,
+               selections: dict[str, int] | None = None,
+               channel: str | None = None) -> Path:
+  """Exports a 2D field or channel-first image to float32 OpenEXR."""
+  import numpy as np
+  if name not in dump.artifacts:
+    raise KeyError(name)
+  artifact = dump.artifacts[name]
+  selected, axes, normalized_selections = select_artifact(
+      dump.load(name), artifact, selections or {}, channel)
+  _validate_spatial_axes(artifact, axes)
+  output_path = Path(output)
+  if output_path.suffix.lower() != ".exr":
+    raise VisualizationError("EXR output must use a .exr extension")
+
+  if selected.ndim == 2:
+    channels = np.asarray(selected, dtype="<f4")[None, :, :]
+    if "channel" in normalized_selections and artifact.get("channel_names"):
+      channel_names = [artifact["channel_names"][
+          normalized_selections["channel"]]]
+    else:
+      channel_names = ["Y"]
+  elif selected.ndim == 3 and "channel" in axes:
+    channel_axis = axes.index("channel")
+    channels = np.asarray(np.moveaxis(selected, channel_axis, 0), dtype="<f4")
+    original_names = artifact.get("channel_names", [])
+    channel_names = (list(original_names) if len(original_names) == len(channels)
+                     else [f"channel_{index}" for index in range(len(channels))])
+  else:
+    raise VisualizationError(
+        f"EXR export requires a 2D field or one channel axis; remaining axes "
+        f"are {axes}. Use --select to choose tensor indices")
+
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  backend = ""
+  try:
+    import Imath
+    import OpenEXR
+    header = OpenEXR.Header(channels.shape[2], channels.shape[1])
+    pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+    header["channels"] = {
+        str(channel_name): Imath.Channel(pixel_type)
+        for channel_name in channel_names
+    }
+    writer = OpenEXR.OutputFile(str(output_path), header)
+    try:
+      writer.writePixels({
+          str(channel_name): np.ascontiguousarray(channel_values).tobytes()
+          for channel_name, channel_values in zip(channel_names, channels)
+      })
+    finally:
+      writer.close()
+    backend = "OpenEXR"
+  except ImportError:
+    os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+    try:
+      import cv2
+    except ImportError as error:
+      raise RuntimeError(
+          "EXR export requires the OpenEXR Python bindings or OpenCV with "
+          "OpenEXR support") from error
+    if len(channels) == 1:
+      cv_image = channels[0]
+      file_channels = ["Y"]
+    elif len(channels) == 3:
+      cv_image = np.moveaxis(channels[[2, 1, 0]], 0, -1)
+      file_channels = ["R", "G", "B"]
+    elif len(channels) == 4:
+      cv_image = np.moveaxis(channels[[2, 1, 0, 3]], 0, -1)
+      file_channels = ["R", "G", "B", "A"]
+    else:
+      raise RuntimeError(
+          "OpenCV EXR fallback supports one, three, or four channels; install "
+          "the OpenEXR bindings for arbitrary channel counts")
+    try:
+      written = cv2.imwrite(str(output_path), cv_image)
+    except cv2.error as error:
+      raise RuntimeError(f"OpenCV failed to write {output_path}: {error}") \
+          from error
+    if not written:
+      raise RuntimeError(f"OpenCV failed to write {output_path}")
+    backend = "OpenCV"
+    # OpenCV names one-channel files Y and three-channel files RGB while
+    # accepting BGR memory order.
+    channel_names = [
+        f"{file_channel}={source_channel}"
+        for file_channel, source_channel in zip(file_channels, channel_names)
+    ]
+
+  _write_sidecar(output_path, {
+      "artifact": name,
+      "backend": backend,
+      "channels": channel_names,
+      "selections": normalized_selections,
+      "source_dtype": artifact["dtype"],
+      "source_shape": artifact["shape"],
+      "stored_dtype": "float32",
+  })
+  return output_path
+
+
 def main(argv: list[str]) -> int:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("dump_dir", type=Path)
   parser.add_argument("--list", action="store_true",
                       help="list validated artifact names")
+  parser.add_argument("--render", metavar="ARTIFACT",
+                      help="render or export one named artifact")
+  parser.add_argument("--output", type=Path,
+                      help="output .png preview or raw float .exr")
+  parser.add_argument("--select", action="append", default=[],
+                      metavar="AXIS=INDEX",
+                      help="select a tensor index; may be repeated")
+  parser.add_argument("--channel",
+                      help="select a channel by name or integer index")
+  parser.add_argument("--rgb", action="store_true",
+                      help="render three remaining channels as RGB")
+  parser.add_argument("--mapping",
+                      choices=("auto", "linear", "log", "symlog",
+                               "categorical"),
+                      help="PNG value mapping (default: metadata-aware auto)")
+  parser.add_argument("--range", nargs=2, type=float,
+                      metavar=("MIN", "MAX"), dest="value_range",
+                      help="explicit PNG mapping range")
+  parser.add_argument("--percentile", nargs=2, type=float,
+                      metavar=("LOW", "HIGH"),
+                      help="derive missing PNG range bounds from percentiles")
+  parser.add_argument("--linthresh", type=float, default=1e-3,
+                      help="linear threshold for symlog mapping")
+  parser.add_argument("--cmap", help="Matplotlib colormap name")
+  parser.add_argument("--no-colorbar", action="store_true",
+                      help="omit the continuous-value color bar")
+  parser.add_argument("--no-legend", action="store_true",
+                      help="omit the categorical legend")
+  parser.add_argument("--overlay", type=Path,
+                      help="source image to place beneath the artifact")
+  parser.add_argument("--overlay-alpha", type=float, default=0.45,
+                      help="artifact opacity for an overlay (default: 0.45)")
+  parser.add_argument("--title", help="override the PNG title")
   args = parser.parse_args(argv)
   try:
     dump = DebugDump(args.dump_dir)
@@ -323,8 +773,37 @@ def main(argv: list[str]) -> int:
     if args.list:
       for name in dump.artifacts:
         print(name)
-  except (ManifestError, OSError) as error:
-    print(f"encoder debug dump validation failed: {error}", file=sys.stderr)
+    if (args.render is None) != (args.output is None):
+      parser.error("--render and --output must be provided together")
+    if args.render is not None:
+      selections = parse_selections(args.select)
+      if args.output.suffix.lower() == ".png":
+        lower = args.value_range[0] if args.value_range else None
+        upper = args.value_range[1] if args.value_range else None
+        render_artifact(
+            dump, args.render, args.output, selections=selections,
+            channel=args.channel, rgb=args.rgb,
+            mapping=args.mapping or "auto", vmin=lower, vmax=upper,
+            percentiles=(tuple(args.percentile)
+                         if args.percentile is not None else None),
+            linthresh=args.linthresh, cmap=args.cmap,
+            colorbar=not args.no_colorbar, legend=not args.no_legend,
+            overlay=args.overlay, overlay_alpha=args.overlay_alpha,
+            title=args.title)
+      elif args.output.suffix.lower() == ".exr":
+        if (args.mapping is not None or args.value_range is not None or
+            args.percentile is not None or args.cmap is not None or
+            args.overlay is not None or args.rgb or args.title is not None):
+          raise VisualizationError(
+              "EXR is a raw float export; PNG mapping, RGB, title, and overlay "
+              "options do not apply")
+        export_exr(dump, args.render, args.output, selections=selections,
+                   channel=args.channel)
+      else:
+        raise VisualizationError("--output must end in .png or .exr")
+      print(f"wrote {args.output} and {args.output}.json")
+  except (KeyError, OSError, RuntimeError, ValueError) as error:
+    print(f"encoder debug-data operation failed: {error}", file=sys.stderr)
     return 1
   return 0
 

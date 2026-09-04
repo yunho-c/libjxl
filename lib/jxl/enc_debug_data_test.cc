@@ -39,6 +39,9 @@ struct CapturedTensor {
   size_t num_categories = 0;
   int64_t iteration = -1;
   DebugGridInfo grid;
+  std::string stage;
+  std::string units;
+  std::string semantic;
 };
 
 template <typename T>
@@ -79,6 +82,9 @@ class RecordingDebugDataSink : public EncoderDebugDataSink {
     }
     captured.num_categories = info.num_categories;
     captured.iteration = info.iteration;
+    captured.stage = info.stage == nullptr ? "" : info.stage;
+    captured.units = info.units == nullptr ? "" : info.units;
+    captured.semantic = info.semantic == nullptr ? "" : info.semantic;
 
     size_t num_elements = 1;
     for (size_t dimension : captured.shape) num_elements *= dimension;
@@ -239,6 +245,18 @@ TEST(EncoderDebugDataTest, CapturesEffortSevenFieldsWithoutChangingOutput) {
       "epf/candidate_reconstruction_xyb",
       "epf/candidate_values",
       "epf/selected_sharpness",
+      "filters/epf_candidate_0/after_epf1_xyb",
+      "filters/epf_candidate_0/after_gaborish_xyb",
+      "filters/epf_candidate_0/after_loop_filter_xyb",
+      "filters/epf_candidate_0/before_loop_filter_xyb",
+      "filters/epf_candidate_2/after_epf1_xyb",
+      "filters/epf_candidate_2/after_gaborish_xyb",
+      "filters/epf_candidate_2/after_loop_filter_xyb",
+      "filters/epf_candidate_2/before_loop_filter_xyb",
+      "filters/epf_candidate_7/after_epf1_xyb",
+      "filters/epf_candidate_7/after_gaborish_xyb",
+      "filters/epf_candidate_7/after_loop_filter_xyb",
+      "filters/epf_candidate_7/before_loop_filter_xyb",
       "gaborish/input_xyb",
       "gaborish/output_xyb",
   };
@@ -397,6 +415,30 @@ TEST(EncoderDebugDataTest, CapturesEffortSevenFieldsWithoutChangingOutput) {
   for (uint8_t value : selected.values) {
     EXPECT_NE(candidates.end(), candidates.find(value));
   }
+
+  for (uint8_t candidate : candidates) {
+    const std::string prefix =
+        "filters/epf_candidate_" + std::to_string(candidate) + "/";
+    const CapturedTensor& before =
+        sink.tensors.at(prefix + "before_loop_filter_xyb");
+    const CapturedTensor& after_gaborish =
+        sink.tensors.at(prefix + "after_gaborish_xyb");
+    const CapturedTensor& after_epf =
+        sink.tensors.at(prefix + "after_epf1_xyb");
+    const CapturedTensor& after_all =
+        sink.tensors.at(prefix + "after_loop_filter_xyb");
+    EXPECT_EQ((std::vector<size_t>{3, 9, 17}), before.shape);
+    EXPECT_EQ(before.shape, after_gaborish.shape);
+    EXPECT_EQ(before.shape, after_epf.shape);
+    EXPECT_EQ("roundtrip_loop_filter", before.stage);
+    EXPECT_EQ("encoder_xyb", before.units);
+    EXPECT_EQ(-1, before.iteration);
+    EXPECT_NE(before.values, after_gaborish.values);
+    EXPECT_EQ(after_epf.values, after_all.values);
+    for (size_t i = 0; i < after_all.values.size() / sizeof(float); ++i) {
+      EXPECT_TRUE(std::isfinite(CapturedValue<float>(after_all, i)));
+    }
+  }
 }
 
 TEST(EncoderDebugDataTest,
@@ -511,6 +553,23 @@ TEST(EncoderDebugDataTest,
       EXPECT_EQ((std::vector<size_t>{2, 3}), mask.shape);
       for (uint8_t value : mask.values) EXPECT_LE(value, 1);
     }
+
+    const std::string filter_prefix =
+        "filters/aq/iter_00" + std::to_string(iteration) + "/";
+    const CapturedTensor& filter_before =
+        sink.tensors.at(filter_prefix + "before_loop_filter_xyb");
+    const CapturedTensor& filter_after_epf =
+        sink.tensors.at(filter_prefix + "after_epf1_xyb");
+    const CapturedTensor& filter_after_all =
+        sink.tensors.at(filter_prefix + "after_loop_filter_xyb");
+    const CapturedTensor& filter_final_linear =
+        sink.tensors.at(filter_prefix + "final_linear_rgb");
+    EXPECT_EQ((std::vector<size_t>{3, 9, 17}), filter_before.shape);
+    EXPECT_EQ(filter_before.shape, filter_after_epf.shape);
+    EXPECT_EQ(filter_after_epf.values, filter_after_all.values);
+    EXPECT_EQ((std::vector<size_t>{3, 9, 17}), filter_final_linear.shape);
+    EXPECT_EQ("linear_srgb", filter_final_linear.units);
+    EXPECT_EQ(iteration, filter_final_linear.iteration);
   }
 
   EXPECT_EQ(sink.tensors.at("aq/iter_000/quant_field_out").values,

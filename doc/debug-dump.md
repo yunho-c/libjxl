@@ -4,7 +4,7 @@
 
 This document describes development-only infrastructure for dumping
 image-shaped intermediate state from the VarDCT encoder frontend. Phases 1
-through 4 are implemented; the later phases remain an implementation plan.
+through 5 are implemented; the later phases remain an implementation plan.
 None of this is a stable public API.
 
 The Phase 1 implementation provides:
@@ -36,6 +36,13 @@ records native cost components, validity and selection masks, merge decisions,
 and selected-strategy/priority snapshots across four search phases. The
 existing stacked EPF error field is complemented by an optional stacked XYB
 candidate-reconstruction artifact in the `all` profile.
+
+Phase 5 adds the `filters` and `filters-deep` profiles, optional non-mutating
+render-pipeline taps around decoder-side Gaborish and every enabled EPF stage,
+and an offline Python viewer. The viewer supports explicit continuous and
+categorical mappings, color bars and legends, raw float OpenEXR export, and
+spatially aligned source-image overlays while recording presentation choices
+in a JSON sidecar.
 
 The primary recommendation is:
 
@@ -317,10 +324,12 @@ jxl_encoder_dump input.png output.jxl \
 The frontend deliberately accepts only a single, non-animated, one-shot
 pixel frame; it rejects JPEG input and forces VarDCT. `--num_threads` controls
 the worker count, and `--color_space` supplies a color-space hint for raw
-formats. The supported profiles are `overview`, `aq`, `ac`, and `all`.
-`overview` selects the Phase 2 artifact families, `aq` selects every artifact
-below `aq/`, `ac` selects the final AC maps and the Phase 4 search tensors, and
-`all` requests every capture point compiled into the current build.
+formats. The supported profiles are `overview`, `aq`, `ac`, `filters`,
+`filters-deep`, and `all`. `overview` selects the Phase 2 artifact families,
+`aq` selects every artifact below `aq/`, `ac` selects the final AC maps and the
+Phase 4 search tensors, `filters` selects inverse-Gaborish and EPF selection
+fields, `filters-deep` adds candidate and roundtrip filter reconstructions,
+and `all` requests every capture point compiled into the current build.
 
 The overview profile can contain the following artifacts, depending on which
 heuristics the chosen effort and distance normally execute:
@@ -376,6 +385,54 @@ Unavailable candidate costs are NaN and `candidate_valid` identifies the
 entries that were actually evaluated. `candidate_selected`,
 `merge_accepted`, and the per-phase selected-strategy maps expose decisions
 without reconstructing them from floating-point comparisons.
+
+### Phase 5 viewer and exports
+
+The Python tool can turn a selected raw artifact into a PNG without changing
+the `.npy` source. Higher-rank candidate tensors require named selections:
+
+```text
+python tools/encoder_debug_data.py dump \
+  --render epf/candidate_error \
+  --select candidate=0 \
+  --mapping log --percentile 1 99 --cmap magma \
+  --output epf-error.png
+```
+
+Continuous mappings are `linear`, `log`, and `symlog`. `--range MIN MAX`
+selects fixed limits, while `--percentile LOW HIGH` derives unspecified limits
+from finite source values. Scalar previews include a color bar by default.
+Artifacts with category metadata use a discrete categorical mapping and named
+legend under `--mapping auto`.
+
+Block, tile, and pixel fields can be placed over the source image using their
+manifest grid coordinates:
+
+```text
+python tools/encoder_debug_data.py dump \
+  --render ac/final/strategy_id \
+  --overlay input.png --overlay-alpha 0.55 \
+  --output ac-overlay.png
+```
+
+Channel tensors may be reduced with `--channel y` or an integer channel
+index. `--rgb` explicitly treats three remaining channels as a display RGB
+image. Every PNG has a neighboring `.png.json` sidecar recording selections,
+mapping, limits, colormap, grid extent, overlay, and opacity.
+
+OpenEXR export stores the selected native values as float32 rather than
+applying a display mapping:
+
+```text
+python tools/encoder_debug_data.py dump \
+  --render filters/epf_candidate_0/after_loop_filter_xyb \
+  --channel y --output filtered-y.exr
+```
+
+The exporter prefers the Python OpenEXR bindings, which preserve arbitrary
+channel names. It falls back to an OpenEXR-enabled OpenCV for one, three, or
+four channels and records the backend and channel mapping in `.exr.json`.
+PNG rendering requires Matplotlib; overlays require Pillow.
 
 ## Artifact format
 
@@ -657,16 +714,26 @@ provide a narrower way to request them together with roundtrip filter taps.
 ### Decoder-side loop-filter observations
 
 The encoder-side inverse Gaborish snapshot does not isolate the effects of
-decoder-side Gaborish and EPF during roundtrip evaluation. A later phase can
-add observation points to the render pipeline for:
+decoder-side Gaborish and EPF during roundtrip evaluation. Phase 5 adds
+optional input-only write stages to the render pipeline for:
 
 * reconstruction before loop filtering;
 * reconstruction after Gaborish;
 * reconstruction after each EPF stage;
 * final roundtrip reconstruction in XYB and linear RGB.
 
-These should be optional because AQ and EPF searches can reconstruct the image
-many times.
+The stable tap leaves are `before_loop_filter_xyb`, `after_gaborish_xyb`,
+`after_epf0_xyb`, `after_epf1_xyb`, `after_epf2_xyb`, and
+`after_loop_filter_xyb`. Only stages enabled by the ordinary encoder settings
+are present. EPF candidate evaluations use
+`filters/epf_candidate_<sharpness>/...`; Butteraugli AQ roundtrips use
+`filters/aq/iter_NNN/...` and also expose `final_linear_rgb` after the normal
+Butteraugli conversion.
+
+These artifacts are optional because AQ and EPF searches can reconstruct the
+image many times. A `Wants` query occurs before a write stage allocates its
+image, and emission occurs only after the render worker pool joins. The tap
+stage is input-only and does not modify filter buffers.
 
 ## Runtime profiles and filtering
 
@@ -813,6 +880,17 @@ and are copied only when that artifact passes `Wants`.
 
 ### Phase 5: roundtrip filter taps and visualization
 
+Implemented. `PassesDecoderState::PipelineOptions` contains compile-time
+guarded image pointers for the six loop-filter boundaries. Requested taps use
+the render pipeline's existing input-only `WriteToImage3F` stage and are
+emitted after reconstruction. Disabled builds contain neither the tap fields
+nor the Phase 5 artifact strings.
+
+`tools/encoder_debug_data.py` remains the manifest validator and lazy NumPy
+loader, and now also performs presentation and OpenEXR export. It never writes
+back to the canonical arrays. Each rendered or exported result has a JSON
+sidecar sufficient to recover its selections and presentation transform.
+
 * Add optional render-pipeline observation points before and after Gaborish and
   EPF stages.
 * Add a Python viewer that loads the manifest and `.npy` artifacts.
@@ -902,7 +980,8 @@ The initial infrastructure is ready when:
   represented correctly;
 * raw arrays contain encoder-native values with no hidden display mapping;
 * tracing does not change the output codestream;
-* the `overview`, `aq`, and `ac` profiles are implemented;
+* the `overview`, `aq`, `ac`, `filters`, and `filters-deep` profiles are
+  implemented;
 * a Python tool can render selected artifacts to PNG without modifying the
   canonical data;
 * artifact names and coordinates are deterministic.

@@ -729,6 +729,12 @@ std::string AqIterationArtifactName(int iteration, const char* leaf) {
   return std::string(prefix) + leaf;
 }
 
+std::string FilterAqIterationPrefix(int iteration) {
+  char prefix[40];
+  snprintf(prefix, sizeof(prefix), "filters/aq/iter_%03d/", iteration);
+  return prefix;
+}
+
 DebugGridInfo AqPixelGrid(size_t xsize, size_t ysize) {
   DebugGridInfo grid;
   grid.kind = DebugGridKind::kPixel;
@@ -856,6 +862,39 @@ Status EmitAqPixelImage3F(EncoderDebugDataSink* sink, const std::string& name,
   info.num_axes = 3;
   info.channel_names = kChannels;
   info.num_channel_names = 3;
+  return EmitDebugImage3F(sink, info, image, image.xsize(), image.ysize());
+}
+
+DebugArtifactInfo FilterFinalLinearArtifactInfo(const std::string& name,
+                                                int iteration, size_t xsize,
+                                                size_t ysize) {
+  static const char* const kAxes[] = {"channel", "y", "x"};
+  static const char* const kChannels[] = {"r", "g", "b"};
+  DebugArtifactInfo info =
+      AqPixelArtifactInfo(name, iteration, xsize, ysize, "linear_srgb",
+                          "Final roundtrip reconstruction converted to "
+                          "linear-light sRGB for Butteraugli");
+  info.stage = "roundtrip_loop_filter";
+  info.axes = kAxes;
+  info.num_axes = 3;
+  info.channel_names = kChannels;
+  info.num_channel_names = 3;
+  return info;
+}
+
+bool WantsFilterFinalLinear(EncoderDebugDataSink* sink, const std::string& name,
+                            int iteration, size_t xsize, size_t ysize) {
+  if (sink == nullptr) return false;
+  const DebugArtifactInfo info =
+      FilterFinalLinearArtifactInfo(name, iteration, xsize, ysize);
+  return sink->Wants(info);
+}
+
+Status EmitFilterFinalLinear(EncoderDebugDataSink* sink,
+                             const std::string& name, int iteration,
+                             const Image3F& image) {
+  const DebugArtifactInfo info = FilterFinalLinearArtifactInfo(
+      name, iteration, image.xsize(), image.ysize());
   return EmitDebugImage3F(sink, info, image, image.xsize(), image.ysize());
 }
 
@@ -997,7 +1036,12 @@ StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
                                      const Image3F& opsin,
                                      PassesEncoderState* enc_state,
                                      const JxlCmsInterface& cms,
-                                     ThreadPool* pool) {
+                                     ThreadPool* pool
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                                     ,
+                                     int debug_iteration
+#endif
+) {
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
   std::unique_ptr<PassesDecoderState> dec_state =
       jxl::make_unique<PassesDecoderState>(memory_manager);
@@ -1034,6 +1078,29 @@ StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
   options.coalescing = false;
   options.render_spotcolors = false;
   options.render_noise = false;
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  DebugGridInfo debug_grid;
+  debug_grid.kind = DebugGridKind::kPixel;
+  debug_grid.spacing_x = enc_state->cparams.resampling;
+  debug_grid.spacing_y = enc_state->cparams.resampling;
+  debug_grid.footprint_x = enc_state->cparams.resampling;
+  debug_grid.footprint_y = enc_state->cparams.resampling;
+  debug_grid.valid_rect =
+      DebugRect{0, 0, enc_state->shared.frame_dim.xsize_upsampled,
+                enc_state->shared.frame_dim.ysize_upsampled};
+  debug_grid.padded_rect =
+      DebugRect{0, 0, enc_state->shared.frame_dim.xsize_upsampled_padded,
+                enc_state->shared.frame_dim.ysize_upsampled_padded};
+  RoundtripFilterDebugData debug_filter_data;
+  ConfigureRoundtripFilterDebugData(
+      enc_state->cparams.debug_data,
+      FilterAqIterationPrefix(debug_iteration), debug_iteration,
+      frame_header.loop_filter.gab, frame_header.loop_filter.epf_iters,
+      debug_grid, enc_state->shared.frame_dim.xsize,
+      enc_state->shared.frame_dim.ysize, &options.debug_taps,
+      &debug_filter_data);
+#endif
 
   // Same as frame_header.nonserialized_metadata->m
   const ImageMetadata& metadata = *decoded.metadata();
@@ -1072,6 +1139,11 @@ StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_groups, allocate_storage,
                                 process_group, "AQ loop"));
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  JXL_RETURN_IF_ERROR(EmitRoundtripFilterDebugData(
+      enc_state->cparams.debug_data, debug_filter_data));
+#endif
 
   // Ensure we don't create any new special frames.
   enc_state->special_frames.resize(num_special_frames);
@@ -1179,29 +1251,45 @@ Status FindBestQuantization(const FrameHeader& frame_header,
 #endif
     JXL_ASSIGN_OR_RETURN(
         ImageBundle dec_linear,
-        RoundtripImage(frame_header, opsin, enc_state, cms, pool));
+        RoundtripImage(frame_header, opsin, enc_state, cms, pool
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                       ,
+                       i
+#endif
+                       ));
     float score;
     ImageF diffmap;
 #if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
     Image3F debug_decoded_linear;
     std::string decoded_linear_name;
+    std::string filter_linear_name;
     bool want_decoded_linear = false;
+    bool want_filter_linear = false;
     if (cparams.debug_data != nullptr) {
       decoded_linear_name = AqIterationArtifactName(i, "decoded_linear_rgb");
       want_decoded_linear = WantsAqPixelArtifact(
           cparams.debug_data, decoded_linear_name, i, dec_linear.xsize(),
           dec_linear.ysize(), "linear_srgb",
           "Exact linear-light sRGB reconstruction supplied to Butteraugli");
+      filter_linear_name = FilterAqIterationPrefix(i) + "final_linear_rgb";
+      want_filter_linear = WantsFilterFinalLinear(
+          cparams.debug_data, filter_linear_name, i, dec_linear.xsize(),
+          dec_linear.ysize());
     }
     JXL_RETURN_IF_ERROR(comparator.CompareWith(
         dec_linear, &diffmap, &score,
-        want_decoded_linear ? &debug_decoded_linear : nullptr));
+        (want_decoded_linear || want_filter_linear) ? &debug_decoded_linear
+                                                    : nullptr));
     const float raw_score = score;
     if (want_decoded_linear) {
       JXL_RETURN_IF_ERROR(EmitAqPixelImage3F(
           cparams.debug_data, decoded_linear_name, i, "linear_srgb",
           "Exact linear-light sRGB reconstruction supplied to Butteraugli",
           debug_decoded_linear));
+    }
+    if (want_filter_linear) {
+      JXL_RETURN_IF_ERROR(EmitFilterFinalLinear(
+          cparams.debug_data, filter_linear_name, i, debug_decoded_linear));
     }
     if (cparams.debug_data != nullptr) {
       JXL_RETURN_IF_ERROR(EmitAqPixelImageF(
@@ -1676,7 +1764,12 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
     }
     JXL_ASSIGN_OR_RETURN(
         ImageBundle decoded,
-        RoundtripImage(frame_header, opsin, enc_state, cms, pool));
+        RoundtripImage(frame_header, opsin, enc_state, cms, pool
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                       ,
+                       i
+#endif
+                       ));
     if (JXL_DEBUG_ADAPTIVE_QUANTIZATION && aux_out) {
       JXL_RETURN_IF_ERROR(DumpXybImage(cparams, ("dec" + ToString(i)).c_str(),
                                        *decoded.color()));

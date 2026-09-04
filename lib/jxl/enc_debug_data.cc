@@ -9,6 +9,7 @@
 #include <limits>
 #include <vector>
 
+#include "lib/jxl/dec_cache.h"
 #include "lib/jxl/enc_debug_data_internal.h"
 
 namespace jxl {
@@ -155,6 +156,137 @@ Status EmitDebugImage3F(EncoderDebugDataSink* sink,
   tensor.byte_strides = strides;
   tensor.rank = 3;
   return sink->Emit(info, tensor);
+}
+
+namespace {
+
+DebugArtifactInfo RoundtripFilterArtifactInfo(
+    const RoundtripFilterDebugData& debug_data, const std::string& name,
+    const char* semantic) {
+  static const char* const kAxes[] = {"channel", "y", "x"};
+  static const char* const kChannels[] = {"x", "y", "b"};
+  DebugArtifactInfo info;
+  info.name = name.c_str();
+  info.stage = "roundtrip_loop_filter";
+  info.iteration = debug_data.iteration;
+  info.grid = debug_data.grid;
+  info.units = "encoder_xyb";
+  info.semantic = semantic;
+  info.axes = kAxes;
+  info.num_axes = 3;
+  info.channel_names = kChannels;
+  info.num_channel_names = 3;
+  return info;
+}
+
+bool WantsRoundtripFilterArtifact(EncoderDebugDataSink* sink,
+                                  const RoundtripFilterDebugData& debug_data,
+                                  const char* leaf, const char* semantic) {
+  if (sink == nullptr) return false;
+  const std::string name = debug_data.prefix + leaf;
+  const DebugArtifactInfo info =
+      RoundtripFilterArtifactInfo(debug_data, name, semantic);
+  return sink->Wants(info);
+}
+
+Status EmitRoundtripFilterArtifact(
+    EncoderDebugDataSink* sink, const RoundtripFilterDebugData& debug_data,
+    const char* leaf, const char* semantic, const Image3F& image, bool wanted) {
+  if (!wanted) return true;
+  const std::string name = debug_data.prefix + leaf;
+  const DebugArtifactInfo info =
+      RoundtripFilterArtifactInfo(debug_data, name, semantic);
+  return EmitDebugImage3F(sink, info, image, debug_data.xsize,
+                          debug_data.ysize);
+}
+
+}  // namespace
+
+void ConfigureRoundtripFilterDebugData(
+    EncoderDebugDataSink* sink, const std::string& prefix, int64_t iteration,
+    bool gaborish, size_t epf_iterations, const DebugGridInfo& grid,
+    size_t xsize, size_t ysize, RenderPipelineDebugTaps* pipeline_taps,
+    RoundtripFilterDebugData* debug_data) {
+  *pipeline_taps = RenderPipelineDebugTaps{};
+  debug_data->prefix = prefix;
+  debug_data->iteration = iteration;
+  debug_data->grid = grid;
+  debug_data->xsize = xsize;
+  debug_data->ysize = ysize;
+
+  debug_data->want_before_loop_filter = WantsRoundtripFilterArtifact(
+      sink, *debug_data, "before_loop_filter_xyb",
+      "Roundtrip reconstruction immediately before decoder loop filtering");
+  debug_data->want_after_gaborish =
+      gaborish && WantsRoundtripFilterArtifact(
+                       sink, *debug_data, "after_gaborish_xyb",
+                       "Roundtrip reconstruction after decoder Gaborish");
+  debug_data->want_after_epf0 =
+      epf_iterations >= 3 &&
+      WantsRoundtripFilterArtifact(
+          sink, *debug_data, "after_epf0_xyb",
+          "Roundtrip reconstruction after decoder EPF stage zero");
+  debug_data->want_after_epf1 =
+      epf_iterations >= 1 &&
+      WantsRoundtripFilterArtifact(
+          sink, *debug_data, "after_epf1_xyb",
+          "Roundtrip reconstruction after decoder EPF stage one");
+  debug_data->want_after_epf2 =
+      epf_iterations >= 2 &&
+      WantsRoundtripFilterArtifact(
+          sink, *debug_data, "after_epf2_xyb",
+          "Roundtrip reconstruction after decoder EPF stage two");
+  debug_data->want_after_loop_filter = WantsRoundtripFilterArtifact(
+      sink, *debug_data, "after_loop_filter_xyb",
+      "Roundtrip reconstruction after all decoder loop-filter stages");
+
+  if (debug_data->want_before_loop_filter) {
+    pipeline_taps->before_loop_filter = &debug_data->before_loop_filter;
+  }
+  if (debug_data->want_after_gaborish) {
+    pipeline_taps->after_gaborish = &debug_data->after_gaborish;
+  }
+  if (debug_data->want_after_epf0) {
+    pipeline_taps->after_epf0 = &debug_data->after_epf0;
+  }
+  if (debug_data->want_after_epf1) {
+    pipeline_taps->after_epf1 = &debug_data->after_epf1;
+  }
+  if (debug_data->want_after_epf2) {
+    pipeline_taps->after_epf2 = &debug_data->after_epf2;
+  }
+  if (debug_data->want_after_loop_filter) {
+    pipeline_taps->after_loop_filter = &debug_data->after_loop_filter;
+  }
+}
+
+Status EmitRoundtripFilterDebugData(
+    EncoderDebugDataSink* sink,
+    const RoundtripFilterDebugData& debug_data) {
+  JXL_RETURN_IF_ERROR(EmitRoundtripFilterArtifact(
+      sink, debug_data, "before_loop_filter_xyb",
+      "Roundtrip reconstruction immediately before decoder loop filtering",
+      debug_data.before_loop_filter, debug_data.want_before_loop_filter));
+  JXL_RETURN_IF_ERROR(EmitRoundtripFilterArtifact(
+      sink, debug_data, "after_gaborish_xyb",
+      "Roundtrip reconstruction after decoder Gaborish",
+      debug_data.after_gaborish, debug_data.want_after_gaborish));
+  JXL_RETURN_IF_ERROR(EmitRoundtripFilterArtifact(
+      sink, debug_data, "after_epf0_xyb",
+      "Roundtrip reconstruction after decoder EPF stage zero",
+      debug_data.after_epf0, debug_data.want_after_epf0));
+  JXL_RETURN_IF_ERROR(EmitRoundtripFilterArtifact(
+      sink, debug_data, "after_epf1_xyb",
+      "Roundtrip reconstruction after decoder EPF stage one",
+      debug_data.after_epf1, debug_data.want_after_epf1));
+  JXL_RETURN_IF_ERROR(EmitRoundtripFilterArtifact(
+      sink, debug_data, "after_epf2_xyb",
+      "Roundtrip reconstruction after decoder EPF stage two",
+      debug_data.after_epf2, debug_data.want_after_epf2));
+  return EmitRoundtripFilterArtifact(
+      sink, debug_data, "after_loop_filter_xyb",
+      "Roundtrip reconstruction after all decoder loop-filter stages",
+      debug_data.after_loop_filter, debug_data.want_after_loop_filter);
 }
 
 #endif  // JPEGXL_ENABLE_ENCODER_DEBUG_DATA

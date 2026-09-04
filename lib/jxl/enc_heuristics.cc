@@ -780,7 +780,13 @@ Status DownsampleImage2_Iterative(Image3F* opsin) {
 
 StatusOr<Image3F> ReconstructImage(
     const FrameHeader& orig_frame_header, const PassesSharedState& shared,
-    const std::vector<std::unique_ptr<ACImage>>& coeffs, ThreadPool* pool) {
+    const std::vector<std::unique_ptr<ACImage>>& coeffs, ThreadPool* pool
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    ,
+    EncoderDebugDataSink* debug_sink, const std::string& debug_prefix,
+    int64_t debug_iteration, const CompressParams& debug_cparams
+#endif
+) {
   const FrameDimensions& frame_dim = shared.frame_dim;
   JxlMemoryManager* memory_manager = shared.memory_manager;
 
@@ -821,6 +827,24 @@ StatusOr<Image3F> ReconstructImage(
   options.render_spotcolors = false;
   options.render_noise = true;
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  DebugGridInfo debug_grid;
+  debug_grid.kind = DebugGridKind::kPixel;
+  debug_grid.spacing_x = debug_cparams.resampling;
+  debug_grid.spacing_y = debug_cparams.resampling;
+  debug_grid.footprint_x = debug_cparams.resampling;
+  debug_grid.footprint_y = debug_cparams.resampling;
+  debug_grid.valid_rect =
+      DebugRect{0, 0, frame_dim.xsize_upsampled, frame_dim.ysize_upsampled};
+  debug_grid.padded_rect = DebugRect{0, 0, frame_dim.xsize_upsampled_padded,
+                                     frame_dim.ysize_upsampled_padded};
+  RoundtripFilterDebugData debug_filter_data;
+  ConfigureRoundtripFilterDebugData(
+      debug_sink, debug_prefix, debug_iteration, frame_header.loop_filter.gab,
+      frame_header.loop_filter.epf_iters, debug_grid, frame_dim.xsize,
+      frame_dim.ysize, &options.debug_taps, &debug_filter_data);
+#endif
+
   JXL_RETURN_IF_ERROR(dec_state->PreparePipeline(
       frame_header, &shared.metadata->m, &decoded, options));
 
@@ -854,6 +878,10 @@ StatusOr<Image3F> ReconstructImage(
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups, allocate_storage,
                                 process_group, "ReconstructImage"));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  JXL_RETURN_IF_ERROR(
+      EmitRoundtripFilterDebugData(debug_sink, debug_filter_data));
+#endif
   return std::move(*decoded.color());
 }
 
@@ -1666,7 +1694,14 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
     FillPlane(val, &epf_sharpness, Rect(epf_sharpness));
     JXL_ASSIGN_OR_RETURN(
         Image3F decoded,
-        ReconstructImage(frame_header, shared, enc_state->coeffs, pool));
+        ReconstructImage(frame_header, shared, enc_state->coeffs, pool
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                         ,
+                         cparams.debug_data,
+                         "filters/epf_candidate_" + std::to_string(val) + "/",
+                         -1, cparams
+#endif
+                         ));
     JXL_ASSIGN_OR_RETURN(error_images[val],
                          ImageF::Create(memory_manager, frame_dim.xsize_blocks,
                                         frame_dim.ysize_blocks));
