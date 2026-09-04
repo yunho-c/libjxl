@@ -321,6 +321,7 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/enc_convolve_separable5.cc
   jxl/enc_debug_data.cc
   jxl/enc_debug_data.h
+  jxl/enc_debug_data_internal.h
   jxl/enc_debug_image.cc
   jxl/enc_debug_image.h
   jxl/enc_detect_dots.cc

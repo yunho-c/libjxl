@@ -3,9 +3,9 @@
 ## Status
 
 This document describes development-only infrastructure for dumping
-image-shaped intermediate state from the VarDCT encoder frontend. Phase 1 is
-implemented; the later phases remain an implementation plan. None of this is
-a stable public API.
+image-shaped intermediate state from the VarDCT encoder frontend. Phases 1
+and 2 are implemented; the later phases remain an implementation plan. None
+of this is a stable public API.
 
 The Phase 1 implementation provides:
 
@@ -20,6 +20,11 @@ The Phase 1 implementation provides:
   and `tools/encoder_debug_data.py`;
 * initial capture points for the native XYB Y plane at pixel resolution and
   the continuous initial quant field at block resolution.
+
+Phase 2 adds the `jxl_encoder_dump` developer frontend and the `overview`
+profile. The profile captures native input and color-transform fields,
+inverse-Gaborish input and output, initial and final AQ fields, both CfL
+passes, final AC strategy maps, and EPF candidate and selection fields.
 
 The primary recommendation is:
 
@@ -284,6 +289,43 @@ python tools/encoder_debug_data.py dump --list
 In Python, `DebugDump.load(name)` returns the stored values unchanged and
 `DebugDump.pixel_coordinates(name)` derives sample-center coordinates from the
 grid metadata. No normalization, color mapping, or upsampling is performed.
+
+### Phase 2 developer frontend
+
+With `JPEGXL_ENABLE_ENCODER_DEBUG_DATA=ON`, the build also provides
+`jxl_encoder_dump`:
+
+```text
+jxl_encoder_dump input.png output.jxl \
+  --debug_dump_dir dump \
+  --debug_dump_profile overview \
+  --distance 1.0 \
+  --effort 7
+```
+
+The frontend deliberately accepts only a single, non-animated, one-shot
+pixel frame; it rejects JPEG input and forces VarDCT. `--num_threads` controls
+the worker count, and `--color_space` supplies a color-space hint for raw
+formats. The supported profiles are `overview` and `all`. `overview` selects
+the Phase 2 artifact families; `all` requests every capture point compiled
+into the current build.
+
+The overview profile can contain the following artifacts, depending on which
+heuristics the chosen effort and distance normally execute:
+
+| Family | Artifacts |
+|---|---|
+| Color | `color/input_encoded`, `color/linear_srgb`, `color/xyb_after_transform` |
+| Inverse Gaborish | `gaborish/input_xyb`, `gaborish/output_xyb` |
+| AQ | `aq/initial/{quant_field,mask_block,mask_pixel}`, `aq/final/{quant_field,raw_quant_field}` |
+| CfL | base scalars plus `cfl/pass_{0,1}/{ytox,ytob}_{code,ratio}` |
+| AC strategy | `ac/final/{strategy_id,is_first_block,covered_blocks_x,covered_blocks_y}` |
+| EPF | `epf/candidate_values`, `epf/candidate_error`, `epf/selected_sharpness` |
+
+`color/linear_srgb` is present only when the encoder itself produces the
+linear-light image (currently efforts 8 through 10). Likewise, candidate or
+multi-pass heuristic fields are omitted when the selected settings skip the
+corresponding computation. No diagnostic request enables a slower path.
 
 ## Artifact format
 
@@ -613,13 +655,12 @@ Add a dedicated executable, tentatively `jxl_encoder_dump`. A separate tool:
 After the design is stable, `cjxl` may gain a developer-build-only
 `--debug_dump_dir` option that uses the same sink and serializer.
 
-Suggested initial command:
+Current command:
 
 ```text
 jxl_encoder_dump input.png output.jxl \
   --debug_dump_dir dump \
-  --debug_dump_profile overview,aq \
-  --debug_dump_roi 0,0,512,512
+  --debug_dump_profile overview
 ```
 
 The encoded output is useful for confirming that an instrumented run is
@@ -667,6 +708,12 @@ padded source-row strides while serializing only the logical tensor extent.
   coordinates.
 
 ### Phase 2: developer frontend and overview profile
+
+Implemented. `jxl_encoder_dump` uses the ordinary packed-image decode and
+encode path, attaches the internal sink through a frame-settings callback,
+forces a one-shot VarDCT frame, and finalizes the manifest after encoding. The
+overview capture test exercises the full field set and compares its codestream
+byte-for-byte with the same encode performed without a sink.
 
 * Add `jxl_encoder_dump`.
 * Support single-frame, one-shot VarDCT encoding.

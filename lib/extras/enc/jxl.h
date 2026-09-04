@@ -21,6 +21,9 @@ namespace extras {
 
 class PackedPixelFile;
 
+using JxlEncoderFrameSettingsCallback =
+    void (*)(JxlEncoderFrameSettings* settings, void* opaque);
+
 struct JXLOption {
   JXLOption(JxlEncoderFrameSettingId id, int64_t val, size_t frame_index)
       : id(id), is_float(false), ival(val), frame_index(frame_index) {}
@@ -76,6 +79,10 @@ struct JXLCompressParams {
   JxlEncoderOutputProcessor output_processor = {};
   JxlDebugImageCallback debug_image = nullptr;
   void* debug_image_opaque = nullptr;
+  // Internal tools may use this after the common frame settings are created.
+  // It is intentionally not part of the public libjxl C API.
+  JxlEncoderFrameSettingsCallback frame_settings_callback = nullptr;
+  void* frame_settings_callback_opaque = nullptr;
   JxlEncoderStats* stats = nullptr;
   bool allow_expert_options = false;
 

@@ -180,6 +180,10 @@ bool EncodeImageJXL(const JXLCompressParams& params, const PackedPixelFile& ppf,
     JxlEncoderSetDebugImageCallback(settings, params.debug_image,
                                     params.debug_image_opaque);
   }
+  if (params.frame_settings_callback != nullptr) {
+    params.frame_settings_callback(settings,
+                                   params.frame_settings_callback_opaque);
+  }
   if (params.stats) {
     JxlEncoderCollectStats(settings, params.stats);
   }

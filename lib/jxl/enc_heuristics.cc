@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -45,6 +46,7 @@
 #include "lib/jxl/enc_cache.h"
 #include "lib/jxl/enc_chroma_from_luma.h"
 #include "lib/jxl/enc_debug_data.h"
+#include "lib/jxl/enc_debug_data_internal.h"
 #include "lib/jxl/enc_gaborish.h"
 #include "lib/jxl/enc_modular.h"
 #include "lib/jxl/enc_noise.h"
@@ -855,6 +857,368 @@ StatusOr<Image3F> ReconstructImage(
   return std::move(*decoded.color());
 }
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+
+namespace {
+
+DebugGridInfo DebugPixelGrid(const FrameDimensions& frame_dim,
+                             const CompressParams& cparams) {
+  DebugGridInfo grid;
+  grid.kind = DebugGridKind::kPixel;
+  grid.spacing_x = cparams.resampling;
+  grid.spacing_y = cparams.resampling;
+  grid.footprint_x = cparams.resampling;
+  grid.footprint_y = cparams.resampling;
+  grid.valid_rect =
+      DebugRect{0, 0, frame_dim.xsize_upsampled, frame_dim.ysize_upsampled};
+  grid.padded_rect = DebugRect{0, 0, frame_dim.xsize_upsampled_padded,
+                               frame_dim.ysize_upsampled_padded};
+  return grid;
+}
+
+DebugGridInfo DebugBlockGrid(const FrameDimensions& frame_dim,
+                             const CompressParams& cparams,
+                             DebugGridKind kind = DebugGridKind::kBlock) {
+  DebugGridInfo grid = DebugPixelGrid(frame_dim, cparams);
+  grid.kind = kind;
+  grid.spacing_x = kBlockDim * cparams.resampling;
+  grid.spacing_y = kBlockDim * cparams.resampling;
+  grid.footprint_x = kBlockDim * cparams.resampling;
+  grid.footprint_y = kBlockDim * cparams.resampling;
+  return grid;
+}
+
+DebugGridInfo DebugColorTileGrid(const FrameDimensions& frame_dim,
+                                 const CompressParams& cparams, size_t xsize,
+                                 size_t ysize) {
+  DebugGridInfo grid;
+  grid.kind = DebugGridKind::kColorTile;
+  grid.spacing_x = kColorTileDim * cparams.resampling;
+  grid.spacing_y = kColorTileDim * cparams.resampling;
+  grid.footprint_x = kColorTileDim * cparams.resampling;
+  grid.footprint_y = kColorTileDim * cparams.resampling;
+  grid.valid_rect =
+      DebugRect{0, 0, frame_dim.xsize_upsampled, frame_dim.ysize_upsampled};
+  grid.padded_rect =
+      DebugRect{0, 0, xsize * grid.spacing_x, ysize * grid.spacing_y};
+  return grid;
+}
+
+bool WantsDebugArtifact(EncoderDebugDataSink* sink, const char* name) {
+  if (sink == nullptr) return false;
+  DebugArtifactInfo info;
+  info.name = name;
+  return sink->Wants(info);
+}
+
+Status EmitCflPass(EncoderDebugDataSink* sink, size_t pass,
+                   const ImageSB& ytox_map, const ImageSB& ytob_map,
+                   const ColorCorrelation& base,
+                   const FrameDimensions& frame_dim,
+                   const CompressParams& cparams) {
+  static const char* const kAxes[] = {"tile_y", "tile_x"};
+  const DebugGridInfo grid = DebugColorTileGrid(
+      frame_dim, cparams, ytox_map.xsize(), ytox_map.ysize());
+
+  const std::string prefix = "cfl/pass_" + std::to_string(pass) + "/";
+  const std::string ytox_code_name = prefix + "ytox_code";
+  const std::string ytob_code_name = prefix + "ytob_code";
+  DebugArtifactInfo code_info;
+  code_info.stage = "chroma_from_luma";
+  code_info.units = "signed_cfl_code";
+  code_info.axes = kAxes;
+  code_info.num_axes = 2;
+  code_info.grid = grid;
+
+  code_info.name = ytox_code_name.c_str();
+  code_info.semantic = "Signed per-tile Y-to-X chroma-from-luma code";
+  JXL_RETURN_IF_ERROR(EmitDebugImageSB(sink, code_info, ytox_map));
+  code_info.name = ytob_code_name.c_str();
+  code_info.semantic = "Signed per-tile Y-to-B chroma-from-luma code";
+  JXL_RETURN_IF_ERROR(EmitDebugImageSB(sink, code_info, ytob_map));
+
+  const std::string ytox_ratio_name = prefix + "ytox_ratio";
+  const std::string ytob_ratio_name = prefix + "ytob_ratio";
+  const bool want_ytox_ratio =
+      WantsDebugArtifact(sink, ytox_ratio_name.c_str());
+  const bool want_ytob_ratio =
+      WantsDebugArtifact(sink, ytob_ratio_name.c_str());
+  if (!want_ytox_ratio && !want_ytob_ratio) return true;
+
+  ImageF ytox_ratio;
+  ImageF ytob_ratio;
+  if (want_ytox_ratio) {
+    JXL_ASSIGN_OR_RETURN(
+        ytox_ratio, ImageF::Create(ytox_map.memory_manager(), ytox_map.xsize(),
+                                   ytox_map.ysize()));
+  }
+  if (want_ytob_ratio) {
+    JXL_ASSIGN_OR_RETURN(
+        ytob_ratio, ImageF::Create(ytob_map.memory_manager(), ytob_map.xsize(),
+                                   ytob_map.ysize()));
+  }
+  for (size_t y = 0; y < ytox_map.ysize(); ++y) {
+    const int8_t* row_x = ytox_map.ConstRow(y);
+    const int8_t* row_b = ytob_map.ConstRow(y);
+    float* ratio_x = want_ytox_ratio ? ytox_ratio.Row(y) : nullptr;
+    float* ratio_b = want_ytob_ratio ? ytob_ratio.Row(y) : nullptr;
+    for (size_t x = 0; x < ytox_map.xsize(); ++x) {
+      if (ratio_x != nullptr) ratio_x[x] = base.YtoXRatio(row_x[x]);
+      if (ratio_b != nullptr) ratio_b[x] = base.YtoBRatio(row_b[x]);
+    }
+  }
+
+  DebugArtifactInfo ratio_info = code_info;
+  ratio_info.units = "xyb_chroma_per_luma";
+  const char* derived_from[1];
+  ratio_info.derived_from = derived_from;
+  ratio_info.num_derived_from = 1;
+  if (want_ytox_ratio) {
+    derived_from[0] = ytox_code_name.c_str();
+    ratio_info.name = ytox_ratio_name.c_str();
+    ratio_info.semantic = "Effective Y-to-X chroma-from-luma correlation ratio";
+    ratio_info.formula = "base_ytox + ytox_code / color_factor";
+    JXL_RETURN_IF_ERROR(EmitDebugImageF(sink, ratio_info, ytox_ratio));
+  }
+  if (want_ytob_ratio) {
+    derived_from[0] = ytob_code_name.c_str();
+    ratio_info.name = ytob_ratio_name.c_str();
+    ratio_info.semantic = "Effective Y-to-B chroma-from-luma correlation ratio";
+    ratio_info.formula = "base_ytob + ytob_code / color_factor";
+    JXL_RETURN_IF_ERROR(EmitDebugImageF(sink, ratio_info, ytob_ratio));
+  }
+  return true;
+}
+
+Status EmitCflBase(EncoderDebugDataSink* sink, const ColorCorrelation& base) {
+  DebugArtifactInfo info;
+  info.stage = "chroma_from_luma";
+  info.grid.kind = DebugGridKind::kOther;
+  info.units = "xyb_chroma_per_luma";
+  info.name = "cfl/base/ytox";
+  info.semantic = "Base Y-to-X chroma-from-luma correlation";
+  if (sink->Wants(info)) {
+    JXL_RETURN_IF_ERROR(sink->EmitScalar(info, base.GetBaseCorrelationX()));
+  }
+  info.name = "cfl/base/ytob";
+  info.semantic = "Base Y-to-B chroma-from-luma correlation";
+  if (sink->Wants(info)) {
+    JXL_RETURN_IF_ERROR(sink->EmitScalar(info, base.GetBaseCorrelationB()));
+  }
+  info.name = "cfl/base/color_factor";
+  info.units = "code_units_per_ratio";
+  info.semantic = "Denominator that converts signed CfL codes to ratios";
+  if (sink->Wants(info)) {
+    JXL_RETURN_IF_ERROR(sink->EmitScalar(info, base.GetColorFactor()));
+  }
+  return true;
+}
+
+Status EmitFinalAcStrategy(EncoderDebugDataSink* sink,
+                           const AcStrategyImage& ac_strategy,
+                           const FrameDimensions& frame_dim,
+                           const CompressParams& cparams) {
+  static const char* const kNames[] = {
+      "DCT",        "IDENTITY",   "DCT2X2",    "DCT4X4",    "DCT16X16",
+      "DCT32X32",   "DCT16X8",    "DCT8X16",   "DCT32X8",   "DCT8X32",
+      "DCT32X16",   "DCT16X32",   "DCT4X8",    "DCT8X4",    "AFV0",
+      "AFV1",       "AFV2",       "AFV3",      "DCT64X64",  "DCT64X32",
+      "DCT32X64",   "DCT128X128", "DCT128X64", "DCT64X128", "DCT256X256",
+      "DCT256X128", "DCT128X256",
+  };
+  static_assert(
+      sizeof(kNames) / sizeof(kNames[0]) == AcStrategy::kNumValidStrategies,
+      "Update debug AC strategy names");
+
+  const bool want_strategy = WantsDebugArtifact(sink, "ac/final/strategy_id");
+  const bool want_first = WantsDebugArtifact(sink, "ac/final/is_first_block");
+  const bool want_x = WantsDebugArtifact(sink, "ac/final/covered_blocks_x");
+  const bool want_y = WantsDebugArtifact(sink, "ac/final/covered_blocks_y");
+  if (!want_strategy && !want_first && !want_x && !want_y) return true;
+
+  ImageB strategy;
+  ImageB first;
+  ImageB covered_x;
+  ImageB covered_y;
+  if (want_strategy) {
+    JXL_ASSIGN_OR_RETURN(
+        strategy, ImageB::Create(ac_strategy.memory_manager(),
+                                 ac_strategy.xsize(), ac_strategy.ysize()));
+  }
+  if (want_first) {
+    JXL_ASSIGN_OR_RETURN(
+        first, ImageB::Create(ac_strategy.memory_manager(), ac_strategy.xsize(),
+                              ac_strategy.ysize()));
+  }
+  if (want_x) {
+    JXL_ASSIGN_OR_RETURN(
+        covered_x, ImageB::Create(ac_strategy.memory_manager(),
+                                  ac_strategy.xsize(), ac_strategy.ysize()));
+  }
+  if (want_y) {
+    JXL_ASSIGN_OR_RETURN(
+        covered_y, ImageB::Create(ac_strategy.memory_manager(),
+                                  ac_strategy.xsize(), ac_strategy.ysize()));
+  }
+  for (size_t y = 0; y < ac_strategy.ysize(); ++y) {
+    const AcStrategyRow row = ac_strategy.ConstRow(y);
+    for (size_t x = 0; x < ac_strategy.xsize(); ++x) {
+      const AcStrategy acs = row[x];
+      if (want_strategy) strategy.Row(y)[x] = acs.RawStrategy();
+      if (want_first) first.Row(y)[x] = acs.IsFirstBlock() ? 1 : 0;
+      if (want_x) {
+        covered_x.Row(y)[x] = static_cast<uint8_t>(acs.covered_blocks_x());
+      }
+      if (want_y) {
+        covered_y.Row(y)[x] = static_cast<uint8_t>(acs.covered_blocks_y());
+      }
+    }
+  }
+
+  static const char* const kAxes[] = {"block_y", "block_x"};
+  DebugArtifactInfo info;
+  info.stage = "ac_strategy_selection";
+  info.units = "enum";
+  info.axes = kAxes;
+  info.num_axes = 2;
+  info.grid = DebugBlockGrid(frame_dim, cparams, DebugGridKind::kVariableBlock);
+  DebugCategory categories[AcStrategy::kNumValidStrategies];
+  for (uint8_t i = 0; i < AcStrategy::kNumValidStrategies; ++i) {
+    const AcStrategy acs = AcStrategy::FromRawStrategy(i);
+    categories[i] =
+        DebugCategory{static_cast<int64_t>(i), kNames[i],
+                      acs.covered_blocks_x(), acs.covered_blocks_y()};
+  }
+  if (want_strategy) {
+    info.name = "ac/final/strategy_id";
+    info.semantic =
+        "Raw AC strategy enum repeated over every covered 8x8 block";
+    info.categories = categories;
+    info.num_categories = AcStrategy::kNumValidStrategies;
+    JXL_RETURN_IF_ERROR(EmitDebugImageB(sink, info, strategy));
+  }
+  info.categories = nullptr;
+  info.num_categories = 0;
+  if (want_first) {
+    info.name = "ac/final/is_first_block";
+    info.units = "boolean";
+    info.semantic = "One at the top-left 8x8 anchor of each selected transform";
+    JXL_RETURN_IF_ERROR(EmitDebugImageB(sink, info, first));
+  }
+  if (want_x) {
+    info.name = "ac/final/covered_blocks_x";
+    info.units = "8x8_blocks";
+    info.semantic =
+        "Horizontal transform footprint repeated over each covered block";
+    JXL_RETURN_IF_ERROR(EmitDebugImageB(sink, info, covered_x));
+  }
+  if (want_y) {
+    info.name = "ac/final/covered_blocks_y";
+    info.units = "8x8_blocks";
+    info.semantic =
+        "Vertical transform footprint repeated over each covered block";
+    JXL_RETURN_IF_ERROR(EmitDebugImageB(sink, info, covered_y));
+  }
+  return true;
+}
+
+Status EmitEpfSelection(EncoderDebugDataSink* sink,
+                        const std::vector<uint8_t>* candidate_values,
+                        const std::array<ImageF, 8>* candidate_errors,
+                        const ImageB& selected,
+                        const FrameDimensions& frame_dim,
+                        const CompressParams& cparams) {
+  static const char* const kBlockAxes[] = {"block_y", "block_x"};
+  DebugArtifactInfo selected_info;
+  selected_info.name = "epf/selected_sharpness";
+  selected_info.stage = "epf_selection";
+  selected_info.units = "epf_sharpness_index";
+  selected_info.semantic =
+      "Final per-block EPF sharpness value selected by the encoder";
+  selected_info.axes = kBlockAxes;
+  selected_info.num_axes = 2;
+  selected_info.grid = DebugBlockGrid(frame_dim, cparams);
+  JXL_RETURN_IF_ERROR(EmitDebugImageB(sink, selected_info, selected));
+
+  if (candidate_values == nullptr || candidate_errors == nullptr) return true;
+
+  if (WantsDebugArtifact(sink, "epf/candidate_values")) {
+    static const char* const kCandidateAxis[] = {"candidate"};
+    DebugArtifactInfo values_info;
+    values_info.name = "epf/candidate_values";
+    values_info.stage = "epf_selection";
+    values_info.units = "epf_sharpness_index";
+    values_info.semantic =
+        "EPF sharpness values corresponding to the candidate axis";
+    values_info.axes = kCandidateAxis;
+    values_info.num_axes = 1;
+    values_info.grid.kind = DebugGridKind::kOther;
+    const size_t shape[] = {candidate_values->size()};
+    const ptrdiff_t strides[] = {static_cast<ptrdiff_t>(sizeof(uint8_t))};
+    DebugTensorView tensor;
+    tensor.dtype = DebugDataType::kUint8;
+    tensor.data = candidate_values->data();
+    tensor.shape = shape;
+    tensor.byte_strides = strides;
+    tensor.rank = 1;
+    JXL_RETURN_IF_ERROR(sink->Emit(values_info, tensor));
+  }
+
+  if (!WantsDebugArtifact(sink, "epf/candidate_error")) return true;
+  if (selected.xsize() != 0 &&
+      selected.ysize() >
+          std::numeric_limits<size_t>::max() / selected.xsize()) {
+    return JXL_FAILURE("EPF debug plane size overflows size_t");
+  }
+  const size_t plane_size = selected.xsize() * selected.ysize();
+  if (candidate_values->size() != 0 &&
+      plane_size >
+          std::numeric_limits<size_t>::max() / candidate_values->size()) {
+    return JXL_FAILURE("EPF debug candidate tensor overflows size_t");
+  }
+  if (plane_size > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+                       sizeof(float)) {
+    return JXL_FAILURE("EPF debug byte stride overflows ptrdiff_t");
+  }
+  std::vector<float> errors(candidate_values->size() * plane_size);
+  for (size_t c = 0; c < candidate_values->size(); ++c) {
+    const ImageF& source = (*candidate_errors)[(*candidate_values)[c]];
+    for (size_t y = 0; y < selected.ysize(); ++y) {
+      memcpy(errors.data() + c * plane_size + y * selected.xsize(),
+             source.ConstRow(y), selected.xsize() * sizeof(float));
+    }
+  }
+  static const char* const kCandidateBlockAxes[] = {"candidate", "block_y",
+                                                    "block_x"};
+  DebugArtifactInfo error_info;
+  error_info.name = "epf/candidate_error";
+  error_info.stage = "epf_selection";
+  error_info.units = "weighted_squared_xyb_error";
+  error_info.semantic =
+      "Native per-block reconstruction error for each EPF candidate before "
+      "selection-context multipliers";
+  error_info.axes = kCandidateBlockAxes;
+  error_info.num_axes = 3;
+  error_info.grid = DebugBlockGrid(frame_dim, cparams);
+  const size_t shape[] = {candidate_values->size(), selected.ysize(),
+                          selected.xsize()};
+  const ptrdiff_t strides[] = {
+      static_cast<ptrdiff_t>(plane_size * sizeof(float)),
+      static_cast<ptrdiff_t>(selected.xsize() * sizeof(float)),
+      static_cast<ptrdiff_t>(sizeof(float))};
+  DebugTensorView tensor;
+  tensor.dtype = DebugDataType::kFloat32;
+  tensor.data = errors.data();
+  tensor.shape = shape;
+  tensor.byte_strides = strides;
+  tensor.rank = 3;
+  return sink->Emit(error_info, tensor);
+}
+
+}  // namespace
+
+#endif  // JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+
 float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
                              const ImageF& mask1x1, size_t by, size_t bx) {
   Rect rect(bx * kBlockDim, by * kBlockDim, kBlockDim, kBlockDim, a.xsize(),
@@ -906,6 +1270,10 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       cparams.speed_tier > SpeedTier::kWombat ||
       frame_header.loop_filter.epf_iters == 0) {
     FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    JXL_RETURN_IF_ERROR(EmitEpfSelection(cparams.debug_data, nullptr, nullptr,
+                                         epf_sharpness, frame_dim, cparams));
+#endif
     return true;
   }
 
@@ -1018,6 +1386,11 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
     }
   }
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  JXL_RETURN_IF_ERROR(EmitEpfSelection(cparams.debug_data, &epf_steps,
+                                       &error_images, epf_sharpness, frame_dim,
+                                       cparams));
+#endif
   return true;
 }
 
@@ -1133,7 +1506,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 #if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
   if (cparams.debug_data != nullptr && !streaming_mode &&
       initialize_global_state) {
-    static const char* const kAxes[] = {"block_y", "block_x"};
+    static const char* const kBlockAxes[] = {"block_y", "block_x"};
     DebugArtifactInfo info;
     info.name = "aq/initial/quant_field";
     info.stage = "adaptive_quantization";
@@ -1141,30 +1514,31 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     info.semantic =
         "Continuous initial adaptive quantization field before AC-strategy "
         "adjustment";
-    info.axes = kAxes;
+    info.axes = kBlockAxes;
     info.num_axes = 2;
-    info.grid.kind = DebugGridKind::kBlock;
-    info.grid.spacing_x = kBlockDim * cparams.resampling;
-    info.grid.spacing_y = kBlockDim * cparams.resampling;
-    info.grid.footprint_x = kBlockDim * cparams.resampling;
-    info.grid.footprint_y = kBlockDim * cparams.resampling;
-    info.grid.valid_rect =
-        DebugRect{0, 0, frame_dim.xsize_upsampled, frame_dim.ysize_upsampled};
-    info.grid.padded_rect = DebugRect{0, 0, frame_dim.xsize_upsampled_padded,
-                                      frame_dim.ysize_upsampled_padded};
-    if (cparams.debug_data->Wants(info)) {
-      const size_t shape[] = {initial_quant_field.ysize(),
-                              initial_quant_field.xsize()};
-      const ptrdiff_t strides[] = {
-          static_cast<ptrdiff_t>(initial_quant_field.bytes_per_row()),
-          static_cast<ptrdiff_t>(sizeof(float))};
-      DebugTensorView tensor;
-      tensor.dtype = DebugDataType::kFloat32;
-      tensor.data = initial_quant_field.ConstRow(0);
-      tensor.shape = shape;
-      tensor.byte_strides = strides;
-      tensor.rank = 2;
-      JXL_RETURN_IF_ERROR(cparams.debug_data->Emit(info, tensor));
+    info.grid = DebugBlockGrid(frame_dim, cparams);
+    JXL_RETURN_IF_ERROR(
+        EmitDebugImageF(cparams.debug_data, info, initial_quant_field));
+
+    info.name = "aq/initial/mask_block";
+    info.units = "heuristic_masking_weight";
+    info.semantic =
+        "Native block-resolution masking field used by AC strategy "
+        "heuristics";
+    JXL_RETURN_IF_ERROR(
+        EmitDebugImageF(cparams.debug_data, info, initial_quant_masking));
+
+    if (initial_quant_masking1x1.xsize() != 0 &&
+        initial_quant_masking1x1.ysize() != 0) {
+      static const char* const kPixelAxes[] = {"y", "x"};
+      info.name = "aq/initial/mask_pixel";
+      info.units = "heuristic_masking_weight";
+      info.semantic =
+          "Native pixel-resolution masking field used by EPF selection";
+      info.axes = kPixelAxes;
+      info.grid = DebugPixelGrid(frame_dim, cparams);
+      JXL_RETURN_IF_ERROR(
+          EmitDebugImageF(cparams.debug_data, info, initial_quant_masking1x1));
     }
   }
 #endif
@@ -1172,6 +1546,28 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   // TODO(veluca): do something about animations.
 
   // Apply inverse-gaborish.
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  const auto emit_gaborish = [&](const char* name,
+                                 const char* semantic) -> Status {
+    static const char* const kAxes[] = {"channel", "y", "x"};
+    static const char* const kChannels[] = {"x", "y", "b"};
+    DebugArtifactInfo info;
+    info.name = name;
+    info.stage = "inverse_gaborish";
+    info.units = "encoder_xyb";
+    info.semantic = semantic;
+    info.axes = kAxes;
+    info.num_axes = 3;
+    info.channel_names = kChannels;
+    info.num_channel_names = 3;
+    info.grid = DebugPixelGrid(frame_dim, cparams);
+    return EmitDebugImage3F(cparams.debug_data, info, *opsin, frame_dim.xsize,
+                            frame_dim.ysize);
+  };
+  JXL_RETURN_IF_ERROR(emit_gaborish(
+      "gaborish/input_xyb",
+      "Encoder XYB immediately before inverse-Gaborish precompensation"));
+#endif
   if (frame_header.loop_filter.gab) {
     // Changing the weight here to 0.99f would help to reduce ringing in
     // generation loss.
@@ -1182,6 +1578,11 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     };
     JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
   }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  JXL_RETURN_IF_ERROR(emit_gaborish(
+      "gaborish/output_xyb",
+      "Encoder XYB immediately after inverse-Gaborish precompensation"));
+#endif
 
   if (initialize_global_state) {
     JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
@@ -1192,6 +1593,26 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
                                           initial_quant_masking,
                                           initial_quant_masking1x1, &matrices));
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  ImageSB debug_cfl_pass0_ytox;
+  ImageSB debug_cfl_pass0_ytob;
+  const bool capture_cfl_pass0 =
+      cparams.debug_data != nullptr &&
+      cparams.speed_tier <= SpeedTier::kSquirrel &&
+      (WantsDebugArtifact(cparams.debug_data, "cfl/pass_0/ytox_code") ||
+       WantsDebugArtifact(cparams.debug_data, "cfl/pass_0/ytob_code") ||
+       WantsDebugArtifact(cparams.debug_data, "cfl/pass_0/ytox_ratio") ||
+       WantsDebugArtifact(cparams.debug_data, "cfl/pass_0/ytob_ratio"));
+  if (capture_cfl_pass0) {
+    JXL_ASSIGN_OR_RETURN(debug_cfl_pass0_ytox,
+                         ImageSB::Create(memory_manager, cmap.ytox_map.xsize(),
+                                         cmap.ytox_map.ysize()));
+    JXL_ASSIGN_OR_RETURN(debug_cfl_pass0_ytob,
+                         ImageSB::Create(memory_manager, cmap.ytob_map.xsize(),
+                                         cmap.ytob_map.ysize()));
+  }
+#endif
 
   auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
     size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);
@@ -1213,6 +1634,12 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
           /*ac_strategy=*/nullptr,
           /*raw_quant_field=*/nullptr,
           /*quantizer=*/nullptr, /*fast=*/false, thread, &cmap));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      if (capture_cfl_pass0) {
+        debug_cfl_pass0_ytox.Row(ty)[tx] = cmap.ytox_map.ConstRow(ty)[tx];
+        debug_cfl_pass0_ytob.Row(ty)[tx] = cmap.ytob_map.ConstRow(ty)[tx];
+      }
+#endif
     }
 
     // Choose block sizes.
@@ -1245,7 +1672,28 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   JXL_RETURN_IF_ERROR(
       RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (cparams.debug_data != nullptr) {
+    JXL_RETURN_IF_ERROR(EmitCflBase(cparams.debug_data, cmap.base()));
+    if (capture_cfl_pass0) {
+      JXL_RETURN_IF_ERROR(
+          EmitCflPass(cparams.debug_data, 0, debug_cfl_pass0_ytox,
+                      debug_cfl_pass0_ytob, cmap.base(), frame_dim, cparams));
+    }
+    if (cparams.speed_tier <= SpeedTier::kHare) {
+      JXL_RETURN_IF_ERROR(EmitCflPass(cparams.debug_data, 1, cmap.ytox_map,
+                                      cmap.ytob_map, cmap.base(), frame_dim,
+                                      cparams));
+    }
+  }
+#endif
+
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  JXL_RETURN_IF_ERROR(
+      EmitFinalAcStrategy(cparams.debug_data, ac_strategy, frame_dim, cparams));
+#endif
 
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
@@ -1255,6 +1703,31 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                                           initial_quant_field, enc_state, cms,
                                           pool, aux_out));
   }
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (cparams.debug_data != nullptr) {
+    static const char* const kAxes[] = {"block_y", "block_x"};
+    DebugArtifactInfo info;
+    info.name = "aq/final/quant_field";
+    info.stage = "adaptive_quantization";
+    info.units = "relative_inverse_quantization_step";
+    info.semantic =
+        "Final continuous quantization field after AC adjustment and any "
+        "Butteraugli refinement";
+    info.axes = kAxes;
+    info.num_axes = 2;
+    info.grid = DebugBlockGrid(frame_dim, cparams);
+    JXL_RETURN_IF_ERROR(
+        EmitDebugImageF(cparams.debug_data, info, initial_quant_field));
+
+    info.name = "aq/final/raw_quant_field";
+    info.units = "raw_quantizer_index";
+    info.semantic =
+        "Final integer raw quantizer field consumed by coefficient coding";
+    JXL_RETURN_IF_ERROR(
+        EmitDebugImageI(cparams.debug_data, info, raw_quant_field));
+  }
+#endif
 
   // Choose a context model that depends on the amount of quantization for AC.
   if (cparams.speed_tier < SpeedTier::kFalcon && initialize_global_state) {

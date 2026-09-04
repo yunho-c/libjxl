@@ -51,6 +51,7 @@
 #include "lib/jxl/enc_coeff_order.h"
 #include "lib/jxl/enc_context_map.h"
 #include "lib/jxl/enc_debug_data.h"
+#include "lib/jxl/enc_debug_data_internal.h"
 #include "lib/jxl/enc_entropy_coder.h"
 #include "lib/jxl/enc_external_image.h"
 #include "lib/jxl/enc_fields.h"
@@ -1623,6 +1624,37 @@ Status ComputeEncodingData(
   Image3F linear_storage;
   Image3F* linear = nullptr;
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (cparams.debug_data != nullptr) {
+    static const char* const kAxes[] = {"channel", "y", "x"};
+    static const char* const kChannels[] = {"r", "g", "b"};
+    DebugArtifactInfo info;
+    info.name = "color/input_encoded";
+    info.stage = "input_copy";
+    info.units = "normalized_input_sample";
+    info.semantic =
+        "Input color samples after copying into the encoder float image and "
+        "before color transformation";
+    info.axes = kAxes;
+    info.num_axes = 3;
+    info.channel_names = kChannels;
+    info.num_channel_names = 3;
+    info.grid.kind = DebugGridKind::kPixel;
+    info.grid.origin_x = static_cast<int64_t>(patch_rect.x0());
+    info.grid.origin_y = static_cast<int64_t>(patch_rect.y0());
+    info.grid.valid_rect = DebugRect{static_cast<int64_t>(patch_rect.x0()),
+                                     static_cast<int64_t>(patch_rect.y0()),
+                                     patch_rect.xsize(), patch_rect.ysize()};
+    info.grid.padded_rect = DebugRect{static_cast<int64_t>(patch_rect.x0()),
+                                      static_cast<int64_t>(patch_rect.y0()),
+                                      RoundUpToBlockDim(patch_rect.xsize()),
+                                      RoundUpToBlockDim(patch_rect.ysize())};
+    JXL_RETURN_IF_ERROR(EmitDebugImage3F(cparams.debug_data, info, color,
+                                         patch_rect.xsize(),
+                                         patch_rect.ysize()));
+  }
+#endif
+
   if (!jpeg_data) {
     if (frame_header.color_transform == ColorTransform::kXYB &&
         frame_info.ib_needs_color_transform) {
@@ -1659,6 +1691,48 @@ Status ComputeEncodingData(
 #if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
   if (cparams.debug_data != nullptr &&
       frame_header.color_transform == ColorTransform::kXYB) {
+    static const char* const kImageAxes[] = {"channel", "y", "x"};
+    static const char* const kXybChannels[] = {"x", "y", "b"};
+    DebugArtifactInfo image_info;
+    image_info.name = "color/xyb_after_transform";
+    image_info.stage = "color_transform";
+    image_info.units = "encoder_xyb";
+    image_info.semantic =
+        "Native encoder XYB after color transformation and invisible-pixel "
+        "preprocessing, before frontend feature subtraction";
+    image_info.axes = kImageAxes;
+    image_info.num_axes = 3;
+    image_info.channel_names = kXybChannels;
+    image_info.num_channel_names = 3;
+    image_info.grid.kind = DebugGridKind::kPixel;
+    image_info.grid.origin_x = static_cast<int64_t>(patch_rect.x0());
+    image_info.grid.origin_y = static_cast<int64_t>(patch_rect.y0());
+    image_info.grid.valid_rect =
+        DebugRect{static_cast<int64_t>(patch_rect.x0()),
+                  static_cast<int64_t>(patch_rect.y0()), patch_rect.xsize(),
+                  patch_rect.ysize()};
+    image_info.grid.padded_rect = DebugRect{
+        static_cast<int64_t>(patch_rect.x0()),
+        static_cast<int64_t>(patch_rect.y0()), color.xsize(), color.ysize()};
+    JXL_RETURN_IF_ERROR(EmitDebugImage3F(cparams.debug_data, image_info, color,
+                                         patch_rect.xsize(),
+                                         patch_rect.ysize()));
+
+    if (linear != nullptr) {
+      static const char* const kRgbChannels[] = {"r", "g", "b"};
+      DebugArtifactInfo linear_info = image_info;
+      linear_info.name = "color/linear_srgb";
+      linear_info.units = "linear_srgb";
+      linear_info.semantic =
+          "Unclamped linear-light sRGB produced by the encoder color "
+          "transform path";
+      linear_info.channel_names = kRgbChannels;
+      linear_info.grid.padded_rect = linear_info.grid.valid_rect;
+      JXL_RETURN_IF_ERROR(EmitDebugImage3F(cparams.debug_data, linear_info,
+                                           *linear, patch_rect.xsize(),
+                                           patch_rect.ysize()));
+    }
+
     static const char* const kAxes[] = {"y", "x"};
     DebugArtifactInfo info;
     info.name = "color/xyb_after_transform/y";

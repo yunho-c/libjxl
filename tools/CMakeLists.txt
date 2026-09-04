@@ -220,6 +220,11 @@ if(JPEGXL_ENABLE_DEVTOOLS)
   )
 endif()  # JPEGXL_ENABLE_DEVTOOLS
 
+if(JPEGXL_ENABLE_ENCODER_DEBUG_DATA)
+  list(APPEND INTERNAL_TOOL_BINARIES jxl_encoder_dump)
+  add_executable(jxl_encoder_dump jxl_encoder_dump.cc)
+endif()
+
 # Benchmark tools.
 if(JPEGXL_ENABLE_BENCHMARK AND JPEGXL_ENABLE_TOOLS)
   list(APPEND INTERNAL_TOOL_BINARIES
