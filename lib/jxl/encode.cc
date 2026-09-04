@@ -2804,6 +2804,11 @@ JXL_EXPORT void JxlEncoderSetDebugImageCallback(
   frame_settings->values.cparams.debug_image_opaque = opaque;
 }
 
+void JxlEncoderSetDebugDataSink(JxlEncoderFrameSettings* frame_settings,
+                                jxl::EncoderDebugDataSink* debug_data_sink) {
+  frame_settings->values.cparams.debug_data = debug_data_sink;
+}
+
 JXL_EXPORT JxlEncoderStats* JxlEncoderStatsCreate() {
   JxlEncoderStats* result = new JxlEncoderStats();
   result->aux_out = jxl::make_unique<jxl::AuxOut>();

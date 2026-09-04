@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jpeg.org/jpegxl/schemas/encoder-debug-data-1.0.json",
+  "title": "JPEG XL encoder debug data manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "libjxl_revision",
+    "profile",
+    "frame",
+    "encoder",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {"const": 1},
+        "minor": {"type": "integer", "minimum": 0}
+      }
+    },
+    "libjxl_revision": {"type": "string"},
+    "profile": {"type": "string"},
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["xsize", "ysize"],
+      "properties": {
+        "xsize": {"type": "integer", "minimum": 1},
+        "ysize": {"type": "integer", "minimum": 1}
+      }
+    },
+    "encoder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "distance",
+        "effort",
+        "decoding_speed_tier",
+        "resampling",
+        "streaming_mode",
+        "color_transform",
+        "input_color_space",
+        "intensity_target",
+        "gaborish",
+        "epf_iterations"
+      ],
+      "properties": {
+        "distance": {"type": "number"},
+        "effort": {"type": "integer"},
+        "decoding_speed_tier": {"type": "integer", "minimum": 0},
+        "resampling": {"type": "integer", "minimum": 1},
+        "streaming_mode": {"type": "boolean"},
+        "color_transform": {"type": "integer", "minimum": 0},
+        "input_color_space": {"type": "integer", "minimum": 0},
+        "intensity_target": {"type": "number"},
+        "gaborish": {"type": "boolean"},
+        "epf_iterations": {"type": "integer", "minimum": 0}
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/artifact"}
+    }
+  },
+  "$defs": {
+    "rect": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "integer"},
+        {"type": "integer"},
+        {"type": "integer", "minimum": 0},
+        {"type": "integer", "minimum": 0}
+      ],
+      "items": false,
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "pair": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "integer"},
+        {"type": "integer"}
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "positivePair": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "integer", "minimum": 1},
+        {"type": "integer", "minimum": 1}
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "origin_px",
+        "spacing_px",
+        "footprint_px",
+        "valid_rect_px",
+        "padded_rect_px",
+        "value_is_block_anchor"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "pixel",
+            "block",
+            "color_tile",
+            "group",
+            "variable_block",
+            "other"
+          ]
+        },
+        "origin_px": {"$ref": "#/$defs/pair"},
+        "spacing_px": {"$ref": "#/$defs/positivePair"},
+        "footprint_px": {"$ref": "#/$defs/positivePair"},
+        "valid_rect_px": {"$ref": "#/$defs/rect"},
+        "padded_rect_px": {"$ref": "#/$defs/rect"},
+        "value_is_block_anchor": {"type": "boolean"}
+      }
+    },
+    "category": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "name", "covered_blocks"],
+      "properties": {
+        "value": {"type": "integer"},
+        "name": {"type": "string"},
+        "covered_blocks": {"$ref": "#/$defs/pair"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "path",
+        "stage",
+        "dtype",
+        "shape",
+        "axes",
+        "grid",
+        "units",
+        "semantic",
+        "frame_index",
+        "bytes",
+        "file_bytes"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "pattern": "^[^/\\\\].*\\.npy$"},
+        "stage": {"type": "string"},
+        "dtype": {
+          "enum": [
+            "uint8",
+            "int8",
+            "uint16",
+            "int16",
+            "uint32",
+            "int32",
+            "uint64",
+            "int64",
+            "float32",
+            "float64"
+          ]
+        },
+        "shape": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 0},
+          "maxItems": 8
+        },
+        "axes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "maxItems": 8
+        },
+        "grid": {"$ref": "#/$defs/grid"},
+        "units": {"type": "string"},
+        "semantic": {"type": "string"},
+        "frame_index": {"type": "integer", "minimum": 0},
+        "iteration": {"type": "integer", "minimum": 0},
+        "channel_names": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "categories": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/category"}
+        },
+        "derived_from": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "formula": {"type": "string"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "file_bytes": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

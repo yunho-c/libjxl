@@ -50,6 +50,7 @@
 #include "lib/jxl/enc_chroma_from_luma.h"
 #include "lib/jxl/enc_coeff_order.h"
 #include "lib/jxl/enc_context_map.h"
+#include "lib/jxl/enc_debug_data.h"
 #include "lib/jxl/enc_entropy_coder.h"
 #include "lib/jxl/enc_external_image.h"
 #include "lib/jxl/enc_fields.h"
@@ -1593,6 +1594,32 @@ Status ComputeEncodingData(
 
   enc_state.cparams = cparams;
 
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (cparams.debug_data != nullptr) {
+    if (enc_state.streaming_mode || jpeg_data != nullptr ||
+        frame_header.encoding != FrameEncoding::kVarDCT) {
+      return JXL_FAILURE(
+          "Encoder debug data currently supports only one-shot, non-JPEG "
+          "VarDCT frames");
+    }
+    EncoderDebugRunInfo run_info;
+    run_info.frame_xsize = frame_data.xsize;
+    run_info.frame_ysize = frame_data.ysize;
+    run_info.butteraugli_distance = cparams.butteraugli_distance;
+    run_info.effort = 10 - static_cast<int>(cparams.speed_tier);
+    run_info.decoding_speed_tier = cparams.decoding_speed_tier;
+    run_info.resampling = cparams.resampling;
+    run_info.streaming_mode = enc_state.streaming_mode;
+    run_info.color_transform =
+        static_cast<uint32_t>(frame_header.color_transform);
+    run_info.input_color_space = static_cast<uint32_t>(c_enc.GetColorSpace());
+    run_info.intensity_target = metadata->m.IntensityTarget();
+    run_info.gaborish = frame_header.loop_filter.gab;
+    run_info.epf_iterations = frame_header.loop_filter.epf_iters;
+    JXL_RETURN_IF_ERROR(cparams.debug_data->Begin(run_info));
+  }
+#endif
+
   Image3F linear_storage;
   Image3F* linear = nullptr;
 
@@ -1628,6 +1655,44 @@ Status ComputeEncodingData(
     }
     JXL_RETURN_IF_ERROR(PadImageToBlockMultipleInPlace(&color));
   }
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (cparams.debug_data != nullptr &&
+      frame_header.color_transform == ColorTransform::kXYB) {
+    static const char* const kAxes[] = {"y", "x"};
+    DebugArtifactInfo info;
+    info.name = "color/xyb_after_transform/y";
+    info.stage = "color_transform";
+    info.units = "encoder_xyb";
+    info.semantic =
+        "Native encoder Y plane after the XYB transform and before frontend "
+        "feature subtraction";
+    info.axes = kAxes;
+    info.num_axes = 2;
+    info.grid.kind = DebugGridKind::kPixel;
+    info.grid.origin_x = static_cast<int64_t>(patch_rect.x0());
+    info.grid.origin_y = static_cast<int64_t>(patch_rect.y0());
+    info.grid.valid_rect = DebugRect{static_cast<int64_t>(patch_rect.x0()),
+                                     static_cast<int64_t>(patch_rect.y0()),
+                                     patch_rect.xsize(), patch_rect.ysize()};
+    info.grid.padded_rect = DebugRect{static_cast<int64_t>(patch_rect.x0()),
+                                      static_cast<int64_t>(patch_rect.y0()),
+                                      color.xsize(), color.ysize()};
+    if (cparams.debug_data->Wants(info)) {
+      const size_t shape[] = {patch_rect.ysize(), patch_rect.xsize()};
+      const ptrdiff_t strides[] = {
+          static_cast<ptrdiff_t>(color.bytes_per_row()),
+          static_cast<ptrdiff_t>(sizeof(float))};
+      DebugTensorView tensor;
+      tensor.dtype = DebugDataType::kFloat32;
+      tensor.data = color.ConstPlaneRow(1, 0);
+      tensor.shape = shape;
+      tensor.byte_strides = strides;
+      tensor.rank = 2;
+      JXL_RETURN_IF_ERROR(cparams.debug_data->Emit(info, tensor));
+    }
+  }
+#endif
 
   // Rectangle within color that corresponds to the currently processed group
   // in streaming mode.

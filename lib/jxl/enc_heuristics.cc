@@ -44,6 +44,7 @@
 #include "lib/jxl/enc_adaptive_quantization.h"
 #include "lib/jxl/enc_cache.h"
 #include "lib/jxl/enc_chroma_from_luma.h"
+#include "lib/jxl/enc_debug_data.h"
 #include "lib/jxl/enc_gaborish.h"
 #include "lib/jxl/enc_modular.h"
 #include "lib/jxl/enc_noise.h"
@@ -1128,6 +1129,45 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     float q = 0.39 / cparams.butteraugli_distance;
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (cparams.debug_data != nullptr && !streaming_mode &&
+      initialize_global_state) {
+    static const char* const kAxes[] = {"block_y", "block_x"};
+    DebugArtifactInfo info;
+    info.name = "aq/initial/quant_field";
+    info.stage = "adaptive_quantization";
+    info.units = "relative_inverse_quantization_step";
+    info.semantic =
+        "Continuous initial adaptive quantization field before AC-strategy "
+        "adjustment";
+    info.axes = kAxes;
+    info.num_axes = 2;
+    info.grid.kind = DebugGridKind::kBlock;
+    info.grid.spacing_x = kBlockDim * cparams.resampling;
+    info.grid.spacing_y = kBlockDim * cparams.resampling;
+    info.grid.footprint_x = kBlockDim * cparams.resampling;
+    info.grid.footprint_y = kBlockDim * cparams.resampling;
+    info.grid.valid_rect =
+        DebugRect{0, 0, frame_dim.xsize_upsampled, frame_dim.ysize_upsampled};
+    info.grid.padded_rect = DebugRect{0, 0, frame_dim.xsize_upsampled_padded,
+                                      frame_dim.ysize_upsampled_padded};
+    if (cparams.debug_data->Wants(info)) {
+      const size_t shape[] = {initial_quant_field.ysize(),
+                              initial_quant_field.xsize()};
+      const ptrdiff_t strides[] = {
+          static_cast<ptrdiff_t>(initial_quant_field.bytes_per_row()),
+          static_cast<ptrdiff_t>(sizeof(float))};
+      DebugTensorView tensor;
+      tensor.dtype = DebugDataType::kFloat32;
+      tensor.data = initial_quant_field.ConstRow(0);
+      tensor.shape = shape;
+      tensor.byte_strides = strides;
+      tensor.rank = 2;
+      JXL_RETURN_IF_ERROR(cparams.debug_data->Emit(info, tensor));
+    }
+  }
+#endif
 
   // TODO(veluca): do something about animations.
 

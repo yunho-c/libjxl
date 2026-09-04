@@ -25,6 +25,8 @@
 
 namespace jxl {
 
+class EncoderDebugDataSink;
+
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct CompressParams {
   float butteraugli_distance = 1.0f;
@@ -187,7 +189,11 @@ struct CompressParams {
   const ProgressiveMode* custom_progressive_mode = nullptr;
 
   JxlDebugImageCallback debug_image = nullptr;
-  void* debug_image_opaque;
+  void* debug_image_opaque = nullptr;
+
+  // Development-only raw encoder data observations. This is deliberately an
+  // internal C++ hook rather than part of the stable C API.
+  EncoderDebugDataSink* debug_data = nullptr;
 };
 
 static constexpr float kMinButteraugliForDynamicAR = 0.5f;

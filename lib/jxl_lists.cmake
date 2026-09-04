@@ -319,6 +319,8 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/enc_context_map.cc
   jxl/enc_context_map.h
   jxl/enc_convolve_separable5.cc
+  jxl/enc_debug_data.cc
+  jxl/enc_debug_data.h
   jxl/enc_debug_image.cc
   jxl/enc_debug_image.h
   jxl/enc_detect_dots.cc
@@ -407,6 +409,8 @@ set(JPEGXL_INTERNAL_EXTRAS_FOR_TOOLS_SOURCES
   extras/codec.cc
   extras/codec.h
   extras/codec_in_out.h
+  extras/encoder_debug_data.cc
+  extras/encoder_debug_data.h
   extras/hlg.cc
   extras/hlg.h
   extras/metrics.cc
@@ -491,6 +495,7 @@ set(JPEGXL_INTERNAL_TESTS
   extras/compressed_icc_test.cc
   extras/dec/color_description_test.cc
   extras/dec/pgx_test.cc
+  extras/encoder_debug_data_test.cc
   extras/gain_map_test.cc
   jxl/ac_strategy_test.cc
   jxl/alpha_test.cc
@@ -511,6 +516,7 @@ set(JPEGXL_INTERNAL_TESTS
   jxl/dct_test.cc
   jxl/decode_test.cc
   jxl/enc_bit_writer_test.cc
+  jxl/enc_debug_data_test.cc
   jxl/enc_external_image_test.cc
   jxl/enc_gaborish_test.cc
   jxl/enc_linalg_test.cc

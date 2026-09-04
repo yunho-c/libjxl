@@ -2,9 +2,24 @@
 
 ## Status
 
-This document proposes development-only infrastructure for dumping
-image-shaped intermediate state from the VarDCT encoder frontend. It is a
-design and implementation plan, not a description of an existing stable API.
+This document describes development-only infrastructure for dumping
+image-shaped intermediate state from the VarDCT encoder frontend. Phase 1 is
+implemented; the later phases remain an implementation plan. None of this is
+a stable public API.
+
+The Phase 1 implementation provides:
+
+* the internal `EncoderDebugDataSink`, tensor-view, run, artifact, grid, and
+  category metadata types in `lib/jxl/enc_debug_data.h`;
+* the `JPEGXL_ENABLE_ENCODER_DEBUG_DATA` build option, which defaults to off;
+* an internal `JxlEncoderSetDebugDataSink` attachment helper;
+* a filesystem sink in `lib/extras/encoder_debug_data.h` that writes strided
+  tensors as C-contiguous little-endian `.npy` files and produces a
+  deterministically ordered `manifest.json`;
+* schema and NumPy loading helpers in `tools/encoder_debug_data_schema.json`
+  and `tools/encoder_debug_data.py`;
+* initial capture points for the native XYB Y plane at pixel resolution and
+  the continuous initial quant field at block resolution.
 
 The primary recommendation is:
 
@@ -167,6 +182,8 @@ class EncoderDebugDataSink {
  public:
   virtual ~EncoderDebugDataSink() = default;
 
+  virtual Status Begin(const EncoderDebugRunInfo& run_info) = 0;
+
   virtual bool Wants(const DebugArtifactInfo& info) const = 0;
 
   // Emit consumes the view synchronously. The encoder retains ownership.
@@ -175,6 +192,8 @@ class EncoderDebugDataSink {
 
   virtual Status EmitScalar(const DebugArtifactInfo& info,
                             double value) = 0;
+
+  virtual Status Finish() = 0;
 };
 ```
 
@@ -227,6 +246,44 @@ runtime overhead should be limited to coarse null or `Wants` checks.
 
 Filesystem and NumPy serialization should live under `tools` or `lib/extras`,
 not in the core codec library.
+
+### Phase 1 usage
+
+Configure with raw capture points enabled:
+
+```text
+cmake -S . -B build -DJPEGXL_ENABLE_ENCODER_DEBUG_DATA=ON
+```
+
+Developer code can construct and attach the Phase 1 filesystem sink as
+follows. The sink must outlive encoding, and `Finish` must be called after the
+encoder has finished producing output so that the manifest is written.
+
+```cpp
+jxl::extras::FileEncoderDebugDataSinkOptions dump_options;
+dump_options.output_dir = "dump";
+dump_options.profile = "phase1";
+dump_options.libjxl_revision = "<git revision>";
+auto dump = jxl::extras::CreateFileEncoderDebugDataSink(dump_options);
+
+JxlEncoderSetDebugDataSink(frame_settings, dump.get());
+// Add the frame and drain JxlEncoderProcessOutput here.
+JXL_RETURN_IF_ERROR(dump->Finish());
+```
+
+The currently instrumented configuration is deliberately limited to a
+one-shot, non-JPEG VarDCT frame. Other configurations fail explicitly when a
+sink is attached instead of emitting ambiguous coordinates.
+
+Validate or inspect a completed dump with:
+
+```text
+python tools/encoder_debug_data.py dump --list
+```
+
+In Python, `DebugDump.load(name)` returns the stored values unchanged and
+`DebugDump.pixel_coordinates(name)` derives sample-center coordinates from the
+grid metadata. No normalization, color mapping, or upsampling is performed.
 
 ## Artifact format
 
@@ -594,6 +651,11 @@ artifacts.
 ## Implementation phases
 
 ### Phase 1: sink, schema, and serializer
+
+Implemented. The two initial artifacts are
+`color/xyb_after_transform/y` (pixel grid) and
+`aq/initial/quant_field` (8 x 8 block grid). They intentionally exercise
+padded source-row strides while serializing only the logical tensor extent.
 
 * Add the internal sink, tensor view, artifact metadata, and cheap `Wants`
   query.

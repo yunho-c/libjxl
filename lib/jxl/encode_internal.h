@@ -709,4 +709,10 @@ struct JxlEncoderStats {
   std::unique_ptr<jxl::AuxOut> aux_out;
 };
 
+// Internal development API. The sink must outlive all encoding work that uses
+// these frame settings. Detailed capture points are compiled only when
+// JPEGXL_ENABLE_ENCODER_DEBUG_DATA is enabled.
+void JxlEncoderSetDebugDataSink(JxlEncoderFrameSettings* frame_settings,
+                                jxl::EncoderDebugDataSink* debug_data_sink);
+
 #endif  // LIB_JXL_ENCODE_INTERNAL_H_

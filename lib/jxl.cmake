@@ -52,6 +52,12 @@ else()
   list(APPEND JPEGXL_INTERNAL_FLAGS -DJPEGXL_ENABLE_BOXES=0)
 endif ()
 
+if (JPEGXL_ENABLE_ENCODER_DEBUG_DATA)
+  list(APPEND JPEGXL_INTERNAL_FLAGS -DJPEGXL_ENABLE_ENCODER_DEBUG_DATA=1)
+else()
+  list(APPEND JPEGXL_INTERNAL_FLAGS -DJPEGXL_ENABLE_ENCODER_DEBUG_DATA=0)
+endif ()
+
 set(OBJ_COMPILE_DEFINITIONS
   # Used to determine if we are building the library when defined or just
   # including the library when not defined. This is public so libjxl shared
