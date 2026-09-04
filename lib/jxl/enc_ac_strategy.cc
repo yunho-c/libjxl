@@ -365,8 +365,17 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                        size_t y, const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
                        float* full_scratch_space, uint32_t* quantized,
-                       float& entropy) {
+                       float& entropy
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                       ,
+                       AcStrategyDebugCost* debug_cost
+#endif
+) {
   entropy = 0.0f;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  float coefficient_cost = 0.0f;
+  float nonzero_cost = 0.0f;
+#endif
   float* mem = full_scratch_space;
   float* scratch_space = full_scratch_space + AcStrategy::kMaxCoeffArea;
   const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
@@ -485,19 +494,35 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       lossc = Mul(Set(df8, kChannelMul[c]), lossc);
       loss = Add(loss, lossc);
     }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    const float entropy_before_coefficients = entropy;
+#endif
     entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    coefficient_cost += entropy - entropy_before_coefficients;
+#endif
     size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
     // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
     // number of non-zeros of the block.
     size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
     // Also add #bit of #bit of num_nonzeros, to estimate the ANS cost, with a
     // bias.
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    const float entropy_before_nonzeros = entropy;
+#endif
     entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    nonzero_cost += entropy - entropy_before_nonzeros;
+#endif
     if (c == 0 && num_blocks >= 2) {
       // It is X channel (red-green) and we often see ringing
       // in the large blocks. Let's punish that more here.
       float w = 1.0 + std::min(3.0, num_blocks / 8.0);
       entropy *= w;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      coefficient_cost *= w;
+      nonzero_cost *= w;
+#endif
       loss = Mul(loss, Set(df8, w));
     }
   }
@@ -506,9 +531,81 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           1.0f / 8.0f) *
       (num_blocks * kDCTBlockSize) / quant_norm16;
   entropy *= entropy_mul;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  coefficient_cost *= entropy_mul;
+  nonzero_cost *= entropy_mul;
+#endif
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  const float entropy_before_information_loss = entropy;
+#endif
   entropy += config.info_loss_multiplier * loss_scalar;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (debug_cost != nullptr) {
+    debug_cost->total_cost = entropy;
+    debug_cost->coefficient_cost = coefficient_cost;
+    debug_cost->nonzero_cost = nonzero_cost;
+    debug_cost->information_loss = entropy - entropy_before_information_loss;
+    debug_cost->quant_norm = quant_norm16;
+  }
+#endif
   return true;
 }
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+void RecordAcCandidate(AcStrategyDebugTile* debug_tile,
+                       AcStrategyDebugPhase phase, AcStrategyType strategy,
+                       size_t block_x, size_t block_y, bool valid,
+                       bool selected, bool is_merge, float merge_current_cost,
+                       const AcStrategyDebugCost& cost) {
+  if (debug_tile == nullptr) return;
+  AcStrategyDebugCandidate candidate;
+  candidate.phase = phase;
+  candidate.strategy = static_cast<uint8_t>(strategy);
+  candidate.block_x = block_x;
+  candidate.block_y = block_y;
+  candidate.valid = valid;
+  candidate.selected = selected;
+  candidate.is_merge = is_merge;
+  candidate.merge_current_cost = merge_current_cost;
+  candidate.cost = cost;
+  debug_tile->candidates.push_back(candidate);
+}
+
+void MarkAcCandidateSelected(AcStrategyDebugTile* debug_tile,
+                             AcStrategyDebugPhase phase,
+                             AcStrategyType strategy, size_t block_x,
+                             size_t block_y) {
+  if (debug_tile == nullptr) return;
+  for (auto it = debug_tile->candidates.rbegin();
+       it != debug_tile->candidates.rend(); ++it) {
+    if (it->phase == phase && it->strategy == static_cast<uint8_t>(strategy) &&
+        it->block_x == block_x && it->block_y == block_y && it->valid) {
+      it->selected = true;
+      return;
+    }
+  }
+}
+
+void RecordAcSnapshot(AcStrategyDebugTile* debug_tile,
+                      AcStrategyDebugPhase phase, const Rect& rect,
+                      const AcStrategyImage& ac_strategy,
+                      const uint8_t* priority) {
+  if (debug_tile == nullptr) return;
+  AcStrategyDebugSnapshot snapshot;
+  snapshot.phase = phase;
+  snapshot.strategy.fill(0xFF);
+  snapshot.priority.fill(0xFF);
+  for (size_t y = 0; y < rect.ysize(); ++y) {
+    const AcStrategyRow row = ac_strategy.ConstRow(rect.y0() + y);
+    for (size_t x = 0; x < rect.xsize(); ++x) {
+      const size_t index = y * 8 + x;
+      snapshot.strategy[index] = row[rect.x0() + x].RawStrategy();
+      snapshot.priority[index] = priority == nullptr ? 0 : priority[index];
+    }
+  }
+  debug_tile->snapshots.push_back(snapshot);
+}
+#endif  // JPEGXL_ENABLE_ENCODER_DEBUG_DATA
 
 Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
                             float butteraugli_target, const ACSConfig& config,
@@ -516,7 +613,12 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
                             AcStrategyImage* JXL_RESTRICT ac_strategy,
                             float* block, float* scratch_space,
                             uint32_t* quantized, float* entropy_out,
-                            AcStrategyType& best_tx) {
+                            AcStrategyType& best_tx
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                            ,
+                            AcStrategyDebugTile* debug_tile
+#endif
+) {
   struct TransformTry8x8 {
     AcStrategyType type;
     int encoding_speed_tier_max_limit;
@@ -578,6 +680,10 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
   best_tx = kTransforms8x8[0].type;
   for (auto tx : kTransforms8x8) {
     if (tx.encoding_speed_tier_max_limit < encoding_speed_tier) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      RecordAcCandidate(debug_tile, AcStrategyDebugPhase::kInitial8x8, tx.type,
+                        x / 8, y / 8, false, false, false, 0.0f, {});
+#endif
       continue;
     }
     AcStrategy acs = AcStrategy::FromRawStrategy(tx.type);
@@ -600,14 +706,30 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
       entropy_mul += kAvoidEntropyOfTransforms * mul;
     }
     float entropy;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    AcStrategyDebugCost debug_cost;
+#endif
     JXL_RETURN_IF_ERROR(EstimateEntropy(acs, entropy_mul, x, y, config,
                                         cmap_factors, block, scratch_space,
-                                        quantized, entropy));
+                                        quantized, entropy
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                                        ,
+                                        &debug_cost
+#endif
+                                        ));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    RecordAcCandidate(debug_tile, AcStrategyDebugPhase::kInitial8x8, tx.type,
+                      x / 8, y / 8, true, false, false, 0.0f, debug_cost);
+#endif
     if (entropy < best) {
       best_tx = tx.type;
       best = entropy;
     }
   }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  MarkAcCandidateSelected(debug_tile, AcStrategyDebugPhase::kInitial8x8,
+                          best_tx, x / 8, y / 8);
+#endif
   *entropy_out = best;
   return true;
 }
@@ -621,7 +743,13 @@ Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
                    AcStrategyImage* JXL_RESTRICT ac_strategy,
                    const float entropy_mul, const uint8_t candidate_priority,
                    uint8_t* priority, float* JXL_RESTRICT entropy_estimate,
-                   float* block, float* scratch_space, uint32_t* quantized) {
+                   float* block, float* scratch_space, uint32_t* quantized
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                   ,
+                   AcStrategyDebugPhase debug_phase,
+                   AcStrategyDebugTile* debug_tile
+#endif
+) {
   AcStrategy acs = AcStrategy::FromRawStrategy(acs_raw);
   float entropy_current = 0;
   for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
@@ -630,16 +758,38 @@ Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
         // Transform would reuse already allocated blocks and
         // lead to invalid overlaps, for example DCT64X32 vs.
         // DCT32X64.
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+        RecordAcCandidate(debug_tile, debug_phase, acs_raw, bx + cx, by + cy,
+                          false, false, true, entropy_current, {});
+#endif
         return true;
       }
       entropy_current += entropy_estimate[(cy + iy) * 8 + (cx + ix)];
     }
   }
   float entropy_candidate;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  AcStrategyDebugCost debug_cost;
+#endif
   JXL_RETURN_IF_ERROR(EstimateEntropy(
       acs, entropy_mul, (bx + cx) * 8, (by + cy) * 8, config, cmap_factors,
-      block, scratch_space, quantized, entropy_candidate));
-  if (entropy_candidate >= entropy_current) return true;
+      block, scratch_space, quantized, entropy_candidate
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      ,
+      &debug_cost
+#endif
+      ));
+  if (entropy_candidate >= entropy_current) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    RecordAcCandidate(debug_tile, debug_phase, acs_raw, bx + cx, by + cy, true,
+                      false, true, entropy_current, debug_cost);
+#endif
+    return true;
+  }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  RecordAcCandidate(debug_tile, debug_phase, acs_raw, bx + cx, by + cy, true,
+                    true, true, entropy_current, debug_cost);
+#endif
   // Accept the candidate.
   for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
     for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
@@ -705,7 +855,12 @@ Status FindBestFirstLevelDivisionForSquare(
     size_t cy, const ACSConfig& config, const float* JXL_RESTRICT cmap_factors,
     AcStrategyImage* JXL_RESTRICT ac_strategy, const float entropy_mul_JXK,
     const float entropy_mul_JXJ, float* JXL_RESTRICT entropy_estimate,
-    float* block, float* scratch_space, uint32_t* quantized) {
+    float* block, float* scratch_space, uint32_t* quantized
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    ,
+    AcStrategyDebugPhase debug_phase, AcStrategyDebugTile* debug_tile
+#endif
+) {
   // We denote J for the larger dimension here, and K for the smaller.
   // For example, for 32x32 block splitting, J would be 32, K 16.
   const size_t blocks_half = blocks / 2;
@@ -752,30 +907,77 @@ Status FindBestFirstLevelDivisionForSquare(
   float entropy_KXJ_top = std::numeric_limits<float>::max();
   float entropy_KXJ_bottom = std::numeric_limits<float>::max();
   float entropy_JXJ = std::numeric_limits<float>::max();
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  AcStrategyDebugCost debug_JXK_left;
+  AcStrategyDebugCost debug_JXK_right;
+  AcStrategyDebugCost debug_KXJ_top;
+  AcStrategyDebugCost debug_KXJ_bottom;
+  AcStrategyDebugCost debug_JXJ;
+#endif
   if (allow_JXK) {
     if (row0[bx + cx + 0].Strategy() != acs_rawJXK) {
       JXL_RETURN_IF_ERROR(EstimateEntropy(
           acsJXK, entropy_mul_JXK, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-          cmap_factors, block, scratch_space, quantized, entropy_JXK_left));
+          cmap_factors, block, scratch_space, quantized, entropy_JXK_left
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+          ,
+          &debug_JXK_left
+#endif
+          ));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      RecordAcCandidate(debug_tile, debug_phase, acs_rawJXK, bx + cx, by + cy,
+                        true, false, true,
+                        entropy[0][0] + entropy[1][0], debug_JXK_left);
+#endif
     }
     if (row0[bx + cx + blocks_half].Strategy() != acs_rawJXK) {
       JXL_RETURN_IF_ERROR(
           EstimateEntropy(acsJXK, entropy_mul_JXK, (bx + cx + blocks_half) * 8,
                           (by + cy + 0) * 8, config, cmap_factors, block,
-                          scratch_space, quantized, entropy_JXK_right));
+                          scratch_space, quantized, entropy_JXK_right
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                          ,
+                          &debug_JXK_right
+#endif
+                          ));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      RecordAcCandidate(debug_tile, debug_phase, acs_rawJXK,
+                        bx + cx + blocks_half, by + cy, true, false, true,
+                        entropy[0][1] + entropy[1][1], debug_JXK_right);
+#endif
     }
   }
   if (allow_KXJ) {
     if (row0[bx + cx].Strategy() != acs_rawKXJ) {
       JXL_RETURN_IF_ERROR(EstimateEntropy(
           acsKXJ, entropy_mul_JXK, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-          cmap_factors, block, scratch_space, quantized, entropy_KXJ_top));
+          cmap_factors, block, scratch_space, quantized, entropy_KXJ_top
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+          ,
+          &debug_KXJ_top
+#endif
+          ));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      RecordAcCandidate(debug_tile, debug_phase, acs_rawKXJ, bx + cx, by + cy,
+                        true, false, true,
+                        entropy[0][0] + entropy[0][1], debug_KXJ_top);
+#endif
     }
     if (row1[bx + cx].Strategy() != acs_rawKXJ) {
       JXL_RETURN_IF_ERROR(
           EstimateEntropy(acsKXJ, entropy_mul_JXK, (bx + cx + 0) * 8,
                           (by + cy + blocks_half) * 8, config, cmap_factors,
-                          block, scratch_space, quantized, entropy_KXJ_bottom));
+                          block, scratch_space, quantized, entropy_KXJ_bottom
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                          ,
+                          &debug_KXJ_bottom
+#endif
+                          ));
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      RecordAcCandidate(debug_tile, debug_phase, acs_rawKXJ, bx + cx,
+                        by + cy + blocks_half, true, false, true,
+                        entropy[1][0] + entropy[1][1], debug_KXJ_bottom);
+#endif
     }
   }
   if (allow_square_transform) {
@@ -784,7 +986,12 @@ Status FindBestFirstLevelDivisionForSquare(
     // exploring 16x32 and 32x16.
     JXL_RETURN_IF_ERROR(EstimateEntropy(
         acsJXJ, entropy_mul_JXJ, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-        cmap_factors, block, scratch_space, quantized, entropy_JXJ));
+        cmap_factors, block, scratch_space, quantized, entropy_JXJ
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+        ,
+        &debug_JXJ
+#endif
+        ));
   }
 
   // Test if this block should have JXK or KXJ transforms,
@@ -793,16 +1000,35 @@ Status FindBestFirstLevelDivisionForSquare(
                   std::min(entropy_JXK_right, entropy[0][1] + entropy[1][1]);
   float costNxJ = std::min(entropy_KXJ_top, entropy[0][0] + entropy[0][1]) +
                   std::min(entropy_KXJ_bottom, entropy[1][0] + entropy[1][1]);
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (allow_square_transform) {
+    RecordAcCandidate(debug_tile, debug_phase, acs_rawJXJ, bx + cx, by + cy,
+                      true, false, true, std::min(costJxN, costNxJ),
+                      debug_JXJ);
+  }
+#endif
   if (entropy_JXJ < costJxN && entropy_JXJ < costNxJ) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    MarkAcCandidateSelected(debug_tile, debug_phase, acs_rawJXJ, bx + cx,
+                            by + cy);
+#endif
     JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cx, by + cy, acs_rawJXJ));
     SetEntropyForTransform(cx, cy, acs_rawJXJ, entropy_JXJ, entropy_estimate);
   } else if (costJxN < costNxJ) {
     if (entropy_JXK_left < entropy[0][0] + entropy[1][0]) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      MarkAcCandidateSelected(debug_tile, debug_phase, acs_rawJXK, bx + cx,
+                              by + cy);
+#endif
       JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cx, by + cy, acs_rawJXK));
       SetEntropyForTransform(cx, cy, acs_rawJXK, entropy_JXK_left,
                              entropy_estimate);
     }
     if (entropy_JXK_right < entropy[0][1] + entropy[1][1]) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      MarkAcCandidateSelected(debug_tile, debug_phase, acs_rawJXK,
+                              bx + cx + blocks_half, by + cy);
+#endif
       JXL_RETURN_IF_ERROR(
           ac_strategy->Set(bx + cx + blocks_half, by + cy, acs_rawJXK));
       SetEntropyForTransform(cx + blocks_half, cy, acs_rawJXK,
@@ -810,11 +1036,19 @@ Status FindBestFirstLevelDivisionForSquare(
     }
   } else {
     if (entropy_KXJ_top < entropy[0][0] + entropy[0][1]) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      MarkAcCandidateSelected(debug_tile, debug_phase, acs_rawKXJ, bx + cx,
+                              by + cy);
+#endif
       JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cx, by + cy, acs_rawKXJ));
       SetEntropyForTransform(cx, cy, acs_rawKXJ, entropy_KXJ_top,
                              entropy_estimate);
     }
     if (entropy_KXJ_bottom < entropy[1][0] + entropy[1][1]) {
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      MarkAcCandidateSelected(debug_tile, debug_phase, acs_rawKXJ, bx + cx,
+                              by + cy + blocks_half);
+#endif
       JXL_RETURN_IF_ERROR(
           ac_strategy->Set(bx + cx, by + cy + blocks_half, acs_rawKXJ));
       SetEntropyForTransform(cx, cy + blocks_half, acs_rawKXJ,
@@ -828,7 +1062,12 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                       const Rect& rect, const ColorCorrelationMap& cmap,
                       float* JXL_RESTRICT block,
                       uint32_t* JXL_RESTRICT quantized,
-                      AcStrategyImage* ac_strategy) {
+                      AcStrategyImage* ac_strategy
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                      ,
+                      AcStrategyDebugTile* debug_tile
+#endif
+) {
   // Main philosophy here:
   // 1. First find best 8x8 transform for each area.
   // 2. Merging them into larger transforms where possibly, but
@@ -843,6 +1082,14 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   float* JXL_RESTRICT scratch_space = block + 3 * AcStrategy::kMaxCoeffArea;
   size_t bx = rect.x0();
   size_t by = rect.y0();
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  if (debug_tile != nullptr) {
+    debug_tile->rect = rect;
+    debug_tile->candidates.clear();
+    debug_tile->snapshots.clear();
+    debug_tile->candidates.reserve(rect.xsize() * rect.ysize() * 16);
+  }
+#endif
   JXL_ENSURE(rect.xsize() <= 8);
   JXL_ENSURE(rect.ysize() <= 8);
   size_t tx = bx / kColorTileDimInBlocks;
@@ -858,6 +1105,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // when DCT8X8 is specified in the tree search.
   // 8x8 transforms have 10 variants, but every larger transform is just a DCT.
   float entropy_estimate[64] = {};
+  // Priority is a tricky kludge to avoid collisions so that transforms
+  // don't overlap.
+  uint8_t priority[64] = {};
   // Favor all 8x8 transforms (against 16x8 and larger transforms)) at
   // low butteraugli_target distances.
   static const float k8x8mul1 = -0.4;
@@ -871,11 +1121,20 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       JXL_RETURN_IF_ERROR(FindBest8x8Transform(
           8 * (bx + ix), 8 * (by + iy), static_cast<int>(cparams.speed_tier),
           butteraugli_target, config, cmap_factors, ac_strategy, block,
-          scratch_space, quantized, &entropy, best_of_8x8s));
+          scratch_space, quantized, &entropy, best_of_8x8s
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+          ,
+          debug_tile
+#endif
+          ));
       JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + ix, by + iy, best_of_8x8s));
       entropy_estimate[iy * 8 + ix] = entropy * mul8x8;
     }
   }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  RecordAcSnapshot(debug_tile, AcStrategyDebugPhase::kInitial8x8, rect,
+                   *ac_strategy, priority);
+#endif
   // Merge when a larger transform is better than the previously
   // searched best combination of 8x8 transforms.
   struct MergeTry {
@@ -930,9 +1189,6 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   set(AcStrategyType::DCT128X256, 0.0f, 0.73f);
   */
 
-  // Priority is a tricky kludge to avoid collisions so that transforms
-  // don't overlap.
-  uint8_t priority[64] = {};
   bool enable_32x32 = cparams.decoding_speed_tier < 4;
   for (auto mt : kTransformsForMerge) {
     if (mt.decoding_speed_tier_max_limit < cparams.decoding_speed_tier) {
@@ -952,7 +1208,12 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
                   8, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
                   mt.entropy_mul, entropy_mul64X64, entropy_estimate, block,
-                  scratch_space, quantized));
+                  scratch_space, quantized
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                  ,
+                  AcStrategyDebugPhase::kAlignedMerge, debug_tile
+#endif
+                  ));
             }
             continue;
           } else if (mt.type == AcStrategyType::DCT32X16) {
@@ -976,7 +1237,12 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
                   4, enable_32x32, bx, by, cx, cy, config, cmap_factors,
                   ac_strategy, mt.entropy_mul, entropy_mul32X32,
-                  entropy_estimate, block, scratch_space, quantized));
+                  entropy_estimate, block, scratch_space, quantized
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                  ,
+                  AcStrategyDebugPhase::kAlignedMerge, debug_tile
+#endif
+                  ));
             }
             continue;
           } else if (mt.type == AcStrategyType::DCT32X16) {
@@ -999,7 +1265,12 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
                   2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
                   mt.entropy_mul, entropy_mul16X16, entropy_estimate, block,
-                  scratch_space, quantized));
+                  scratch_space, quantized
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                  ,
+                  AcStrategyDebugPhase::kAlignedMerge, debug_tile
+#endif
+                  ));
             }
             continue;
           } else if (mt.type == AcStrategyType::DCT16X8) {
@@ -1023,10 +1294,19 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         JXL_RETURN_IF_ERROR(
             TryMergeAcs(mt.type, bx, by, cx, cy, config, cmap_factors,
                         ac_strategy, mt.entropy_mul, mt.priority, &priority[0],
-                        entropy_estimate, block, scratch_space, quantized));
+                        entropy_estimate, block, scratch_space, quantized
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                        ,
+                        AcStrategyDebugPhase::kAlignedMerge, debug_tile
+#endif
+                        ));
       }
     }
   }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  RecordAcSnapshot(debug_tile, AcStrategyDebugPhase::kAlignedMerge, rect,
+                   *ac_strategy, priority);
+#endif
   if (cparams.speed_tier >= SpeedTier::kHare) {
     return true;
   }
@@ -1038,10 +1318,19 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
             2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
             entropy_mul16X8, entropy_mul16X16, entropy_estimate, block,
-            scratch_space, quantized));
+            scratch_space, quantized
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+            ,
+            AcStrategyDebugPhase::kNonAligned16, debug_tile
+#endif
+            ));
       }
     }
   }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  RecordAcSnapshot(debug_tile, AcStrategyDebugPhase::kNonAligned16, rect,
+                   *ac_strategy, priority);
+#endif
   // Non-aligned matching for 32X32, 16X32 and 32X16.
   size_t step = cparams.speed_tier >= SpeedTier::kTortoise ? 2 : 1;
   for (size_t cy = 0; cy + 3 < rect.ysize(); cy += step) {
@@ -1052,9 +1341,18 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
           4, enable_32x32, bx, by, cx, cy, config, cmap_factors, ac_strategy,
           entropy_mul16X32, entropy_mul32X32, entropy_estimate, block,
-          scratch_space, quantized));
+          scratch_space, quantized
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+          ,
+          AcStrategyDebugPhase::kNonAligned32, debug_tile
+#endif
+          ));
     }
   }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  RecordAcSnapshot(debug_tile, AcStrategyDebugPhase::kNonAligned32, rect,
+                   *ac_strategy, priority);
+#endif
   return true;
 }
 
@@ -1139,7 +1437,12 @@ Status AcStrategyHeuristics::PrepareForThreads(std::size_t num_threads) {
 Status AcStrategyHeuristics::ProcessRect(const Rect& rect,
                                          const ColorCorrelationMap& cmap,
                                          AcStrategyImage* ac_strategy,
-                                         size_t thread) {
+                                         size_t thread
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                                         ,
+                                         AcStrategyDebugTile* debug_tile
+#endif
+) {
   // In Cheetah mode, use DCT8 everywhere and uniform quantization.
   if (cparams.speed_tier >= SpeedTier::kCheetah) {
     ac_strategy->FillDCT8(rect);
@@ -1148,7 +1451,12 @@ Status AcStrategyHeuristics::ProcessRect(const Rect& rect,
   return HWY_DYNAMIC_DISPATCH(ProcessRectACS)(
       cparams, config, rect, cmap,
       mem.address<float>() + thread * mem_per_thread,
-      qmem.address<uint32_t>() + thread * qmem_per_thread, ac_strategy);
+      qmem.address<uint32_t>() + thread * qmem_per_thread, ac_strategy
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+      ,
+      debug_tile
+#endif
+  );
 }
 
 Status AcStrategyHeuristics::Finalize(const FrameDimensions& frame_dim,

@@ -11,6 +11,7 @@
 #include <jxl/encode_cxx.h>
 #include <jxl/types.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -198,6 +199,21 @@ TEST(EncoderDebugDataTest, CapturesEffortSevenFieldsWithoutChangingOutput) {
       "ac/final/covered_blocks_y",
       "ac/final/is_first_block",
       "ac/final/strategy_id",
+      "ac/search/candidate_coefficient_cost",
+      "ac/search/candidate_information_loss",
+      "ac/search/candidate_nonzero_cost",
+      "ac/search/candidate_quant_norm",
+      "ac/search/candidate_selected",
+      "ac/search/candidate_total_cost",
+      "ac/search/candidate_valid",
+      "ac/search/merge_accepted",
+      "ac/search/merge_candidate_cost",
+      "ac/search/merge_current_cost",
+      "ac/search/phase_executed",
+      "ac/search/phase_id",
+      "ac/search/priority_after_phase",
+      "ac/search/selected_strategy_after_phase",
+      "ac/search/strategy_id",
       "aq/final/quant_field",
       "aq/final/raw_quant_field",
       "aq/initial/mask_block",
@@ -220,6 +236,7 @@ TEST(EncoderDebugDataTest, CapturesEffortSevenFieldsWithoutChangingOutput) {
       "color/xyb_after_transform",
       "color/xyb_after_transform/y",
       "epf/candidate_error",
+      "epf/candidate_reconstruction_xyb",
       "epf/candidate_values",
       "epf/selected_sharpness",
       "gaborish/input_xyb",
@@ -291,6 +308,61 @@ TEST(EncoderDebugDataTest, CapturesEffortSevenFieldsWithoutChangingOutput) {
     EXPECT_LE(is_first.values[i], 1);
   }
 
+  const CapturedTensor& ac_valid =
+      sink.tensors.at("ac/search/candidate_valid");
+  const CapturedTensor& ac_selected =
+      sink.tensors.at("ac/search/candidate_selected");
+  const CapturedTensor& ac_total =
+      sink.tensors.at("ac/search/candidate_total_cost");
+  const CapturedTensor& ac_coefficients =
+      sink.tensors.at("ac/search/candidate_coefficient_cost");
+  const CapturedTensor& ac_nonzeros =
+      sink.tensors.at("ac/search/candidate_nonzero_cost");
+  const CapturedTensor& ac_loss =
+      sink.tensors.at("ac/search/candidate_information_loss");
+  EXPECT_EQ((std::vector<size_t>{4, AcStrategy::kNumValidStrategies, 2, 3}),
+            ac_valid.shape);
+  EXPECT_EQ(ac_valid.shape, ac_selected.shape);
+  EXPECT_EQ(ac_valid.shape, ac_total.shape);
+  size_t valid_candidates = 0;
+  size_t selected_initial_candidates = 0;
+  for (size_t i = 0; i < ac_valid.values.size(); ++i) {
+    EXPECT_LE(ac_valid.values[i], 1);
+    EXPECT_LE(ac_selected.values[i], 1);
+    const float total = CapturedValue<float>(ac_total, i);
+    if (ac_valid.values[i] == 0) {
+      EXPECT_TRUE(std::isnan(total));
+      continue;
+    }
+    ++valid_candidates;
+    const float components = CapturedValue<float>(ac_coefficients, i) +
+                             CapturedValue<float>(ac_nonzeros, i) +
+                             CapturedValue<float>(ac_loss, i);
+    EXPECT_TRUE(std::isfinite(total));
+    EXPECT_NEAR(total, components,
+                1e-5f * std::max(1.0f, std::abs(total)));
+    if (i < AcStrategy::kNumValidStrategies * 2 * 3) {
+      selected_initial_candidates += ac_selected.values[i];
+    }
+  }
+  EXPECT_GT(valid_candidates, 0u);
+  EXPECT_EQ(6u, selected_initial_candidates);
+
+  const CapturedTensor& selected_after_phase =
+      sink.tensors.at("ac/search/selected_strategy_after_phase");
+  const CapturedTensor& priority_after_phase =
+      sink.tensors.at("ac/search/priority_after_phase");
+  const CapturedTensor& phase_executed =
+      sink.tensors.at("ac/search/phase_executed");
+  EXPECT_EQ((std::vector<size_t>{4, 2, 3}), selected_after_phase.shape);
+  EXPECT_EQ(selected_after_phase.shape, priority_after_phase.shape);
+  EXPECT_EQ((std::vector<size_t>{4}), phase_executed.shape);
+  for (uint8_t executed : phase_executed.values) EXPECT_EQ(1, executed);
+  EXPECT_EQ((std::vector<size_t>{4}),
+            sink.tensors.at("ac/search/phase_id").shape);
+  EXPECT_EQ((std::vector<size_t>{AcStrategy::kNumValidStrategies}),
+            sink.tensors.at("ac/search/strategy_id").shape);
+
   const double color_factor =
       CapturedValue<double>(sink.tensors.at("cfl/base/color_factor"), 0);
   const double base_ytox =
@@ -312,6 +384,14 @@ TEST(EncoderDebugDataTest, CapturesEffortSevenFieldsWithoutChangingOutput) {
   EXPECT_EQ((std::vector<size_t>{3}), candidate_values.shape);
   EXPECT_EQ((std::vector<size_t>{3, 2, 3}), candidate_error.shape);
   EXPECT_EQ((std::vector<size_t>{2, 3}), selected.shape);
+  const CapturedTensor& candidate_reconstruction =
+      sink.tensors.at("epf/candidate_reconstruction_xyb");
+  EXPECT_EQ((std::vector<size_t>{3, 3, 9, 17}),
+            candidate_reconstruction.shape);
+  EXPECT_EQ((std::vector<std::string>{"candidate", "channel", "y", "x"}),
+            candidate_reconstruction.axes);
+  EXPECT_EQ((std::vector<std::string>{"x", "y", "b"}),
+            candidate_reconstruction.channel_names);
   const std::set<uint8_t> candidates(candidate_values.values.begin(),
                                      candidate_values.values.end());
   for (uint8_t value : selected.values) {

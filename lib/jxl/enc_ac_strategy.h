@@ -8,7 +8,10 @@
 
 #include <jxl/memory_manager.h>
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/rect.h"
@@ -28,6 +31,54 @@ namespace jxl {
 
 struct AuxOut;
 class AcStrategyImage;
+
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+
+enum class AcStrategyDebugPhase : uint8_t {
+  kInitial8x8 = 0,
+  kAlignedMerge = 1,
+  kNonAligned16 = 2,
+  kNonAligned32 = 3,
+};
+
+constexpr size_t kAcStrategyDebugNumPhases = 4;
+constexpr size_t kAcStrategyDebugTileBlocks = 64;
+
+struct AcStrategyDebugCost {
+  float total_cost = 0.0f;
+  float coefficient_cost = 0.0f;
+  float nonzero_cost = 0.0f;
+  float information_loss = 0.0f;
+  float quant_norm = 0.0f;
+};
+
+struct AcStrategyDebugCandidate {
+  AcStrategyDebugPhase phase = AcStrategyDebugPhase::kInitial8x8;
+  uint8_t strategy = 0;
+  size_t block_x = 0;
+  size_t block_y = 0;
+  bool valid = false;
+  bool selected = false;
+  bool is_merge = false;
+  float merge_current_cost = 0.0f;
+  AcStrategyDebugCost cost;
+};
+
+struct AcStrategyDebugSnapshot {
+  AcStrategyDebugPhase phase = AcStrategyDebugPhase::kInitial8x8;
+  std::array<uint8_t, kAcStrategyDebugTileBlocks> strategy{};
+  std::array<uint8_t, kAcStrategyDebugTileBlocks> priority{};
+};
+
+// One worker owns each instance. Records remain tile-local until the caller's
+// worker pool has joined, at which point they are assembled for the sink.
+struct AcStrategyDebugTile {
+  Rect rect;
+  std::vector<AcStrategyDebugCandidate> candidates;
+  std::vector<AcStrategyDebugSnapshot> snapshots;
+};
+
+#endif  // JPEGXL_ENABLE_ENCODER_DEBUG_DATA
 
 // AC strategy selection: utility struct.
 
@@ -74,7 +125,12 @@ struct AcStrategyHeuristics {
               const ImageF& mask1x1, DequantMatrices* matrices);
   Status PrepareForThreads(std::size_t num_threads);
   Status ProcessRect(const Rect& rect, const ColorCorrelationMap& cmap,
-                     AcStrategyImage* ac_strategy, size_t thread);
+                     AcStrategyImage* ac_strategy, size_t thread
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+                     ,
+                     AcStrategyDebugTile* debug_tile = nullptr
+#endif
+  );
   Status Finalize(const FrameDimensions& frame_dim,
                   const AcStrategyImage& ac_strategy, AuxOut* aux_out);
   JxlMemoryManager* memory_manager;

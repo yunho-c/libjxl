@@ -42,7 +42,7 @@ struct EncoderDumpArgs {
                             "directory for .npy files and manifest.json",
                             &dump_dir, &ParseString);
     cmdline->AddOptionValue('\0', "debug_dump_profile", "PROFILE",
-                            "artifact profile: overview (default), aq, or all",
+                            "artifact profile: overview (default), aq, ac, or all",
                             &profile, &ParseString);
     cmdline->AddOptionValue('d', "distance", "DISTANCE",
                             "VarDCT target distance, default = 1.0", &distance,
@@ -80,6 +80,10 @@ bool ConfigureProfile(const std::string& profile,
     options->include_prefixes = {"aq/"};
     return true;
   }
+  if (profile == "ac") {
+    options->include_prefixes = {"ac/"};
+    return true;
+  }
   if (profile != "overview") {
     fprintf(stderr, "Unknown debug dump profile: %s\n", profile.c_str());
     return false;
@@ -93,7 +97,9 @@ bool ConfigureProfile(const std::string& profile,
       "aq/final/",
       "cfl/",
       "ac/final/",
-      "epf/",
+      "epf/candidate_values",
+      "epf/candidate_error",
+      "epf/selected_sharpness",
   };
   return true;
 }

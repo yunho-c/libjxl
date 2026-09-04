@@ -1014,21 +1014,329 @@ Status EmitCflBase(EncoderDebugDataSink* sink, const ColorCorrelation& base) {
   return true;
 }
 
+static const char* const kAcStrategyNames[] = {
+    "DCT",        "IDENTITY",   "DCT2X2",    "DCT4X4",    "DCT16X16",
+    "DCT32X32",   "DCT16X8",    "DCT8X16",   "DCT32X8",   "DCT8X32",
+    "DCT32X16",   "DCT16X32",   "DCT4X8",    "DCT8X4",    "AFV0",
+    "AFV1",       "AFV2",       "AFV3",      "DCT64X64",  "DCT64X32",
+    "DCT32X64",   "DCT128X128", "DCT128X64", "DCT64X128", "DCT256X256",
+    "DCT256X128", "DCT128X256",
+};
+static_assert(sizeof(kAcStrategyNames) / sizeof(kAcStrategyNames[0]) ==
+                  AcStrategy::kNumValidStrategies,
+              "Update debug AC strategy names");
+
+static const char* const kAcSearchArtifactNames[] = {
+    "ac/search/phase_id",
+    "ac/search/strategy_id",
+    "ac/search/candidate_total_cost",
+    "ac/search/candidate_valid",
+    "ac/search/candidate_selected",
+    "ac/search/candidate_coefficient_cost",
+    "ac/search/candidate_nonzero_cost",
+    "ac/search/candidate_information_loss",
+    "ac/search/candidate_quant_norm",
+    "ac/search/merge_current_cost",
+    "ac/search/merge_candidate_cost",
+    "ac/search/merge_accepted",
+    "ac/search/selected_strategy_after_phase",
+    "ac/search/priority_after_phase",
+    "ac/search/phase_executed",
+};
+
+bool WantsAcSearch(EncoderDebugDataSink* sink) {
+  for (const char* name : kAcSearchArtifactNames) {
+    if (WantsDebugArtifact(sink, name)) return true;
+  }
+  return false;
+}
+
+Status EmitDebugTensor(EncoderDebugDataSink* sink,
+                       const DebugArtifactInfo& info, DebugDataType dtype,
+                       const void* data, const size_t* shape,
+                       const ptrdiff_t* strides, size_t rank) {
+  DebugTensorView tensor;
+  tensor.dtype = dtype;
+  tensor.data = data;
+  tensor.shape = shape;
+  tensor.byte_strides = strides;
+  tensor.rank = rank;
+  return sink->Emit(info, tensor);
+}
+
+Status EmitAcSearch(EncoderDebugDataSink* sink,
+                    const std::vector<AcStrategyDebugTile>& tiles,
+                    const FrameDimensions& frame_dim,
+                    const CompressParams& cparams) {
+  if (sink == nullptr || !WantsAcSearch(sink)) return true;
+
+  constexpr size_t kPhases = kAcStrategyDebugNumPhases;
+  constexpr size_t kStrategies = AcStrategy::kNumValidStrategies;
+  const size_t ysize = frame_dim.ysize_blocks;
+  const size_t xsize = frame_dim.xsize_blocks;
+  size_t plane_size;
+  size_t strategy_plane_size;
+  size_t tensor_size;
+  if (!SafeMul(ysize, xsize, plane_size) ||
+      !SafeMul(kStrategies, plane_size, strategy_plane_size) ||
+      !SafeMul(kPhases, strategy_plane_size, tensor_size)) {
+    return JXL_FAILURE("AC search debug tensor dimensions overflow size_t");
+  }
+  if (strategy_plane_size >
+          static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+              sizeof(float) ||
+      plane_size >
+          static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+              sizeof(float) ||
+      xsize > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+                  sizeof(float)) {
+    return JXL_FAILURE("AC search debug tensor stride overflows ptrdiff_t");
+  }
+  static const char* const kCandidateAxes[] = {"search_phase", "strategy",
+                                               "block_y", "block_x"};
+  static const char* const kPhaseBlockAxes[] = {"search_phase", "block_y",
+                                                "block_x"};
+  static const char* const kPhaseAxis[] = {"search_phase"};
+  static const char* const kStrategyAxis[] = {"strategy"};
+  static const char* const kPhaseNames[] = {
+      "initial_8x8", "aligned_merge", "non_aligned_16",
+      "non_aligned_32"};
+  DebugCategory phase_categories[kPhases];
+  for (size_t i = 0; i < kPhases; ++i) {
+    phase_categories[i] =
+        DebugCategory{static_cast<int64_t>(i), kPhaseNames[i], 0, 0};
+  }
+  DebugCategory strategy_categories[kStrategies];
+  for (size_t i = 0; i < kStrategies; ++i) {
+    const AcStrategy acs = AcStrategy::FromRawStrategy(i);
+    strategy_categories[i] =
+        DebugCategory{static_cast<int64_t>(i), kAcStrategyNames[i],
+                      acs.covered_blocks_x(), acs.covered_blocks_y()};
+  }
+
+  DebugArtifactInfo info;
+  info.stage = "ac_strategy_search";
+  info.grid = DebugBlockGrid(frame_dim, cparams);
+  info.grid.value_is_block_anchor = true;
+
+  auto emit_ids = [&](const char* name, const char* semantic, size_t count,
+                      const char* const* axes, const DebugCategory* categories,
+                      size_t num_categories) -> Status {
+    if (!WantsDebugArtifact(sink, name)) return true;
+    std::vector<uint8_t> values(count);
+    std::iota(values.begin(), values.end(), uint8_t{0});
+    const size_t shape[] = {count};
+    const ptrdiff_t strides[] = {static_cast<ptrdiff_t>(sizeof(uint8_t))};
+    DebugArtifactInfo id_info = info;
+    id_info.name = name;
+    id_info.units = "enum";
+    id_info.semantic = semantic;
+    id_info.axes = axes;
+    id_info.num_axes = 1;
+    id_info.categories = categories;
+    id_info.num_categories = num_categories;
+    id_info.grid = DebugGridInfo{};
+    return EmitDebugTensor(sink, id_info, DebugDataType::kUint8, values.data(),
+                           shape, strides, 1);
+  };
+  JXL_RETURN_IF_ERROR(emit_ids(
+      "ac/search/phase_id", "Search-phase values corresponding to the phase axis",
+      kPhases, kPhaseAxis, phase_categories, kPhases));
+  JXL_RETURN_IF_ERROR(emit_ids(
+      "ac/search/strategy_id",
+      "Raw AC strategy values corresponding to the strategy axis", kStrategies,
+      kStrategyAxis, strategy_categories, kStrategies));
+
+  const size_t candidate_shape[] = {kPhases, kStrategies, ysize, xsize};
+  const ptrdiff_t candidate_float_strides[] = {
+      static_cast<ptrdiff_t>(strategy_plane_size * sizeof(float)),
+      static_cast<ptrdiff_t>(plane_size * sizeof(float)),
+      static_cast<ptrdiff_t>(xsize * sizeof(float)),
+      static_cast<ptrdiff_t>(sizeof(float))};
+  const ptrdiff_t candidate_byte_strides[] = {
+      static_cast<ptrdiff_t>(strategy_plane_size),
+      static_cast<ptrdiff_t>(plane_size), static_cast<ptrdiff_t>(xsize), 1};
+  auto candidate_index = [&](const AcStrategyDebugCandidate& candidate) {
+    return ((static_cast<size_t>(candidate.phase) * kStrategies +
+             candidate.strategy) *
+                ysize +
+            candidate.block_y) *
+               xsize +
+           candidate.block_x;
+  };
+  auto emit_candidate_float = [&](const char* name, const char* units,
+                                  const char* semantic, bool merges_only,
+                                  auto get_value) -> Status {
+    if (!WantsDebugArtifact(sink, name)) return true;
+    std::vector<float> values(tensor_size,
+                              std::numeric_limits<float>::quiet_NaN());
+    for (const AcStrategyDebugTile& tile : tiles) {
+      for (const AcStrategyDebugCandidate& candidate : tile.candidates) {
+        if (!candidate.valid || (merges_only && !candidate.is_merge) ||
+            static_cast<size_t>(candidate.phase) >= kPhases ||
+            candidate.strategy >= kStrategies || candidate.block_x >= xsize ||
+            candidate.block_y >= ysize) {
+          continue;
+        }
+        values[candidate_index(candidate)] = get_value(candidate);
+      }
+    }
+    DebugArtifactInfo candidate_info = info;
+    candidate_info.name = name;
+    candidate_info.units = units;
+    candidate_info.semantic = semantic;
+    candidate_info.axes = kCandidateAxes;
+    candidate_info.num_axes = 4;
+    return EmitDebugTensor(sink, candidate_info, DebugDataType::kFloat32,
+                           values.data(), candidate_shape,
+                           candidate_float_strides, 4);
+  };
+  auto emit_candidate_byte = [&](const char* name, const char* semantic,
+                                 bool merges_only, auto get_value) -> Status {
+    if (!WantsDebugArtifact(sink, name)) return true;
+    std::vector<uint8_t> values(tensor_size, 0);
+    for (const AcStrategyDebugTile& tile : tiles) {
+      for (const AcStrategyDebugCandidate& candidate : tile.candidates) {
+        if ((merges_only && !candidate.is_merge) ||
+            static_cast<size_t>(candidate.phase) >= kPhases ||
+            candidate.strategy >= kStrategies || candidate.block_x >= xsize ||
+            candidate.block_y >= ysize) {
+          continue;
+        }
+        const size_t index = candidate_index(candidate);
+        values[index] = std::max(values[index],
+                                 static_cast<uint8_t>(get_value(candidate)));
+      }
+    }
+    DebugArtifactInfo candidate_info = info;
+    candidate_info.name = name;
+    candidate_info.units = "boolean";
+    candidate_info.semantic = semantic;
+    candidate_info.axes = kCandidateAxes;
+    candidate_info.num_axes = 4;
+    return EmitDebugTensor(sink, candidate_info, DebugDataType::kUint8,
+                           values.data(), candidate_shape,
+                           candidate_byte_strides, 4);
+  };
+
+  JXL_RETURN_IF_ERROR(emit_candidate_float(
+      "ac/search/candidate_total_cost", "heuristic_cost",
+      "Total native heuristic cost of each evaluated AC candidate", false,
+      [](const AcStrategyDebugCandidate& c) { return c.cost.total_cost; }));
+  JXL_RETURN_IF_ERROR(emit_candidate_byte(
+      "ac/search/candidate_valid",
+      "One where the candidate was evaluated at this phase and anchor", false,
+      [](const AcStrategyDebugCandidate& c) { return c.valid ? 1 : 0; }));
+  JXL_RETURN_IF_ERROR(emit_candidate_byte(
+      "ac/search/candidate_selected",
+      "One where the evaluated candidate was selected by its search decision",
+      false,
+      [](const AcStrategyDebugCandidate& c) { return c.selected ? 1 : 0; }));
+  JXL_RETURN_IF_ERROR(emit_candidate_float(
+      "ac/search/candidate_coefficient_cost", "heuristic_cost",
+      "Coefficient-magnitude contribution to the candidate cost", false,
+      [](const AcStrategyDebugCandidate& c) {
+        return c.cost.coefficient_cost;
+      }));
+  JXL_RETURN_IF_ERROR(emit_candidate_float(
+      "ac/search/candidate_nonzero_cost", "heuristic_cost",
+      "Nonzero-count contribution to the candidate cost", false,
+      [](const AcStrategyDebugCandidate& c) { return c.cost.nonzero_cost; }));
+  JXL_RETURN_IF_ERROR(emit_candidate_float(
+      "ac/search/candidate_information_loss", "heuristic_cost",
+      "Quantization information-loss contribution to the candidate cost",
+      false, [](const AcStrategyDebugCandidate& c) {
+        return c.cost.information_loss;
+      }));
+  JXL_RETURN_IF_ERROR(emit_candidate_float(
+      "ac/search/candidate_quant_norm", "relative_inverse_quantization_step",
+      "Quantization norm used while evaluating the candidate", false,
+      [](const AcStrategyDebugCandidate& c) { return c.cost.quant_norm; }));
+  JXL_RETURN_IF_ERROR(emit_candidate_float(
+      "ac/search/merge_current_cost", "heuristic_cost",
+      "Cost of the existing transform arrangement compared by a merge decision",
+      true, [](const AcStrategyDebugCandidate& c) {
+        return c.merge_current_cost;
+      }));
+  JXL_RETURN_IF_ERROR(emit_candidate_float(
+      "ac/search/merge_candidate_cost", "heuristic_cost",
+      "Candidate cost compared by a merge decision", true,
+      [](const AcStrategyDebugCandidate& c) { return c.cost.total_cost; }));
+  JXL_RETURN_IF_ERROR(emit_candidate_byte(
+      "ac/search/merge_accepted",
+      "One where the merge candidate replaced the existing arrangement", true,
+      [](const AcStrategyDebugCandidate& c) { return c.selected ? 1 : 0; }));
+
+  const size_t snapshot_shape[] = {kPhases, ysize, xsize};
+  const ptrdiff_t snapshot_strides[] = {
+      static_cast<ptrdiff_t>(plane_size), static_cast<ptrdiff_t>(xsize), 1};
+  auto emit_snapshot = [&](const char* name, const char* units,
+                           const char* semantic, bool strategy) -> Status {
+    if (!WantsDebugArtifact(sink, name)) return true;
+    std::vector<uint8_t> values(kPhases * plane_size, 0xFF);
+    for (const AcStrategyDebugTile& tile : tiles) {
+      for (const AcStrategyDebugSnapshot& snapshot : tile.snapshots) {
+        const size_t phase = static_cast<size_t>(snapshot.phase);
+        if (phase >= kPhases) continue;
+        for (size_t y = 0; y < tile.rect.ysize(); ++y) {
+          for (size_t x = 0; x < tile.rect.xsize(); ++x) {
+            const size_t dst = (phase * ysize + tile.rect.y0() + y) * xsize +
+                               tile.rect.x0() + x;
+            const size_t src = y * 8 + x;
+            values[dst] = strategy ? snapshot.strategy[src]
+                                   : snapshot.priority[src];
+          }
+        }
+      }
+    }
+    DebugArtifactInfo snapshot_info = info;
+    snapshot_info.name = name;
+    snapshot_info.units = units;
+    snapshot_info.semantic = semantic;
+    snapshot_info.axes = kPhaseBlockAxes;
+    snapshot_info.num_axes = 3;
+    if (strategy) {
+      snapshot_info.categories = strategy_categories;
+      snapshot_info.num_categories = kStrategies;
+    }
+    return EmitDebugTensor(sink, snapshot_info, DebugDataType::kUint8,
+                           values.data(), snapshot_shape, snapshot_strides, 3);
+  };
+  JXL_RETURN_IF_ERROR(emit_snapshot(
+      "ac/search/selected_strategy_after_phase", "enum",
+      "Selected AC strategy map after each completed search phase", true));
+  JXL_RETURN_IF_ERROR(emit_snapshot(
+      "ac/search/priority_after_phase", "merge_priority",
+      "Internal overlap-prevention priority after each search phase", false));
+
+  if (WantsDebugArtifact(sink, "ac/search/phase_executed")) {
+    std::array<uint8_t, kPhases> executed{};
+    for (const AcStrategyDebugTile& tile : tiles) {
+      for (const AcStrategyDebugSnapshot& snapshot : tile.snapshots) {
+        const size_t phase = static_cast<size_t>(snapshot.phase);
+        if (phase < kPhases) executed[phase] = 1;
+      }
+    }
+    const size_t shape[] = {kPhases};
+    const ptrdiff_t strides[] = {1};
+    DebugArtifactInfo executed_info = info;
+    executed_info.name = "ac/search/phase_executed";
+    executed_info.units = "boolean";
+    executed_info.semantic = "One for each AC search phase executed by this run";
+    executed_info.axes = kPhaseAxis;
+    executed_info.num_axes = 1;
+    executed_info.grid = DebugGridInfo{};
+    JXL_RETURN_IF_ERROR(EmitDebugTensor(
+        sink, executed_info, DebugDataType::kUint8, executed.data(), shape,
+        strides, 1));
+  }
+  return true;
+}
+
 Status EmitFinalAcStrategy(EncoderDebugDataSink* sink,
                            const AcStrategyImage& ac_strategy,
                            const FrameDimensions& frame_dim,
                            const CompressParams& cparams) {
-  static const char* const kNames[] = {
-      "DCT",        "IDENTITY",   "DCT2X2",    "DCT4X4",    "DCT16X16",
-      "DCT32X32",   "DCT16X8",    "DCT8X16",   "DCT32X8",   "DCT8X32",
-      "DCT32X16",   "DCT16X32",   "DCT4X8",    "DCT8X4",    "AFV0",
-      "AFV1",       "AFV2",       "AFV3",      "DCT64X64",  "DCT64X32",
-      "DCT32X64",   "DCT128X128", "DCT128X64", "DCT64X128", "DCT256X256",
-      "DCT256X128", "DCT128X256",
-  };
-  static_assert(
-      sizeof(kNames) / sizeof(kNames[0]) == AcStrategy::kNumValidStrategies,
-      "Update debug AC strategy names");
 
   const bool want_strategy = WantsDebugArtifact(sink, "ac/final/strategy_id");
   const bool want_first = WantsDebugArtifact(sink, "ac/final/is_first_block");
@@ -1086,7 +1394,7 @@ Status EmitFinalAcStrategy(EncoderDebugDataSink* sink,
   for (uint8_t i = 0; i < AcStrategy::kNumValidStrategies; ++i) {
     const AcStrategy acs = AcStrategy::FromRawStrategy(i);
     categories[i] =
-        DebugCategory{static_cast<int64_t>(i), kNames[i],
+        DebugCategory{static_cast<int64_t>(i), kAcStrategyNames[i],
                       acs.covered_blocks_x(), acs.covered_blocks_y()};
   }
   if (want_strategy) {
@@ -1215,6 +1523,50 @@ Status EmitEpfSelection(EncoderDebugDataSink* sink,
   return sink->Emit(error_info, tensor);
 }
 
+Status EmitEpfCandidateReconstructions(EncoderDebugDataSink* sink,
+                                       const std::vector<float>& values,
+                                       size_t num_candidates, size_t xsize,
+                                       size_t ysize,
+                                       const FrameDimensions& frame_dim,
+                                       const CompressParams& cparams) {
+  static const char* const kAxes[] = {"candidate", "channel", "y", "x"};
+  static const char* const kChannels[] = {"x", "y", "b"};
+  DebugArtifactInfo info;
+  info.name = "epf/candidate_reconstruction_xyb";
+  info.stage = "epf_selection";
+  info.units = "encoder_xyb";
+  info.semantic =
+      "Encoder reconstruction for each EPF sharpness candidate in native XYB";
+  info.axes = kAxes;
+  info.num_axes = 4;
+  info.channel_names = kChannels;
+  info.num_channel_names = 3;
+  info.grid = DebugPixelGrid(frame_dim, cparams);
+  if (!sink->Wants(info)) return true;
+  size_t plane_size;
+  size_t candidate_stride;
+  if (!SafeMul(xsize, ysize, plane_size) ||
+      !SafeMul(3, plane_size, candidate_stride) ||
+      candidate_stride >
+          static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+              sizeof(float) ||
+      plane_size >
+          static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+              sizeof(float) ||
+      xsize > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+                  sizeof(float)) {
+    return JXL_FAILURE("EPF reconstruction debug tensor dimensions overflow");
+  }
+  const size_t shape[] = {num_candidates, 3, ysize, xsize};
+  const ptrdiff_t strides[] = {
+      static_cast<ptrdiff_t>(candidate_stride * sizeof(float)),
+      static_cast<ptrdiff_t>(plane_size * sizeof(float)),
+      static_cast<ptrdiff_t>(xsize * sizeof(float)),
+      static_cast<ptrdiff_t>(sizeof(float))};
+  return EmitDebugTensor(sink, info, DebugDataType::kFloat32, values.data(),
+                         shape, strides, 4);
+}
+
 }  // namespace
 
 #endif  // JPEGXL_ENABLE_ENCODER_DEBUG_DATA
@@ -1294,6 +1646,22 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
     }
   }
   std::array<ImageF, kNumEPFVals> error_images;
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  const bool capture_epf_reconstruction = WantsDebugArtifact(
+      cparams.debug_data, "epf/candidate_reconstruction_xyb");
+  std::vector<float> debug_epf_reconstructions;
+  if (capture_epf_reconstruction) {
+    size_t plane_size;
+    size_t candidate_size;
+    size_t tensor_size;
+    if (!SafeMul(orig_opsin.xsize(), orig_opsin.ysize(), plane_size) ||
+        !SafeMul(3, plane_size, candidate_size) ||
+        !SafeMul(epf_steps.size(), candidate_size, tensor_size)) {
+      return JXL_FAILURE("EPF reconstruction debug tensor size overflows");
+    }
+    debug_epf_reconstructions.resize(tensor_size);
+  }
+#endif
   for (uint8_t val : epf_steps) {
     FillPlane(val, &epf_sharpness, Rect(epf_sharpness));
     JXL_ASSIGN_OR_RETURN(
@@ -1309,6 +1677,20 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
             orig_opsin, decoded, initial_quant_masking1x1, by, bx);
       }
     }
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+    if (capture_epf_reconstruction) {
+      const size_t plane_size = orig_opsin.xsize() * orig_opsin.ysize();
+      const size_t candidate = epf_steps_lut[val];
+      for (size_t c = 0; c < 3; ++c) {
+        float* destination =
+            debug_epf_reconstructions.data() + (candidate * 3 + c) * plane_size;
+        for (size_t y = 0; y < orig_opsin.ysize(); ++y) {
+          memcpy(destination + y * orig_opsin.xsize(), decoded.ConstPlaneRow(c, y),
+                 orig_opsin.xsize() * sizeof(float));
+        }
+      }
+    }
+#endif
   }
   std::vector<std::vector<size_t>> histo(9, std::vector<size_t>(kNumEPFVals));
   std::vector<size_t> totals(9, 1);
@@ -1390,6 +1772,11 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   JXL_RETURN_IF_ERROR(EmitEpfSelection(cparams.debug_data, &epf_steps,
                                        &error_images, epf_sharpness, frame_dim,
                                        cparams));
+  if (capture_epf_reconstruction) {
+    JXL_RETURN_IF_ERROR(EmitEpfCandidateReconstructions(
+        cparams.debug_data, debug_epf_reconstructions, epf_steps.size(),
+        orig_opsin.xsize(), orig_opsin.ysize(), frame_dim, cparams));
+  }
 #endif
   return true;
 }
@@ -1594,6 +1981,10 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                                           initial_quant_masking,
                                           initial_quant_masking1x1, &matrices));
 
+  const size_t num_tiles =
+      DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks) *
+      DivCeil(frame_dim.ysize_blocks, kEncTileDimInBlocks);
+
 #if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
   ImageSB debug_cfl_pass0_ytox;
   ImageSB debug_cfl_pass0_ytob;
@@ -1612,6 +2003,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                          ImageSB::Create(memory_manager, cmap.ytob_map.xsize(),
                                          cmap.ytob_map.ysize()));
   }
+  const bool capture_ac_search = WantsAcSearch(cparams.debug_data);
+  std::vector<AcStrategyDebugTile> debug_ac_tiles;
+  if (capture_ac_search) debug_ac_tiles.resize(num_tiles);
 #endif
 
   auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
@@ -1643,8 +2037,13 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     }
 
     // Choose block sizes.
-    JXL_RETURN_IF_ERROR(
-        acs_heuristics.ProcessRect(r, cmap, &ac_strategy, thread));
+    JXL_RETURN_IF_ERROR(acs_heuristics.ProcessRect(
+        r, cmap, &ac_strategy, thread
+#if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+        ,
+        capture_ac_search ? &debug_ac_tiles[tid] : nullptr
+#endif
+        ));
 
     // Always set the initial quant field, so we can compute the CfL map with
     // more accuracy. The initial quant field might change in slower modes, but
@@ -1662,8 +2061,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     }
     return true;
   };
-  size_t num_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks) *
-                     DivCeil(frame_dim.ysize_blocks, kEncTileDimInBlocks);
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
     JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
@@ -1673,6 +2070,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
 
 #if JPEGXL_ENABLE_ENCODER_DEBUG_DATA
+  JXL_RETURN_IF_ERROR(EmitAcSearch(cparams.debug_data, debug_ac_tiles,
+                                   frame_dim, cparams));
   if (cparams.debug_data != nullptr) {
     static const char* const kBlockAxes[] = {"block_y", "block_x"};
     DebugArtifactInfo aq_info;

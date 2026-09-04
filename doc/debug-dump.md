@@ -4,7 +4,7 @@
 
 This document describes development-only infrastructure for dumping
 image-shaped intermediate state from the VarDCT encoder frontend. Phases 1
-through 3 are implemented; the later phases remain an implementation plan.
+through 4 are implemented; the later phases remain an implementation plan.
 None of this is a stable public API.
 
 The Phase 1 implementation provides:
@@ -30,6 +30,12 @@ Phase 3 adds the `aq` profile. At efforts that run Butteraugli refinement, it
 records every explicitly numbered comparison and update in native pixel and
 block spaces, including the comparator input and diffmap, 16th-norm tile
 field, quant-field snapshots, update multiplier, and clamp/stall masks.
+
+Phase 4 adds the `ac` profile and tile-local AC search instrumentation. It
+records native cost components, validity and selection masks, merge decisions,
+and selected-strategy/priority snapshots across four search phases. The
+existing stacked EPF error field is complemented by an optional stacked XYB
+candidate-reconstruction artifact in the `all` profile.
 
 The primary recommendation is:
 
@@ -311,9 +317,10 @@ jxl_encoder_dump input.png output.jxl \
 The frontend deliberately accepts only a single, non-animated, one-shot
 pixel frame; it rejects JPEG input and forces VarDCT. `--num_threads` controls
 the worker count, and `--color_space` supplies a color-space hint for raw
-formats. The supported profiles are `overview`, `aq`, and `all`. `overview`
-selects the Phase 2 artifact families, `aq` selects every artifact below
-`aq/`, and `all` requests every capture point compiled into the current build.
+formats. The supported profiles are `overview`, `aq`, `ac`, and `all`.
+`overview` selects the Phase 2 artifact families, `aq` selects every artifact
+below `aq/`, `ac` selects the final AC maps and the Phase 4 search tensors, and
+`all` requests every capture point compiled into the current build.
 
 The overview profile can contain the following artifacts, depending on which
 heuristics the chosen effort and distance normally execute:
@@ -360,6 +367,15 @@ jxl_encoder_dump input.png output.jxl \
   --distance 1.0 \
   --effort 8
 ```
+
+The `ac` profile stores candidate arrays with shape
+`[search_phase, strategy, block_y, block_x]`. Its four phase values are
+`initial_8x8`, `aligned_merge`, `non_aligned_16`, and `non_aligned_32`.
+Companion `phase_id` and `strategy_id` arrays carry categorical metadata.
+Unavailable candidate costs are NaN and `candidate_valid` identifies the
+entries that were actually evaluated. `candidate_selected`,
+`merge_accepted`, and the per-phase selected-strategy maps expose decisions
+without reconstructing them from floating-point comparisons.
 
 ## Artifact format
 
@@ -555,6 +571,7 @@ For a comprehensive AC search profile, capture:
 
 * `ac/search/candidate_total_cost`;
 * `ac/search/candidate_valid`;
+* `ac/search/candidate_selected`;
 * `ac/search/candidate_coefficient_cost`;
 * `ac/search/candidate_nonzero_cost`;
 * `ac/search/candidate_information_loss`;
@@ -562,7 +579,9 @@ For a comprehensive AC search profile, capture:
 * `ac/search/merge_current_cost`;
 * `ac/search/merge_candidate_cost`;
 * `ac/search/merge_accepted`;
-* intermediate selected-strategy and priority fields after major merge phases.
+* `ac/search/selected_strategy_after_phase`;
+* `ac/search/priority_after_phase`;
+* `ac/search/phase_executed`, `phase_id`, and `strategy_id`.
 
 Suggested candidate tensor axes are:
 
@@ -623,15 +642,17 @@ Capture:
 * `epf/candidate_error` with axes
   `[candidate, block_y, block_x]`;
 * `epf/selected_sharpness`;
-* optional candidate reconstructed XYB images;
+* optional `epf/candidate_reconstruction_xyb` with axes
+  `[candidate, channel, y, x]`;
 * optional final reconstruction after applying the selected field.
 
 The candidate error fields already exist inside `ComputeARHeuristics`. Stack
 them without normalization and store the actual candidate values, such as
 `[0, 2, 7]`, as axis metadata or a small companion array.
 
-Candidate reconstructions are large. Make them part of an explicit deep
-filter profile rather than an ordinary frontend dump.
+Candidate reconstructions are large. They are requested only by `all`, not by
+the ordinary `overview` profile. A later explicit deep-filter profile can
+provide a narrower way to request them together with roundtrip filter taps.
 
 ### Decoder-side loop-filter observations
 
@@ -771,6 +792,20 @@ iterations share one analyzable schema.
 
 ### Phase 4: AC and EPF search diagnostics
 
+Implemented. AC workers append sparse observations to buffers owned by their
+encoder tiles. After `RunOnPool` joins, requested artifacts are assembled one
+at a time into dense tensors and synchronously emitted, limiting peak
+encoder-side aggregation memory to one candidate tensor. No sink or filesystem
+operation occurs inside the candidate loops.
+
+The cost breakdown observes the existing `EstimateEntropy` accumulation: the
+coefficient, nonzero, and information-loss contributions sum to the same total
+used by the decision, within float roundoff, while the decision expression and
+branch comparisons remain unchanged. Initial effort-pruned or otherwise
+unavailable tensor entries remain NaN with a zero validity mask. EPF candidate
+reconstructions reuse the images already produced by the normal candidate loop
+and are copied only when that artifact passes `Wants`.
+
 * Introduce tile-local AC candidate tensors.
 * Record 8 x 8 candidates, hierarchical merge phases, validity, and decisions.
 * Expose meaningful cost components without changing decision arithmetic.
@@ -867,7 +902,7 @@ The initial infrastructure is ready when:
   represented correctly;
 * raw arrays contain encoder-native values with no hidden display mapping;
 * tracing does not change the output codestream;
-* the `overview` and `aq` profiles are implemented;
+* the `overview`, `aq`, and `ac` profiles are implemented;
 * a Python tool can render selected artifacts to PNG without modifying the
   canonical data;
 * artifact names and coordinates are deterministic.
