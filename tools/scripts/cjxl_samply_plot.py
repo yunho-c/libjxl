@@ -18,8 +18,9 @@ Example:
       --format json --output build-samply/profiles/kodak-t1-analysis.json
 
   uv run tools/scripts/cjxl_samply_plot.py \
-      --input build-samply/profiles/kodak-t1-analysis.json \
-      --output build-samply/profiles/kodak-stage-breakdown.svg
+      --input 'Effort 5=build-samply/profiles/kodak-e5-analysis.json' \
+      --input 'Effort 7=build-samply/profiles/kodak-e7-analysis.json' \
+      --output build-samply/profiles/kodak-effort-comparison.svg
 
 SVG, PDF, and PNG outputs are supported. The default scope shows encoder work
 only, excluding process startup, input decoding, and input conversion. The
@@ -35,6 +36,7 @@ import sys
 
 ANALYSIS_SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_FILENAME = "stage-breakdown.svg"
+DEFAULT_COMPARISON_OUTPUT_FILENAME = "stage-comparison.svg"
 STARTUP_OPERATION = "Process startup and static initializers"
 PNG_OPERATION = "PNG input decode"
 SRGB_OPERATION = "sRGB to XYB color transform"
@@ -46,26 +48,26 @@ OUTPUT_SUFFIXES = frozenset((".pdf", ".png", ".svg"))
 
 STAGE_PRESENTATION = {
     "AC strategy search and candidate DCT/IDCT": (
-        "AC strategy + candidate transforms",
+        "AC strategy selection (candidate transforms)",
         "#E64B35",
     ),
     "AR heuristics and roundtrip reconstruction/filtering": (
-        "AR heuristics + reconstruction",
+        "EPF control-field selection",
         "#287A78",
     ),
-    "Chroma-from-luma heuristics": ("Chroma-from-luma", "#D19A28"),
+    "Chroma-from-luma heuristics": ("Chroma from luma (CfL)", "#D19A28"),
     "Entropy modeling, tokenization, and bit writing": (
-        "Entropy + bit writing",
+        "Coefficient tokenization & entropy coding",
         "#4B70AD",
     ),
     "Final coefficient DCT and quantization": (
-        "Final DCT + quantization",
+        "Coefficient transform & quantization",
         "#8B6144",
     ),
-    "Modular/DC side data": ("Modular / DC side data", "#6B795F"),
+    "Modular/DC side data": ("VarDCT DC & AC metadata coding", "#6B795F"),
     "Adaptive quantization map": ("Adaptive quantization", "#8171A1"),
-    "Patch dictionary search": ("Patch search", "#AD607C"),
-    "Other CLI, encoder, and runtime": ("Other encoder / runtime", "#666664"),
+    "Patch dictionary search": ("Patch dictionary search", "#AD607C"),
+    "Other CLI, encoder, and runtime": ("Other encoder work", "#666664"),
     "Other lossy heuristics": ("Other lossy heuristics", "#8A725F"),
     SRGB_OPERATION: ("sRGB to XYB", "#438DA4"),
     PACKED_INPUT_OPERATION: ("Packed input to float", "#8D999C"),
@@ -81,6 +83,16 @@ FALLBACK_COLORS = (
     "#736B89",
     "#9E6B79",
     "#627258",
+)
+
+SERIES_COLORS = (
+    "#4477AA",
+    "#EE6677",
+    "#228833",
+    "#CCBB44",
+    "#66CCEE",
+    "#AA3377",
+    "#BBBBBB",
 )
 
 
@@ -234,6 +246,96 @@ def build_plot_data(analysis):
     }
 
 
+def build_comparison_data(labeled_analyses):
+    if len(labeled_analyses) < 2:
+        raise PlotError("A comparison requires at least two labeled analyses")
+    if len(labeled_analyses) > len(SERIES_COLORS):
+        raise PlotError(
+            "A comparison supports at most %d analyses" % len(SERIES_COLORS)
+        )
+
+    series = []
+    labels = set()
+    for label, analysis in labeled_analyses:
+        if not isinstance(label, str) or not label.strip():
+            raise PlotError("Comparison labels must be nonempty")
+        label = label.strip()
+        if label in labels:
+            raise PlotError("Duplicate comparison label: %s" % label)
+        labels.add(label)
+        series.append({"label": label, "plot_data": build_plot_data(analysis)})
+
+    delta_attribution = series[0]["plot_data"]["delta_attribution"]
+    capture_count = series[0]["plot_data"]["summary"]["capture_count"]
+    for item in series[1:]:
+        plot_data = item["plot_data"]
+        if plot_data["delta_attribution"] != delta_attribution:
+            raise PlotError("Compared analyses must use the same delta attribution")
+        if plot_data["summary"]["capture_count"] != capture_count:
+            raise PlotError("Compared analyses must have the same capture count")
+
+    stages_by_series = []
+    operation_names = set()
+    for item in series:
+        by_name = {stage["name"]: stage for stage in item["plot_data"]["stages"]}
+        stages_by_series.append(by_name)
+        operation_names.update(by_name)
+
+    def stage_sort_key(operation):
+        maximum = max(
+            by_name.get(operation, {}).get("mean_ms", 0.0)
+            for by_name in stages_by_series
+        )
+        return -maximum, operation
+
+    stages = []
+    for fallback_index, operation in enumerate(
+        sorted(operation_names, key=stage_sort_key)
+    ):
+        short_name, _ = STAGE_PRESENTATION.get(
+            operation,
+            (operation, FALLBACK_COLORS[fallback_index % len(FALLBACK_COLORS)]),
+        )
+        if operation in INPUT_CONVERSION_OPERATIONS:
+            stage_scope = "input"
+        elif operation in COMMAND_OVERHEAD_OPERATIONS:
+            stage_scope = "overhead"
+        else:
+            stage_scope = "encoder"
+        values = []
+        for item, by_name in zip(series, stages_by_series):
+            source = by_name.get(operation)
+            values.append(
+                {
+                    "label": item["label"],
+                    "aggregate_ms": 0.0 if source is None else source["aggregate_ms"],
+                    "mean_ms": 0.0 if source is None else source["mean_ms"],
+                }
+            )
+        stages.append(
+            {
+                "name": operation,
+                "short_name": short_name,
+                "scope": stage_scope,
+                "values": values,
+            }
+        )
+
+    return {
+        "delta_attribution": delta_attribution,
+        "capture_count": capture_count,
+        "series": [
+            {
+                "label": item["label"],
+                "summary": item["plot_data"]["summary"],
+                "captures": item["plot_data"]["captures"],
+            }
+            for item in series
+        ],
+        "stages": stages,
+    }
+
+
 def _load_matplotlib():
     try:
         import matplotlib
@@ -282,7 +384,14 @@ def render_figure(
     if suffix not in OUTPUT_SUFFIXES:
         raise PlotError("Output must be SVG, PDF, or PNG")
 
-    figure_height = max(3.0, 0.75 + 0.34 * len(stages))
+    is_comparison = "series" in plot_data
+    if is_comparison:
+        series_count = len(plot_data["series"])
+        bar_step = 0.23
+        group_spacing = max(1.0, series_count * bar_step + 0.18)
+        figure_height = max(3.4, 1.1 + 0.34 * group_spacing * len(stages))
+    else:
+        figure_height = max(3.0, 0.75 + 0.34 * len(stages))
     narrow = width_inches < 5.5
     label_size = 7.5 if narrow else 8.5
 
@@ -307,40 +416,90 @@ def render_figure(
                 loc="left",
                 fontsize=9,
                 fontweight="bold",
-                pad=8,
+                pad=32 if is_comparison else 8,
                 color="#202020",
             )
 
-        aggregate_total = sum(stage["aggregate_ms"] for stage in stages)
-        y_positions = list(range(len(stages)))
-        mean_values = [stage["mean_ms"] for stage in stages]
-        axis.barh(
-            y_positions,
-            mean_values,
-            height=0.58,
-            color=[stage["color"] for stage in stages],
-            edgecolor="none",
-            zorder=2,
-        )
-        for y_position, stage in zip(y_positions, stages):
-            share = 100.0 * stage["aggregate_ms"] / aggregate_total
-            axis.text(
-                1.025,
-                y_position,
-                "%s ms (%.1f%%)" % (_format_ms(stage["mean_ms"]), share),
-                transform=axis.get_yaxis_transform(),
-                ha="left",
-                va="center",
-                fontsize=label_size,
-                color="#333333",
-                clip_on=False,
+        if is_comparison:
+            y_positions = [index * group_spacing for index in range(len(stages))]
+            selected_totals = [
+                sum(stage["values"][index]["aggregate_ms"] for stage in stages)
+                for index in range(series_count)
+            ]
+            mean_values = []
+            for series_index, item in enumerate(plot_data["series"]):
+                offset = (series_index - (series_count - 1) / 2.0) * bar_step
+                positions = [position + offset for position in y_positions]
+                values = [stage["values"][series_index]["mean_ms"] for stage in stages]
+                mean_values.extend(values)
+                color = SERIES_COLORS[series_index]
+                axis.barh(
+                    positions,
+                    values,
+                    height=bar_step * 0.78,
+                    color=color,
+                    edgecolor="none",
+                    label=item["label"],
+                    zorder=2,
+                )
+                for position, stage, value in zip(positions, stages, values):
+                    if value <= 0:
+                        continue
+                    aggregate_ms = stage["values"][series_index]["aggregate_ms"]
+                    share = 100.0 * aggregate_ms / selected_totals[series_index]
+                    axis.text(
+                        1.025,
+                        position,
+                        "%s ms (%.1f%%)" % (_format_ms(value), share),
+                        transform=axis.get_yaxis_transform(),
+                        ha="left",
+                        va="center",
+                        fontsize=label_size,
+                        color=color,
+                        clip_on=False,
+                    )
+            axis.legend(
+                loc="lower left",
+                bbox_to_anchor=(0.0, 1.01),
+                borderaxespad=0,
+                frameon=False,
+                ncol=min(series_count, 4),
+                columnspacing=1.4,
+                handlelength=1.5,
             )
+            y_labels = [stage["short_name"] for stage in stages]
+        else:
+            aggregate_total = sum(stage["aggregate_ms"] for stage in stages)
+            y_positions = list(range(len(stages)))
+            mean_values = [stage["mean_ms"] for stage in stages]
+            axis.barh(
+                y_positions,
+                mean_values,
+                height=0.58,
+                color=[stage["color"] for stage in stages],
+                edgecolor="none",
+                zorder=2,
+            )
+            for y_position, stage in zip(y_positions, stages):
+                share = 100.0 * stage["aggregate_ms"] / aggregate_total
+                axis.text(
+                    1.025,
+                    y_position,
+                    "%s ms (%.1f%%)" % (_format_ms(stage["mean_ms"]), share),
+                    transform=axis.get_yaxis_transform(),
+                    ha="left",
+                    va="center",
+                    fontsize=label_size,
+                    color="#333333",
+                    clip_on=False,
+                )
+            y_labels = [stage["short_name"] for stage in stages]
 
         maximum = max(mean_values)
         maximum = maximum * 1.08 if maximum > 0 else 1.0
         axis.set_yticks(
             y_positions,
-            labels=[stage["short_name"] for stage in stages],
+            labels=y_labels,
         )
         axis.invert_yaxis()
         axis.set_xlim(0, maximum)
@@ -361,7 +520,9 @@ def render_figure(
         figure.subplots_adjust(
             left=0.38,
             right=0.77 if narrow else 0.82,
-            top=0.91 if title else 0.98,
+            top=(0.80 if title else 0.88)
+            if is_comparison
+            else (0.91 if title else 0.98),
             bottom=0.15 if narrow else 0.13,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -375,25 +536,48 @@ def render_figure(
         pyplot.close(figure)
 
 
-def resolve_output_path(input_path, output_path):
+def resolve_output_path(input_path, output_path, comparison=False):
     if output_path:
         path = pathlib.Path(output_path).expanduser().resolve()
     else:
-        path = (
-            pathlib.Path(input_path).expanduser().resolve().parent
-            / DEFAULT_OUTPUT_FILENAME
+        filename = (
+            DEFAULT_COMPARISON_OUTPUT_FILENAME
+            if comparison
+            else DEFAULT_OUTPUT_FILENAME
         )
+        path = pathlib.Path(input_path).expanduser().resolve().parent / filename
     if path.suffix.lower() not in OUTPUT_SUFFIXES:
         raise PlotError("Output must be SVG, PDF, or PNG")
     return path
 
 
+def parse_input_spec(argument):
+    label, separator, input_path = argument.partition("=")
+    if not separator:
+        return None, argument
+    label = label.strip()
+    if not label:
+        raise PlotError("Input label must be nonempty")
+    if not input_path:
+        raise PlotError("Input path must be nonempty")
+    return label, input_path
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="parser-generated analysis JSON")
+    parser.add_argument(
+        "--input",
+        action="append",
+        required=True,
+        metavar="[LABEL=]PATH",
+        help=("parser-generated analysis JSON; repeat with explicit labels to compare"),
+    )
     parser.add_argument(
         "--output",
-        help="output SVG, PDF, or PNG path (default: stage-breakdown.svg)",
+        help=(
+            "output SVG, PDF, or PNG path (defaults: stage-breakdown.svg; "
+            "stage-comparison.svg for multiple inputs)"
+        ),
     )
     parser.add_argument(
         "--scope",
@@ -425,9 +609,20 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        analysis = load_analysis(args.input)
-        plot_data = build_plot_data(analysis)
-        output_path = resolve_output_path(args.input, args.output)
+        input_specs = [parse_input_spec(argument) for argument in args.input]
+        comparison = len(input_specs) > 1
+        if comparison and any(label is None for label, _ in input_specs):
+            raise PlotError("Multiple inputs require labels: use --input LABEL=PATH")
+        labeled_analyses = [
+            (label, load_analysis(input_path)) for label, input_path in input_specs
+        ]
+        if comparison:
+            plot_data = build_comparison_data(labeled_analyses)
+        else:
+            plot_data = build_plot_data(labeled_analyses[0][1])
+        output_path = resolve_output_path(
+            input_specs[0][1], args.output, comparison=comparison
+        )
         render_figure(
             plot_data,
             output_path,
