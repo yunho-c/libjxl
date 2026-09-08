@@ -1,0 +1,10 @@
+[package]
+name = "cjxl-quality-metric"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fast-ssim2 = { git = "https://github.com/imazen/fast-ssim2", rev = "c3867954c7bec8a761951df9256354b305fd0cff", features = ["imgref"] }
+imgref = "1.12.3"
+serde_json = "1"

@@ -75,6 +75,7 @@ import pandas as pd
 # as a script, use `--input` and `--output-dir` instead.
 # The default input points at the refreshed, paused wall-v2 partial snapshot:
 # expanded stage wall times joined to the original uninstrumented timings.
+# Refreshed 2026-09-08: 4,469/4,550 stage tuples; efforts 1-9 complete.
 # Missing stage captures stay empty; pooled stage bars omit incomplete efforts.
 
 # %%
@@ -90,6 +91,12 @@ OUTPUT_DIR = pathlib.Path(
 ).expanduser()
 EXPECTED_TIMING_SAMPLES = 5
 SAVE_FORMATS = ("png", "svg")
+QUALITY_RUN = pathlib.Path(
+    os.environ.get(
+        "CJXL_QUALITY_RUN",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-pilot-20260908",
+    )
+).expanduser()
 
 
 # %% [markdown]
@@ -886,6 +893,8 @@ def parse_args(argv=None):
         help="comma-separated output formats: png, svg, and/or pdf",
     )
     parser.add_argument("--show", action="store_true")
+    parser.add_argument("--quality-run", type=pathlib.Path,
+                        help="optional saved quality study; never starts collection")
     args = parser.parse_args(argv)
     if args.expected_timing_samples < 1:
         parser.error("--expected-timing-samples must be positive")
@@ -908,7 +917,45 @@ def main(argv=None):
         args.formats,
         args.show,
     )
+    if args.quality_run:
+        generate_quality_figures(args.quality_run, args.output_dir, args.formats, args.show)
     return 0
+
+
+# %%
+def generate_quality_figures(run, output_dir, formats=SAVE_FORMATS, show=False):
+    """Load the sibling quality module without launching any external programs."""
+    import importlib.util
+
+    if not (pathlib.Path(run) / "metadata.json").is_file():
+        print("No saved matched-quality study at %s; skipping Pareto plots." % run)
+        return {}
+    candidates = []
+    if "__file__" in globals():
+        candidates.append(pathlib.Path(__file__).resolve().parent)
+    for parent in (pathlib.Path.cwd(), *pathlib.Path.cwd().parents):
+        candidates.extend((parent, parent / "tools/scripts"))
+    source = next(
+        (folder / "cjxl_quality_characterization.py" for folder in candidates
+         if (folder / "cjxl_quality_characterization.py").is_file()),
+        None,
+    )
+    if source is None:
+        raise FileNotFoundError(
+            "Open Jupyter within the libjxl checkout so the quality plotting module can be found."
+        )
+    spec = importlib.util.spec_from_file_location("cjxl_quality_characterization", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    figures = module.notebook_figures(run)
+    for name, figure in figures.items():
+        save_figure(figure, pathlib.Path(output_dir), name, formats)
+    if show:
+        plt.show()
+    else:
+        for figure in figures.values():
+            plt.close(figure)
+    return figures
 
 
 # %%
@@ -937,3 +984,22 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         SAVE_FORMATS,
         show=True,
     )
+
+
+# %% [markdown]
+# ## 7. Matched-quality speed–compression
+#
+# QUALITY_RUN points to a separate, resumable quality study. These panels
+# target fast-ssim2 scores 60, 70, and 85 with a measured tolerance of ±0.5.
+# Open markers are interpolated previews, not actual calibrated encodes.
+# Filled markers require a verified score and five independent timing samples.
+# Each point uses the same image cohort; unavailable efforts are identified.
+# Dashed lines identify the nondominated frontier, not the effort-order curve.
+#
+# This cell only reads saved results and generates plots. It never decodes,
+# scores, calibrates, or encodes. Missing measured data is shown explicitly.
+# See doc/runtime-quality.md for opt-in collection and resume commands.
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules:
+    quality_figures = generate_quality_figures(QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True)
