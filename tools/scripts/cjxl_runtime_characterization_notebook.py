@@ -46,6 +46,8 @@
 #
 # Partial timing cells are drawn with open markers. Stage figures omit cells
 # without exhaustive stage data.
+# Expanded wall-v2 data uses exclusive durations for additive charts and
+# inclusive durations only for the separate refinement breakdown.
 
 # %%
 import argparse
@@ -71,12 +73,14 @@ import pandas as pd
 #
 # Edit these paths when opening this file as a Jupytext notebook. When invoked
 # as a script, use `--input` and `--output-dir` instead.
-# The default input below temporarily points at the current partial snapshot.
+# The default input points at the refreshed, paused wall-v2 partial snapshot:
+# expanded stage wall times joined to the original uninstrumented timings.
+# Missing stage captures stay empty; pooled stage bars omit incomplete efforts.
 
 # %%
 DEFAULT_INPUT_CSV = pathlib.Path(
     "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/"
-    "run-e8ff0976/summary/image-tuples.partial.csv"
+    "run-e8ff0976-wall-v2/summary/image-tuples.partial.csv"
 )
 INPUT_CSV = pathlib.Path(
     os.environ.get("CJXL_IMAGE_TUPLES_CSV", DEFAULT_INPUT_CSV)
@@ -581,6 +585,8 @@ def plot_rate_runtime_tradeoff(frame, cells):
 
 # %%
 def plot_stage_breakdown(frame, cells):
+    if "wall_exclusive_frame_setup_other_ms" in frame.columns:
+        return plot_expanded_wall_breakdown(frame)
     resolutions = resolution_order(frame)
     figure, axes = subplot_grid(len(resolutions), width=5.1, height=3.9)
     for axis, resolution in zip(axes, resolutions):
@@ -612,6 +618,157 @@ def plot_stage_breakdown(frame, cells):
     figure.legend(handles, labels, loc="outside lower center", ncols=3)
     figure.suptitle(
         "libjxl instrumented wall-time composition (pooled across images and qualities)"
+    )
+    return figure
+
+
+# %% [markdown]
+# ### Expanded frontend wall profiles (version 2)
+#
+# Only fully populated resolution/quality/effort cells enter these plots.
+# The exclusive stages, including the outside-frame API remainder, sum to
+# complete profiled encode wall time. DC preparation includes trial passes;
+# the inclusive quantizer figure below includes those within refinement.
+
+
+# %%
+def expanded_wall_rows(frame):
+    columns = [
+        c
+        for c in frame.columns
+        if c.startswith("wall_exclusive_") and c.endswith("_ms")
+    ]
+    if not columns:
+        return frame.iloc[:0], columns
+    valid = frame[columns].notna().all(axis=1)
+    # These figures pool all qualities. Require the whole resolution/effort
+    # group so a partially collected effort cannot silently change that mix.
+    keys = ["resolution_class", "effort"]
+    complete = valid.groupby([frame[k] for k in keys]).transform("all")
+    rows = frame[complete].copy()
+    if len(rows) and not np.allclose(
+        rows[columns].sum(axis=1), rows["profiled_complete_wall_ms"], atol=1e-6
+    ):
+        raise ValueError(
+            "Expanded exclusive wall columns do not sum to complete encode"
+        )
+    return rows, columns
+
+
+def plot_expanded_wall_breakdown(frame):
+    rows, columns = expanded_wall_rows(frame)
+    resolutions = resolution_order(frame)
+    figure, axes = subplot_grid(len(resolutions), width=5.4, height=4.1)
+    groups = {
+        "Input unpack / color": ("input_unpack", "color_conversion"),
+        "Downsampling": ("downsampling",),
+        "Initial AQ": ("initial_aq",),
+        "Inverse Gaborish": ("inverse_gaborish",),
+        "Feature search": ("feature_search",),
+        "AC/CfL tile heuristics": (
+            "heuristics_setup",
+            "ac_cfl_tiles",
+            "heuristics_finalize",
+        ),
+        "Perceptual refinement": tuple(
+            c[len("wall_exclusive_") : -3]
+            for c in columns
+            if c.startswith("wall_exclusive_refinement_")
+        )
+        + ("quantizer_refinement",),
+        "Final coefficients": ("final_coefficients",),
+        "AR filter selection": ("ar_selection",),
+        "DC / metadata / ordering": (
+            "dc_preparation",
+            "ac_metadata",
+            "block_context",
+            "coefficient_order",
+            "modular_tree",
+        ),
+        "Tokenization": ("tokenization",),
+        "Entropy model": ("entropy_model",),
+        "Model/token emission": ("emission",),
+        "Assembly": ("assembly",),
+        "Frame / API remainder": ("frame_setup_other", "encode_api_other"),
+    }
+    used = {
+        "wall_exclusive_" + name + "_ms" for names in groups.values() for name in names
+    }
+    if used != set(columns):
+        raise ValueError("Expanded wall plot groups do not cover the schema exactly")
+    colors = plt.get_cmap("tab20").colors
+    for axis, resolution in zip(axes, resolutions):
+        subset = rows[rows["resolution_class"] == resolution]
+        grouped = subset.groupby("effort", observed=True)[
+            columns + ["profiled_complete_wall_ms"]
+        ].sum()
+        bottom = np.zeros(len(grouped))
+        for (label, names), color in zip(groups.items(), colors):
+            values = grouped[["wall_exclusive_" + name + "_ms" for name in names]].sum(
+                axis=1
+            )
+            share = 100 * values / grouped["profiled_complete_wall_ms"]
+            axis.bar(grouped.index, share, bottom=bottom, color=color, label=label)
+            bottom += share.to_numpy()
+        axis.set_title(resolution_label(frame, resolution))
+        axis.set_xlabel("Effort")
+        axis.set_ylabel("Complete profiled wall time (%)")
+        axis.set_xticks(grouped.index)
+        axis.set_ylim(0, 100)
+        if grouped.empty:
+            axis.text(
+                0.5,
+                0.5,
+                "No complete wall-v2 efforts yet",
+                ha="center",
+                transform=axis.transAxes,
+            )
+    figure.legend(
+        *axes[0].get_legend_handles_labels(), loc="outside lower center", ncols=4
+    )
+    figure.suptitle(
+        "Expanded wall-time composition (pooled across images and qualities)"
+    )
+    return figure
+
+
+def plot_refinement_wall(frame):
+    rows, _ = expanded_wall_rows(frame)
+    figure, axes = subplot_grid(len(resolution_order(frame)), width=5.1, height=3.9)
+    fields = {
+        "Reference preparation": "refinement_reference",
+        "Candidate roundtrip": "refinement_roundtrip",
+        "Butteraugli comparison": "refinement_compare",
+        "Quant-field update": "refinement_update",
+    }
+    for axis, resolution in zip(axes, resolution_order(frame)):
+        subset = rows[rows["resolution_class"] == resolution]
+        grouped = subset.groupby("effort", observed=True).sum(numeric_only=True)
+        bottom = np.zeros(len(grouped))
+        for label, stage in fields.items():
+            values = grouped["wall_inclusive_" + stage + "_ms"] / grouped["megapixels"]
+            axis.bar(grouped.index, values, bottom=bottom, label=label)
+            bottom += values.to_numpy()
+        total = (
+            grouped["wall_inclusive_quantizer_refinement_ms"] / grouped["megapixels"]
+        )
+        if np.any(total.to_numpy() - bottom < -1e-6):
+            raise ValueError("Refinement children exceed their parent")
+        axis.bar(
+            grouped.index,
+            np.maximum(total.to_numpy() - bottom, 0),
+            bottom=bottom,
+            label="Other refinement work",
+        )
+        axis.set_title(resolution_label(frame, resolution))
+        axis.set_xlabel("Effort")
+        axis.set_ylabel("Quantizer refinement wall time (ms/MP)")
+        axis.set_xticks(grouped.index)
+    figure.legend(
+        *axes[0].get_legend_handles_labels(), loc="outside lower center", ncols=3
+    )
+    figure.suptitle(
+        "Inclusive refinement wall time, partitioned into sequential children"
     )
     return figure
 
@@ -690,6 +847,8 @@ def generate_characterization(
         "stage-wall-breakdown": plot_stage_breakdown(frame, cells),
         "timing-variability": plot_timing_variability(frame, expected_timing_samples),
     }
+    if "wall_inclusive_quantizer_refinement_ms" in frame.columns:
+        figures["quantizer-refinement-wall"] = plot_refinement_wall(frame)
     written = []
     for name, figure in figures.items():
         written.extend(save_figure(figure, output_dir, name, formats))

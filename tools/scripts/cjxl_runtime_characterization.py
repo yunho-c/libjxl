@@ -9,7 +9,8 @@
 The experiment deliberately keeps four measurements separate:
 
 * complete-encode wall time from an uninstrumented API harness;
-* exact wall-clock serializer phases from the opt-in stage profiler;
+* exact wall-clock encoder stages from the opt-in profiler (serializer-only
+  in legacy runs, expanded frontend/refinement stages in wall-v2 runs);
 * aggregate worker time from that profiler (not latency);
 * sampled thread-CPU attribution from Samply (not wall time).
 
@@ -642,6 +643,15 @@ def load_or_create_metadata(args, corpus_value, tools):
             ),
         },
     }
+    if getattr(args, "reference_run", None) is not None:
+        configuration["reference_run"] = str(args.reference_run.resolve())
+        configuration["reference_metadata_sha256"] = sha256_file(args.reference_run / "metadata.json")
+        reference = json.loads((args.reference_run / "metadata.json").read_text())["configuration"]
+        for key in ("corpus_manifest_sha256", "thread_count", "qualities", "efforts"):
+            if reference[key] != configuration[key]:
+                raise StudyError("Reference run configuration differs: %s" % key)
+    if getattr(args, "wall_profile_version", 0):
+        configuration["wall_profile_version"] = args.wall_profile_version
     if path.is_file():
         current = json.loads(path.read_text(encoding="utf-8"))
         if current.get("configuration") != configuration:
@@ -865,9 +875,37 @@ def median_mapping(samples, key):
     }
 
 
+def validate_wall_sample(sample, required_version=2):
+    """Reject invalid nested wall accounting before persisting any result."""
+    if sample.get("wall_profile_version") != required_version:
+        raise StudyError("Missing or incompatible wall profile version")
+    exclusive = sample["wall_exclusive_nanoseconds"]
+    inclusive = sample["wall_inclusive_nanoseconds"]
+    counts = sample["wall_invocations"]
+    if not exclusive or set(exclusive) != set(inclusive) or set(exclusive) != set(counts):
+        raise StudyError("Wall stage keys disagree")
+    for name, value in exclusive.items():
+        if any(type(v) is not int or v < 0 for v in (value, inclusive[name], counts[name])):
+            raise StudyError("Invalid wall stage value: %s" % name)
+        if value > inclusive[name] or (counts[name] == 0 and inclusive[name] != 0):
+            raise StudyError("Invalid inclusive/exclusive wall stage: %s" % name)
+    root = sample["wall_root_nanoseconds"]
+    if sum(exclusive.values()) != root or not 0 < root <= sample["elapsed_nanoseconds"]:
+        raise StudyError("Wall stages do not partition the frame wall time")
+    for name in ("internal_width", "internal_height", "resampling", "frame_invocations"):
+        if type(sample[name]) is not int or sample[name] <= 0:
+            raise StudyError("Invalid wall profile geometry/count: %s" % name)
+
+
 def command_stages(args, images, benchmark, efforts, budget):
     records_path = args.output / "stage-profiles.jsonl"
     done = completed_ids(records_path, "job_id")
+    if getattr(args, "wall_profile_version", 0):
+        for record in read_jsonl(records_path):
+            if record.get("wall_profile_version") != args.wall_profile_version:
+                raise StudyError("Existing stage ledger uses a different wall profile version")
+            for sample in record["samples"]:
+                validate_wall_sample(sample, args.wall_profile_version)
     jobs = shuffled_tuple_jobs(
         images,
         args.qualities,
@@ -883,7 +921,8 @@ def command_stages(args, images, benchmark, efforts, budget):
             continue
         if budget.exhausted:
             return False
-        final_output = output_path(args.output, image, quality, effort)
+        reference_run = getattr(args, "reference_run", None) or args.output
+        final_output = output_path(reference_run, image, quality, effort)
         if not final_output.is_file():
             raise StudyError("Run timing phase first; missing %s" % final_output)
         with tempfile.TemporaryDirectory(prefix="cjxl-stage-") as temporary:
@@ -909,6 +948,10 @@ def command_stages(args, images, benchmark, efforts, budget):
             if sha256_file(profiled_output) != sha256_file(final_output):
                 raise StudyError("Instrumented codestream differs for %s" % identifier)
             samples = document["samples"]
+            required_wall_version = getattr(args, "wall_profile_version", 0)
+            if required_wall_version:
+                for sample in samples:
+                    validate_wall_sample(sample, required_wall_version)
             representative = sorted(
                 samples, key=lambda sample: sample["elapsed_nanoseconds"]
             )[len(samples) // 2]
@@ -962,6 +1005,12 @@ def command_stages(args, images, benchmark, efforts, budget):
                 "median_phase_nanoseconds": median_mapping(samples, "phase_nanoseconds"),
                 "median_work_nanoseconds": median_mapping(samples, "work_nanoseconds"),
             }
+            if samples[0].get("wall_profile_version"):
+                record["wall_profile_version"] = samples[0]["wall_profile_version"]
+                for field in ("wall_exclusive_nanoseconds", "wall_inclusive_nanoseconds", "wall_invocations",
+                              "wall_root_nanoseconds", "internal_width", "internal_height", "resampling",
+                              "frame_invocations", "refinement_iterations"):
+                    record["representative_" + field] = representative[field]
             append_jsonl(records_path, record)
             done.add(identifier)
             budget.completed_one()
@@ -1121,10 +1170,25 @@ def record_execution_invocation(args, image_count):
 def command_run(args):
     args.corpus = args.corpus.resolve()
     args.output = args.output.resolve()
+    if getattr(args, "reference_run", None):
+        args.reference_run = args.reference_run.resolve()
+        if args.phase != "stages" or args.reference_run == args.output:
+            raise StudyError("--reference-run requires a separate stage-only output directory")
     corpus_value, all_images = load_corpus(args.corpus)
     images = filtered_images(all_images, args.image_filter)
     ordinary = require_executable(args.benchmark, "ordinary benchmark")
     stage = require_executable(args.stage_benchmark, "stage benchmark")
+    if getattr(args, "wall_profile_version", 0):
+        if args.stage_build_manifest is None:
+            raise StudyError("Expanded wall profiling requires --stage-build-manifest")
+        manifest = json.loads(args.stage_build_manifest.read_text())
+        if manifest.get("wall_profile_version") != args.wall_profile_version:
+            raise StudyError("Stage build manifest wall profile version mismatch")
+        if pathlib.Path(manifest["files"]["benchmark"]["path"]).resolve() != pathlib.Path(stage).resolve():
+            raise StudyError("Stage benchmark is not the frozen manifest binary")
+        for name, identity in manifest["files"].items():
+            if sha256_file(pathlib.Path(identity["path"])) != identity["sha256"]:
+                raise StudyError("Frozen stage build file changed: %s" % name)
     cjxl = require_executable(args.cjxl, "cjxl")
     samply = require_executable(args.samply, "Samply")
     tools = {
@@ -1218,7 +1282,15 @@ def tuple_summary(timing_records, stage_records):
         }
         stage = stages.get(identifier)
         if stage:
-            row["profiled_complete_wall_ms"] = stage["median_elapsed_nanoseconds"] / 1_000_000
+            # Keep every wall column on the same actual sample, even when a
+            # caller requests an even number of stage samples. The arithmetic
+            # median of the two central elapsed values is not such a sample.
+            representative_elapsed = next(
+                (sample["elapsed_nanoseconds"] for sample in stage.get("samples", [])
+                 if sample["sample_index"] == stage.get("representative_sample_index")),
+                stage["median_elapsed_nanoseconds"],
+            )
+            row["profiled_complete_wall_ms"] = representative_elapsed / 1_000_000
             phases = stage["representative_phase_nanoseconds"]
             row["frontend_residual_wall_ms"] = stage[
                 "representative_frontend_residual_nanoseconds"
@@ -1227,6 +1299,18 @@ def tuple_summary(timing_records, stage_records):
                 row["phase_wall_%s_ms" % name] = value / 1_000_000
             for name, value in stage["representative_work_nanoseconds"].items():
                 row["work_aggregate_worker_%s_ms" % name] = value / 1_000_000
+            if stage.get("wall_profile_version"):
+                row["wall_profile_version"] = stage["wall_profile_version"]
+                for kind in ("exclusive", "inclusive"):
+                    for name, value in stage["representative_wall_%s_nanoseconds" % kind].items():
+                        row["wall_%s_%s_ms" % (kind, name)] = value / 1_000_000
+                row["wall_exclusive_encode_api_other_ms"] = (
+                    representative_elapsed - stage["representative_wall_root_nanoseconds"]
+                ) / 1_000_000
+                for name in ("internal_width", "internal_height", "resampling", "frame_invocations", "refinement_iterations"):
+                    row[name] = stage["representative_" + name]
+                for name, value in stage["representative_wall_invocations"].items():
+                    row["wall_invocations_" + name] = value
         rows.append(row)
     return rows
 
@@ -1274,7 +1358,7 @@ def aggregate_summary(rows):
             "total_encoded_bytes": sum(row["encoded_bytes"] for row in members),
             "aggregate_bits_per_pixel": sum(row["encoded_bytes"] for row in members) * 8 / total_pixels,
         }
-        stage_fields = [field for field in members[0] if field.startswith(("profiled_", "frontend_", "phase_", "work_"))]
+        stage_fields = [field for field in members[0] if field.startswith(("profiled_", "frontend_", "phase_", "work_", "wall_exclusive_", "wall_inclusive_"))]
         for field in stage_fields:
             if all(field in row for row in members):
                 result["total_%s" % field] = sum(row[field] for row in members)
@@ -1327,15 +1411,19 @@ def summarize_profiles(run, parser_path):
 
 def command_summarize(args):
     run = args.run.resolve()
-    timings = read_jsonl(run / "timings.jsonl")
+    metadata = json.loads((run / "metadata.json").read_text(encoding="utf-8"))
+    configuration = metadata["configuration"]
+    timing_run = pathlib.Path(configuration.get("reference_run", run))
+    timings = read_jsonl(timing_run / "timings.jsonl")
     stages = read_jsonl(run / "stage-profiles.jsonl")
     rows = tuple_summary(timings, stages)
     summary = run / "summary"
-    write_csv(summary / "image-tuples.csv", rows)
+    suffix = ".partial" if getattr(args, "partial", False) else ""
+    write_csv(summary / ("image-tuples" + suffix + ".csv"), rows)
     aggregated = aggregate_summary(rows)
-    write_csv(summary / "aggregated.csv", aggregated)
+    write_csv(summary / ("aggregated" + suffix + ".csv"), aggregated)
     profile_rows = summarize_profiles(run, args.samply_parser.resolve())
-    write_csv(summary / "samply-operations.csv", profile_rows)
+    write_csv(summary / ("samply-operations" + suffix + ".csv"), profile_rows)
     metadata = json.loads((run / "metadata.json").read_text(encoding="utf-8"))
     configuration = metadata["configuration"]
     expected_tuples = (
@@ -1362,8 +1450,9 @@ The primary result is the median uninstrumented complete-encode wall time from
 independent processes. Each process records one sample after one validation
 encode and {warmups} warmup encode(s). PFM input reading and filesystem output
 are outside the timed region. The exact phase columns cover the serializer
-portion of the instrumented sample whose complete elapsed time is the stage
-run's median. `frontend_residual_wall_ms` is that sample's complete wall time
+portion of one instrumented sample selected by complete elapsed-time median
+(the upper middle actual sample for an even sample count).
+`frontend_residual_wall_ms` is that sample's complete wall time
 minus its complete serializer wall time.
 
 `phase_wall_*` values are mutually exclusive wall-clock phases.
@@ -1371,16 +1460,25 @@ minus its complete serializer wall time.
 summed or interpreted as latency. Samply columns are sampled thread-CPU
 attribution and are likewise not wall-clock timings.
 
+For expanded wall-v2 captures, `wall_exclusive_*_ms` columns (including
+`encode_api_other`) partition complete encode wall time. `wall_inclusive_*_ms`
+columns include nested stages and must not be summed as a latency partition.
+Missing stage captures remain blank, not zero. Timing data is read from
+`{timing_run}`; stage captures are read from this run.
+
 ## Outputs
 
-- `image-tuples.csv`: per-image distributions, size, exact wall phases, and
+- `image-tuples{suffix}.csv`: per-image distributions, size, exact wall phases, and
   aggregate worker measurements.
-- `aggregated.csv`: sums across each corpus/resolution/quality/effort cell.
-- `samply-operations.csv`: operation attribution for stratified captures.
+- `aggregated{suffix}.csv`: sums across each corpus/resolution/quality/effort cell.
+- `samply-operations{suffix}.csv`: operation attribution for captures in this run;
+  reference-run Samply captures are not copied or included here.
 - `../execution-events.jsonl`: append-only scheduling and invocation history.
-- `../outputs`: one deterministic JXL codestream per unique tuple.
+- `{timing_run}/outputs`: deterministic JXL codestreams in the timing/reference run.
 """.format(
         generated=utc_now(),
+        suffix=suffix,
+        timing_run=timing_run,
         completed_tuples=completed_tuples,
         expected_tuples=expected_tuples,
         timing_samples=timing_samples,
@@ -1394,7 +1492,7 @@ attribution and are likewise not wall-clock timings.
         ),
         warmups=configuration["warmups_per_process"],
     )
-    (summary / "REPORT.md").write_text(report, encoding="utf-8")
+    (summary / ("REPORT" + suffix + ".md")).write_text(report, encoding="utf-8")
     print("wrote summaries under %s" % summary)
 
 
@@ -1405,7 +1503,8 @@ def command_verify(args):
     _, images = load_corpus(
         pathlib.Path(configuration["corpus_manifest"]), validate_hashes=False
     )
-    timing_records = read_jsonl(run / "timings.jsonl")
+    reference_run = pathlib.Path(configuration.get("reference_run", run))
+    timing_records = read_jsonl(reference_run / "timings.jsonl")
     stage_records = read_jsonl(run / "stage-profiles.jsonl")
     by_sample = {record["sample_id"]: record for record in timing_records}
     stages = {record["job_id"]: record for record in stage_records}
@@ -1415,13 +1514,13 @@ def command_verify(args):
         images, configuration["qualities"], configuration["efforts"]
     ):
         identifier = job_id(image, quality, effort)
-        output = output_path(run, image, quality, effort)
+        output = output_path(reference_run, image, quality, effort)
         expected_outputs.append((identifier, output))
         samples = [
             by_sample.get("%s|repetition=%d" % (identifier, repetition))
             for repetition in range(configuration["timing_repetitions"])
         ]
-        if any(sample is None for sample in samples):
+        if not getattr(args, "stage_only", False) and any(sample is None for sample in samples):
             errors.append("missing timing sample: %s" % identifier)
         if not output.is_file():
             errors.append("missing output: %s" % output)
@@ -1432,20 +1531,29 @@ def command_verify(args):
             errors.append("missing stage profile: %s" % identifier)
         elif not stage.get("output_matches_uninstrumented"):
             errors.append("stage output mismatch: %s" % identifier)
+        elif output.is_file() and sha256_file(output) != stage["output_sha256"]:
+            errors.append("stage output hash mismatch: %s" % identifier)
+        if stage is not None and configuration.get("wall_profile_version"):
+            for sample in stage["samples"]:
+                validate_wall_sample(sample, configuration["wall_profile_version"])
     if errors:
         raise StudyError("Verification failed:\n" + "\n".join(errors[:50]))
 
     djxl = require_executable(args.djxl, "djxl")
     decoded_path = run / "verified-decodes.jsonl"
-    decoded = completed_ids(decoded_path, "job_id")
+    decoded = {
+        record["job_id"]: record.get("output_sha256")
+        for record in read_jsonl(decoded_path)
+    }
     for index, (identifier, output) in enumerate(expected_outputs, 1):
-        if identifier in decoded:
+        output_hash = sha256_file(output)
+        if decoded.get(identifier) == output_hash:
             continue
         print("decode %d/%d %s" % (index, len(expected_outputs), identifier), flush=True)
         run_command((djxl, output, "--disable_output", "--quiet"), capture=False)
         append_jsonl(
             decoded_path,
-            {"job_id": identifier, "decoded_at": utc_now(), "output_sha256": sha256_file(output)},
+            {"job_id": identifier, "decoded_at": utc_now(), "output_sha256": output_hash},
         )
     atomic_json(
         run / "verification.json",
@@ -1456,7 +1564,7 @@ def command_verify(args):
             "timing_sample_count": len(timing_records),
             "stage_profile_count": len(stage_records),
             "decoded_output_count": len(expected_outputs),
-            "status": "complete",
+            "status": "stage-only-complete" if getattr(args, "stage_only", False) else "complete",
         },
     )
     print("verification complete")
@@ -1471,6 +1579,10 @@ def add_run_arguments(parser):
     parser.add_argument("--samply", default="samply")
     parser.add_argument("--ordinary-build-manifest", type=pathlib.Path)
     parser.add_argument("--stage-build-manifest", type=pathlib.Path)
+    parser.add_argument("--reference-run", type=pathlib.Path,
+                        help="reuse codestreams/timings from this run for a separate stage-only pass")
+    parser.add_argument("--wall-profile-version", type=int, choices=(0, 2), default=0,
+                        help="require the expanded wall profile schema (2) in a new run")
     parser.add_argument("--cjxl-cmake-cache", type=pathlib.Path)
     parser.add_argument("--phase", choices=("timing", "stages", "profiles", "all"), default="all")
     parser.add_argument("--qualities", default=",".join(map(str, DEFAULT_QUALITIES)))
@@ -1517,6 +1629,7 @@ def parse_args(argv):
     run.set_defaults(function=command_run)
 
     summarize = subparsers.add_parser("summarize", help="write CSV and Markdown summaries")
+    summarize.add_argument("--partial", action="store_true", help="write explicitly named partial snapshots")
     summarize.add_argument("--run", type=pathlib.Path, required=True)
     summarize.add_argument(
         "--samply-parser",
@@ -1526,6 +1639,7 @@ def parse_args(argv):
     summarize.set_defaults(function=command_summarize)
 
     verify = subparsers.add_parser("verify", help="verify completeness, hashes, and decodability")
+    verify.add_argument("--stage-only", action="store_true", help="verify stage coverage without requiring all independent timing repetitions")
     verify.add_argument("--run", type=pathlib.Path, required=True)
     verify.add_argument("--djxl", required=True)
     verify.set_defaults(function=command_verify)

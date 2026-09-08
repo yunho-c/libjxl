@@ -112,7 +112,8 @@ OPERATION_RULES = (
     (
         "Modular/DC side data",
         (
-            "ModularFrameEncoder",
+            # The bare class name also occurs in unrelated function arguments.
+            "ModularFrameEncoder::",
             "ModularCompress",
             "AddVarDCTDC",
             "EncodeModularChannel",
