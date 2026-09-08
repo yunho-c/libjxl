@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 #include "lib/jxl/enc_heuristics.h"
+#include "lib/jxl/enc_stage_profile.h"
 
 #include <jxl/cms_interface.h>
 #include <jxl/memory_manager.h>
@@ -893,6 +894,7 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
                            PassesEncoderState* enc_state,
                            const Image3F& orig_opsin, const Rect& rect,
                            ThreadPool* pool) {
+  EncoderWallTimer wall(EncoderWallStage::kArSelection);
   const CompressParams& cparams = enc_state->cparams;
   PassesSharedState& shared = enc_state->shared;
   const FrameDimensions& frame_dim = shared.frame_dim;
@@ -1042,6 +1044,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
   // Find and subtract splines.
+  EncoderWallTimer features_wall(EncoderWallStage::kFeatureSearch);
   bool override_splines = cparams.custom_splines.HasAny();
   if (override_splines) {
     image_features.splines.SetData(cparams.custom_splines);
@@ -1065,6 +1068,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         PatchDictionaryEncoder::SubtractFrom(image_features.patches, opsin));
   }
 
+  features_wall.Stop();
   const float quant_dc = InitialQuantDC(cparams.butteraugli_distance);
 
   // TODO(veluca): we can now run all the code from here to FindBestQuantizer
@@ -1092,6 +1096,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   ImageF initial_quant_masking;
 
   // Compute an initial estimate of the quantization field.
+  EncoderWallTimer aq_wall(EncoderWallStage::kInitialAQ);
   // Call InitialQuantField only in Hare mode or slower. Otherwise, rely
   // on simple heuristics in FindBestAcStrategy, or set a constant for Falcon
   // mode.
@@ -1130,9 +1135,11 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   }
 
   // TODO(veluca): do something about animations.
+  aq_wall.Stop();
 
   // Apply inverse-gaborish.
   if (frame_header.loop_filter.gab) {
+    EncoderWallTimer gaborish_wall(EncoderWallStage::kInverseGaborish);
     // Changing the weight here to 0.99f would help to reduce ringing in
     // generation loss.
     float weight[3] = {
@@ -1143,6 +1150,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
   }
 
+  EncoderWallTimer setup_wall(EncoderWallStage::kHeuristicsSetup);
   if (initialize_global_state) {
     JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
         memory_manager, cparams, modular_frame_encoder, &matrices));
@@ -1202,10 +1210,16 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
     return true;
   };
-  JXL_RETURN_IF_ERROR(
-      RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
+  setup_wall.Stop();
+  {
+    EncoderWallTimer tiles_wall(EncoderWallStage::kAcCflTiles);
+    JXL_RETURN_IF_ERROR(
+        RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
+  }
 
+  EncoderWallTimer finalize_wall(EncoderWallStage::kHeuristicsFinalize);
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
+  finalize_wall.Stop();
 
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
@@ -1218,6 +1232,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   // Choose a context model that depends on the amount of quantization for AC.
   if (cparams.speed_tier < SpeedTier::kFalcon && initialize_global_state) {
+    EncoderWallTimer context_wall(EncoderWallStage::kBlockContext);
     FindBestBlockEntropyModel(cparams, raw_quant_field, ac_strategy,
                               &block_ctx_map);
   }

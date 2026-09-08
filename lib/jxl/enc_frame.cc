@@ -745,6 +745,7 @@ Status DownsampleColorChannels(const CompressParams& cparams,
       cparams.already_downsampled) {
     return true;
   }
+  EncoderWallTimer wall(EncoderWallStage::kDownsampling);
   if (frame_header.encoding == FrameEncoding::kVarDCT &&
       frame_header.upsampling == 2) {
     // TODO(lode): use the regular DownsampleImage, or adapt to the custom
@@ -1170,6 +1171,7 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
 
 Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
                              const FrameDimensions& frame_dim) {
+  EncoderWallTimer wall(EncoderWallStage::kCoefficientOrder);
   auto used_orders_info = ComputeUsedOrders(
       enc_state.cparams.speed_tier, enc_state.shared.ac_strategy,
       Rect(enc_state.shared.raw_quant_field));
@@ -1621,6 +1623,7 @@ Status ComputeEncodingData(
   ImageF* black = black_eci ? &extra_channels[black_idx] : nullptr;
   bool has_interleaved_alpha = false;
   JxlChunkedFrameInputSource input = frame_data.GetInputSource();
+  EncoderWallTimer input_wall(EncoderWallStage::kInputUnpack);
   if (!jpeg_data) {
     JXL_RETURN_IF_ERROR(CopyColorChannels(input, patch_rect, frame_info,
                                           metadata->m, pool, &color, alpha,
@@ -1629,6 +1632,7 @@ Status ComputeEncodingData(
   JXL_RETURN_IF_ERROR(CopyExtraChannels(input, patch_rect, frame_info,
                                         metadata->m, has_interleaved_alpha,
                                         pool, &extra_channels));
+  input_wall.Stop();
 
   enc_state.cparams = cparams;
 
@@ -1645,6 +1649,7 @@ Status ComputeEncodingData(
                                              patch_rect.ysize()));
         linear = &linear_storage;
       }
+      EncoderWallTimer color_wall(EncoderWallStage::kColorConversion);
       JXL_RETURN_IF_ERROR(ToXYB(c_enc, metadata->m.IntensityTarget(), black,
                                 pool, &color, cms, linear));
     } else {
@@ -1748,6 +1753,7 @@ Status ComputeEncodingData(
           EncoderProfilePhase::kCoefficientTokenization);
       EncoderStageProfileWorkTimer tokenization_work(
           EncoderProfileWork::kCoefficientTokenization);
+      EncoderWallTimer tree_wall(EncoderWallStage::kModularTree);
       JXL_RETURN_IF_ERROR(enc_modular.ComputeTree(pool));
       JXL_RETURN_IF_ERROR(enc_modular.ComputeTokens(pool));
     }
@@ -2776,7 +2782,14 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
 
 #if JPEGXL_ENABLE_STAGE_PROFILER
   EncoderStageProfileSession profile_session(cparams.stage_profile);
+  if (cparams.stage_profile && cparams.stage_profile->frame_invocations == 1) {
+    auto* profile = cparams.stage_profile;
+    profile->resampling = cparams.resampling;
+    profile->internal_width = DivCeil(frame_data.xsize, cparams.already_downsampled ? 1 : cparams.resampling);
+    profile->internal_height = DivCeil(frame_data.ysize, cparams.already_downsampled ? 1 : cparams.resampling);
+  }
 #endif
+  EncoderWallTimer frame_wall(EncoderWallStage::kFrameOther);
 
   if (CanDoStreamingEncoding(cparams, frame_info, *metadata, frame_data)) {
     return EncodeFrameStreaming(memory_manager, cparams, frame_info, metadata,

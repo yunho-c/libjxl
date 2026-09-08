@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 #include "lib/jxl/enc_cache.h"
+#include "lib/jxl/enc_stage_profile.h"
 
 #include <jxl/cms_interface.h>
 #include <jxl/memory_manager.h>
@@ -47,6 +48,7 @@ namespace jxl {
 
 Status ComputeACMetadata(ThreadPool* pool, PassesEncoderState* enc_state,
                          ModularFrameEncoder* modular_frame_encoder) {
+  EncoderWallTimer wall(EncoderWallStage::kAcMetadata);
   PassesSharedState& shared = enc_state->shared;
   auto compute_ac_meta = [&](int group_index, int /* thread */) -> Status {
     const Rect r = shared.frame_dim.DCGroupRect(group_index);
@@ -72,6 +74,9 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
                                PassesEncoderState* enc_state,
                                ModularFrameEncoder* modular_frame_encoder,
                                AuxOut* aux_out) {
+  EncoderWallTimer coeff_wall(EncoderWallTimer::InRefinement()
+      ? EncoderWallStage::kRefinementCoefficients
+      : EncoderWallStage::kFinalCoefficients);
   PassesSharedState& JXL_RESTRICT shared = enc_state->shared;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
@@ -115,6 +120,8 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
                                 "Compute coeffs"));
 
   if (frame_header.flags & FrameHeader::kUseDcFrame) {
+    coeff_wall.Stop();
+    EncoderWallTimer dc_wall(EncoderWallStage::kDcPreparation);
     CompressParams cparams = enc_state->cparams;
     cparams.dots = Override::kOff;
     cparams.noise = Override::kOff;
@@ -222,6 +229,8 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
     shared.dc = &shared.dc_storage;
     JXL_ENSURE(encoded_size == 0);
   } else {
+    coeff_wall.Stop();
+    EncoderWallTimer dc_wall(EncoderWallStage::kDcPreparation);
     auto compute_dc_coeffs = [&](int group_index, int /* thread */) -> Status {
       const Rect r = enc_state->shared.frame_dim.DCGroupRect(group_index);
       int modular_group_index = group_index;

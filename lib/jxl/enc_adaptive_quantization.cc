@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 #include "lib/jxl/enc_adaptive_quantization.h"
+#include "lib/jxl/enc_stage_profile.h"
 
 #include <jxl/cms_interface.h>
 #include <jxl/memory_manager.h>
@@ -842,6 +843,7 @@ StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
                                      PassesEncoderState* enc_state,
                                      const JxlCmsInterface& cms,
                                      ThreadPool* pool) {
+  EncoderWallTimer roundtrip_wall(EncoderWallStage::kRefinementRoundtrip);
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
   std::unique_ptr<PassesDecoderState> dec_state =
       jxl::make_unique<PassesDecoderState>(memory_manager);
@@ -862,6 +864,7 @@ StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
   JXL_RETURN_IF_ERROR(
       InitializePassesEncoder(frame_header, opsin, Rect(opsin), cms, pool,
                               enc_state, modular_frame_encoder.get(), nullptr));
+  EncoderWallTimer reconstruction_wall(EncoderWallStage::kRefinementReconstruction);
   JXL_RETURN_IF_ERROR(dec_state->Init(frame_header));
   JXL_RETURN_IF_ERROR(dec_state->InitForAC(num_passes, pool));
 
@@ -952,7 +955,9 @@ Status FindBestQuantization(const FrameHeader& frame_header,
           ? frame_header.nonserialized_metadata->m.IntensityTarget()
           : 80.f;
   JxlButteraugliComparator comparator(params, cms);
+  EncoderWallTimer reference_wall(EncoderWallStage::kRefinementReference);
   JXL_RETURN_IF_ERROR(comparator.SetLinearReferenceImage(linear));
+  reference_wall.Stop();
   bool lower_is_better =
       (comparator.GoodQualityScore() < comparator.BadQualityScore());
   const float initial_quant_dc = InitialQuantDC(butteraugli_target);
@@ -983,6 +988,7 @@ Status FindBestQuantization(const FrameHeader& frame_header,
     iters = kMaxButteraugliIters;
   }
   for (int i = 0; i < iters + 1; ++i) {
+    EncoderWallTimer::RefinementIteration();
     if (JXL_DEBUG_ADAPTIVE_QUANTIZATION) {
       printf("\nQuantization field:\n");
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
@@ -999,7 +1005,10 @@ Status FindBestQuantization(const FrameHeader& frame_header,
         RoundtripImage(frame_header, opsin, enc_state, cms, pool));
     float score;
     ImageF diffmap;
+    EncoderWallTimer compare_wall(EncoderWallStage::kRefinementCompare);
     JXL_RETURN_IF_ERROR(comparator.CompareWith(dec_linear, &diffmap, &score));
+    compare_wall.Stop();
+    EncoderWallTimer update_wall(EncoderWallStage::kRefinementUpdate);
     if (!lower_is_better) {
       score = -score;
       ScaleImage(-1.0f, &diffmap);
@@ -1136,6 +1145,7 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
                                 1.0f / enc_state->cparams.max_error[2]};
 
   for (int i = 0; i < kMaxButteraugliIters + 1; ++i) {
+    EncoderWallTimer::RefinementIteration();
     JXL_RETURN_IF_ERROR(quantizer.SetQuantField(initial_quant_dc, quant_field,
                                                 &raw_quant_field));
     if (JXL_DEBUG_ADAPTIVE_QUANTIZATION && aux_out) {
@@ -1275,6 +1285,7 @@ Status FindBestQuantizer(const FrameHeader& frame_header, const Image3F* linear,
                          PassesEncoderState* enc_state,
                          const JxlCmsInterface& cms, ThreadPool* pool,
                          AuxOut* aux_out, double rescale) {
+  EncoderWallTimer wall(EncoderWallStage::kQuantizerRefinement);
   const CompressParams& cparams = enc_state->cparams;
   if (cparams.max_error_mode) {
     JXL_RETURN_IF_ERROR(FindBestQuantizationMaxError(
