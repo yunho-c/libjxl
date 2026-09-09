@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # Copyright (c) the JPEG XL Project Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license in LICENSE.
-"""Resumable fast-ssim2 scoring, matched-quality search, and Pareto plots.
+"""Resumable perceptual scoring, matched-quality search, and CSV summaries.
 
 Collection is opt-in and separate from rendering. See doc/runtime-quality.md.
-The standard-library collector uses the existing uninstrumented API harness;
-only plotting requires matplotlib. No work is started by importing this module.
+The standard-library CLI uses the existing uninstrumented API harness and
+exports data only. Rendering lives in cjxl_runtime_characterization_notebook.
+No work is started by importing this module.
 """
 
 import argparse
@@ -19,7 +20,9 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import select
+import shutil
 import signal
 import statistics
 import subprocess
@@ -31,6 +34,43 @@ SCHEMA = 1
 COLOR = "RGB_D65_SRG_Rel_Lin"
 METRIC_REVISION = "c3867954c7bec8a761951df9256354b305fd0cff"
 SOURCE_FIELDS = ("image_id", "corpus", "resolution_class", "width", "height")
+METRICS = {
+    "fast-ssim2": {"label": "fast-ssim2", "higher_is_better": True},
+    "butteraugli": {"label": "Butteraugli distance", "higher_is_better": False},
+}
+
+
+def metric_name(config):
+    # Backward-compatible with the original fast-ssim2 run/test fixtures.
+    name = config.get("metric", "fast-ssim2")
+    if name not in METRICS:
+        raise StudyError(f"Unknown metric: {name}")
+    return name
+
+
+def require_encoding_allowed(config):
+    if config.get("preview_only") or metric_name(config) == "butteraugli":
+        raise StudyError(
+            "Butteraugli is preview-only: no calibration or timing encodes"
+        )
+
+
+def parse_butteraugli(stdout):
+    """Keep the conventional distance distinct from the auxiliary 3-norm."""
+    lines = stdout.strip().splitlines()
+    if len(lines) != 2 or not re.fullmatch(r"3-norm: \S+", lines[1]):
+        raise StudyError("Unexpected Butteraugli output")
+    try:
+        distance, pnorm = float(lines[0]), float(lines[1].split()[1])
+    except ValueError as error:
+        raise StudyError("Invalid Butteraugli distance") from error
+    if not all(math.isfinite(v) and v >= 0 for v in (distance, pnorm)):
+        raise StudyError("Butteraugli distances must be finite and nonnegative")
+    return {
+        "score": distance,
+        "butteraugli_pnorm3": pnorm,
+        "metric_stdout": stdout.strip(),
+    }
 
 
 class StudyError(Exception):
@@ -170,6 +210,9 @@ class Scorer:
         self.process = None
 
     def __enter__(self):
+        if metric_name(self.config) == "butteraugli":
+            self.info = {"mode": "pairwise-linear-srgb"}
+            return self
         command = [self.config["scorer"], self.image["pfm_path"], "auto"]
         append(self.run / "commands.jsonl", {"command": command})
         self.errors = tempfile.TemporaryFile(mode="w+")
@@ -218,14 +261,39 @@ class Scorer:
                 self.budget,
                 self.config["timeout"],
             )
-            self.process.stdin.write(json.dumps({"path": str(decoded)}) + "\n")
-            self.process.stdin.flush()
-            result = self.response()
+            if metric_name(self.config) == "butteraugli":
+                result = parse_butteraugli(
+                    execute(
+                        [
+                            self.config["scorer"],
+                            self.image["pfm_path"],
+                            decoded,
+                            "--colorspace",
+                            COLOR,
+                            "--intensity_target",
+                            self.config["intensity_target"],
+                            "--pnorm",
+                            "3",
+                        ],
+                        self.run,
+                        self.budget,
+                        self.config["timeout"],
+                    )
+                )
+            else:
+                self.process.stdin.write(json.dumps({"path": str(decoded)}) + "\n")
+                self.process.stdin.flush()
+                result = self.response()
             score = result["score"]
             if not isinstance(score, (float, int)) or not math.isfinite(score):
                 raise StudyError("Metric produced a non-finite score")
             return {
-                "score": score,
+                **{
+                    key: result[key]
+                    for key in ("score", "butteraugli_pnorm3", "metric_stdout")
+                    if key in result
+                },
+                "metric": metric_name(self.config),
                 "decoded_sha256": digest(decoded),
                 "scoring_mode": self.info["mode"],
             }
@@ -235,7 +303,8 @@ class Scorer:
             stop_process(self.process)
             self.process.stdin.close()
             self.process.stdout.close()
-        self.errors.close()
+        if hasattr(self, "errors"):
+            self.errors.close()
 
 
 def numbers(text, kind=int):
@@ -274,9 +343,27 @@ def initialize(args):
     for key in ("benchmark", "djxl"):
         files[binaries[key]["path"]] = binaries[key]["sha256"]
     scorer = args.scorer.resolve()
-    version = json.loads(subprocess.check_output([str(scorer), "--version"], text=True))
-    if version.get("fast_ssim2_revision") != METRIC_REVISION:
-        raise StudyError("Use the pinned quality_metric adapter")
+    if args.metric == "butteraugli":
+        expected_scorer = Path(binaries["djxl"]["path"]).with_name("butteraugli_main")
+        if scorer != expected_scorer.resolve():
+            raise StudyError("Use butteraugli_main from the frozen decoder build")
+        version = {
+            "implementation": "libjxl/butteraugli_main",
+            "source_build_revision": ordinary["libjxl_revision"],
+            "sha256": digest(scorer),
+            "primary_score": "distance",
+            "auxiliary_score": "3-norm",
+            "color_space": COLOR,
+            "intensity_target": args.intensity_target,
+            "hf_asymmetry": 1.0,
+            "xmul": 1.0,
+        }
+    else:
+        version = json.loads(
+            subprocess.check_output([str(scorer), "--version"], text=True)
+        )
+        if version.get("fast_ssim2_revision") != METRIC_REVISION:
+            raise StudyError("Use the pinned quality_metric adapter")
     files[str(scorer)] = digest(scorer)
     with args.tuples.open(newline="") as f:
         rows = list(csv.DictReader(f))
@@ -298,13 +385,15 @@ def initialize(args):
     efforts = sorted({int(r["effort"]) for r in selected_rows})
     if args.pilot and efforts != list(range(1, 11)):
         raise StudyError("Pilot requires existing outputs at efforts 1-10")
-    measured = args.measurement_efforts
+    measured = [] if args.metric == "butteraugli" else args.measurement_efforts
     if not set(measured) <= set(efforts):
         raise StudyError("Measurement efforts are missing from the source tuples")
     config = {
         "schema_version": SCHEMA,
-        "metric": "fast-ssim2",
+        "metric": args.metric,
         "metric_version": version,
+        "preview_only": args.metric == "butteraugli",
+        "intensity_target": args.intensity_target,
         "targets": args.targets,
         "tolerance": args.tolerance,
         "images": images,
@@ -324,11 +413,12 @@ def initialize(args):
         "repetitions": 5,
         "warmups": 1,
         "seed": 20260908,
-        "minimum_distance": 0.55,
-        "maximum_distance": 15.266666666667,
+        "minimum_distance": args.minimum_distance,
+        "maximum_distance": args.maximum_distance,
         "max_evaluations": args.max_evaluations,
         "timeout": args.timeout,
         "pilot": args.pilot,
+        "collector_snapshot_sha256": digest(__file__),
     }
     config["configuration_id"] = identity(config)
     if args.run.exists():
@@ -339,6 +429,7 @@ def initialize(args):
     write_json(args.run / "metadata.json", config)
     # Snapshot the input bytes, rather than depending on a changing partial CSV.
     (args.run / "source-tuples.csv").write_bytes(args.tuples.read_bytes())
+    (args.run / "collector.py").write_bytes(Path(__file__).read_bytes())
     append(
         args.run / "execution-events.jsonl",
         {"event": "initialized", "configuration_id": config["configuration_id"]},
@@ -354,6 +445,8 @@ def load_config(run, verify=False):
         raise StudyError("Configuration changed; initialize a separate run")
     verify_file(run / "source-tuples.csv", config["tuple_snapshot_sha256"])
     if verify:
+        if config.get("collector_snapshot_sha256"):
+            verify_file(run / "collector.py", config["collector_snapshot_sha256"])
         for path, sha in config["tool_hashes"].items():
             verify_file(path, sha)
         for image in config["images"]:
@@ -412,7 +505,7 @@ def base_row(image, effort, distance):
     }
 
 
-def collect_scores(run, config, budget):
+def collect_scores(run, config, budget, efforts=None):
     existing = read_records(run, "scores", config, verify=True)
     done = {r["source_job_id"] for r in existing}
     inputs = source_rows(run, config)
@@ -420,7 +513,9 @@ def collect_scores(run, config, budget):
         jobs = [
             r
             for r in inputs
-            if r["image_id"] == image["image_id"] and r["job_id"] not in done
+            if r["image_id"] == image["image_id"]
+            and r["job_id"] not in done
+            and (efforts is None or int(r["effort"]) in efforts)
         ]
         if not jobs:
             continue
@@ -447,7 +542,7 @@ def collect_scores(run, config, budget):
                 print(f"score {row['job_id']}: {result['score']:.4f}", flush=True)
 
 
-def interpolate(points, target):
+def interpolate(points, target, higher_is_better=True):
     """Local monotone interpolation; never sort by score and hide reversals."""
     points = sorted(points, key=lambda p: p["distance"])
     if any(a["distance"] == b["distance"] for a, b in zip(points, points[1:])):
@@ -458,7 +553,8 @@ def interpolate(points, target):
         return {**best, "bracket": [best["distance"]]}, "exact-existing"
     candidates = []
     for a, b in zip(points, points[1:]):
-        if a["score"] > target > b["score"]:
+        direction = 1 if higher_is_better else -1
+        if direction * a["score"] > direction * target > direction * b["score"]:
             if a["resampling"] != b["resampling"]:
                 continue
             if a["encoded_bytes"] < b["encoded_bytes"]:
@@ -529,6 +625,10 @@ def search(points, target, tolerance, evaluate, minimum, maximum, max_evaluation
             # Cover endpoints, then deterministic dyadic probes for nonmonotonic curves.
             choices = [minimum, maximum]
             choices += [minimum + (maximum - minimum) * i / 8 for i in range(1, 8)]
+            # Compare the same decimal representation passed to the encoder.
+            # E.g. 3.1337500000000005 otherwise looks new despite a saved
+            # 3.13375 probe, and prematurely stops the fallback search.
+            choices = [float(format(d, ".12g")) for d in choices]
             choices = [d for d in choices if d not in by_distance]
             if not choices:
                 return None, "no-resolved-bracket", calls
@@ -593,12 +693,15 @@ def match_key(image_id, effort, target):
     return f"{image_id}|effort={effort}|target={target:g}"
 
 
-def collect_calibration(run, config, budget):
+def collect_calibration(run, config, budget, efforts=None):
+    require_encoding_allowed(config)
     scores = read_records(run, "scores", config, verify=True)
     probes = read_records(run, "probes", config, verify=True)
     outcomes = read_records(run, "calibration", config, verify=True)
     done = {r["match_id"] for r in outcomes if r["status"] == "matched"}
     for effort in config["measurement_efforts"]:
+        if efforts is not None and effort not in efforts:
+            continue
         for image in config["images"]:
             pending = [
                 t
@@ -670,12 +773,26 @@ def collect_calibration(run, config, budget):
                         "status": status,
                     }
                     if best:
+                        # Retain one named-by-match artifact even when a seed from
+                        # the original sweep already meets the target.
+                        budget.check()
+                        matched_dir = run / "matched"
+                        matched_dir.mkdir(exist_ok=True)
+                        token = identity([key, best["output_sha256"]])[:24]
+                        matched_output = matched_dir / (token + ".jxl")
+                        if not matched_output.exists():
+                            temporary = matched_output.with_suffix(".jxl.tmp")
+                            shutil.copyfile(best["output_path"], temporary)
+                            verify_file(temporary, best["output_sha256"])
+                            temporary.replace(matched_output)
+                        verify_file(matched_output, best["output_sha256"])
                         outcome.update(best)
                         outcome.update(
                             match_id=key,
                             target=target,
                             status=status,
                             score_error=best["score"] - target,
+                            output_path=str(matched_output),
                         )
                     save_record(run, "calibration", config, outcome)
                     budget.completed += 1
@@ -686,7 +803,8 @@ def collect_calibration(run, config, budget):
                     )
 
 
-def collect_measurements(run, config, budget):
+def collect_measurements(run, config, budget, efforts=None):
+    require_encoding_allowed(config)
     matches = {
         r["match_id"]: r for r in read_records(run, "calibration", config, verify=True)
     }
@@ -696,6 +814,8 @@ def collect_measurements(run, config, budget):
     images = {i["image_id"]: i for i in config["images"]}
     for repetition in range(config["repetitions"]):
         for effort in config["measurement_efforts"]:
+            if efforts is not None and effort not in efforts:
+                continue
             jobs = sorted(
                 (m for m in selected if m["effort"] == effort),
                 key=lambda m: m["match_id"],
@@ -753,7 +873,7 @@ def per_image_rows(run, config, mode):
                     **base_row(image, effort, None),
                     "mode": mode,
                     "target": target,
-                    "metric": "fast-ssim2",
+                    "metric": metric_name(config),
                     "status": "missing",
                     "tolerance": config["tolerance"],
                 }
@@ -763,7 +883,9 @@ def per_image_rows(run, config, mode):
                         for r in scores
                         if r["image_id"] == image["image_id"] and r["effort"] == effort
                     ]
-                    result, status = interpolate(points, target)
+                    result, status = interpolate(
+                        points, target, METRICS[metric_name(config)]["higher_is_better"]
+                    )
                     if result:
                         row.update(
                             {
@@ -837,6 +959,7 @@ def aggregate_points(rows):
     for row in rows:
         grouped[
             (
+                metric_name(row),
                 row["mode"],
                 row["corpus"],
                 row["resolution_class"],
@@ -851,7 +974,15 @@ def aggregate_points(rows):
             raise StudyError("Duplicate images in aggregate")
         out = dict(
             zip(
-                ("mode", "corpus", "resolution_class", "target", "encoder", "effort"),
+                (
+                    "metric",
+                    "mode",
+                    "corpus",
+                    "resolution_class",
+                    "target",
+                    "encoder",
+                    "effort",
+                ),
                 key,
             )
         )
@@ -883,244 +1014,113 @@ def aggregate_points(rows):
     return result
 
 
-def frontier(points):
-    return [
-        p
-        for p in points
-        if not any(
-            q["bits_per_pixel"] <= p["bits_per_pixel"]
-            and q["throughput_mp_s"] >= p["throughput_mp_s"]
-            and (
-                q["bits_per_pixel"] < p["bits_per_pixel"]
-                or q["throughput_mp_s"] > p["throughput_mp_s"]
-            )
-            for q in points
+def comparison_studies(run, compare_run):
+    """Read-only comparison of the same references, encodes, and source timings."""
+    studies = []
+    for path in (Path(run), Path(compare_run)):
+        config = load_config(path)
+        scores = read_records(path, "scores", config)
+        studies.append((path, config, scores))
+    _, a, scores_a = studies[0]
+    _, b, scores_b = studies[1]
+    if metric_name(a) == metric_name(b):
+        raise StudyError("Comparison requires two different metrics")
+
+    def cohort(config):
+        return sorted(
+            (i["image_id"], i["pfm_sha256"], i["width"], i["height"])
+            for i in config["images"]
         )
-    ]
+
+    if (
+        cohort(a) != cohort(b)
+        or a["tuple_snapshot_sha256"] != b["tuple_snapshot_sha256"]
+    ):
+        raise StudyError(
+            "Metric comparison requires identical cohorts and source timings"
+        )
+    rows_b = {r["source_job_id"]: r for r in scores_b}
+    if {r["source_job_id"] for r in scores_a if r["effort"] in (4, 5)} != {
+        r["source_job_id"] for r in scores_b if r["effort"] in (4, 5)
+    }:
+        raise StudyError(
+            "Metric comparison requires matching e4/e5 scoring coverage; resume score"
+        )
+    for row in scores_a:
+        other = rows_b.get(row["source_job_id"])
+        if other is not None and any(
+            row[k] != other[k]
+            for k in (
+                "output_sha256",
+                "reference_sha256",
+                "decoded_sha256",
+                "encoded_bytes",
+                "elapsed_ms",
+                "timing_sample_count",
+            )
+        ):
+            raise StudyError(
+                "Metric comparison observations refer to different artifacts"
+            )
+    return sorted(studies, key=lambda study: metric_name(study[1]) == "butteraugli")
 
 
-def plot_pareto(points, mode):
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    from matplotlib.ticker import LogLocator, FuncFormatter
-
-    panels = sorted({(r["corpus"], r["resolution_class"], r["target"]) for r in points})
-    fig, axes = plt.subplots(
-        max(1, math.ceil(len(panels) / 3)),
-        min(3, max(1, len(panels))),
-        figsize=(
-            5.4 * min(3, max(1, len(panels))),
-            4.4 * max(1, math.ceil(len(panels) / 3)),
-        ),
-        squeeze=False,
-        layout="constrained",
-    )
-    markers = ["o", "s", "^", "D", "v", "P", "X", "<", ">", "h"]
-    for ax, panel in zip(axes.flat, panels):
-        entries = [
-            r
-            for r in points
-            if (r["corpus"], r["resolution_class"], r["target"]) == panel
-        ]
-        ready = [r for r in entries if r["status"] == "ready"]
-        if ready:
-            if len({tuple(sorted(r["cohort"])) for r in ready}) != 1:
-                raise StudyError("Plot points have different cohorts")
-            for encoder in sorted({r["encoder"] for r in ready}):
-                line = sorted(
-                    [r for r in ready if r["encoder"] == encoder],
-                    key=lambda r: r["effort"],
+def effort_comparison_rows(studies):
+    """Within each metric, report e5 relative to e4; never equate metric scales."""
+    output = []
+    for run, config, _ in studies:
+        matches = per_image_rows(run, config, "preview")
+        pooled = aggregate_points(matches)
+        for image in [i["image_id"] for i in config["images"]] + ["pooled"]:
+            for target in config["targets"]:
+                source = (
+                    pooled
+                    if image == "pooled"
+                    else [r for r in matches if r["image_id"] == image]
                 )
-                color = "#2065ac" if encoder == "libjxl" else "#d55e00"
-                # Missing efforts break the connecting line.
-                all_efforts = sorted(
-                    r["effort"] for r in entries if r["encoder"] == encoder
-                )
-                lookup = {r["effort"]: r for r in line}
-                ax.plot(
-                    [
-                        lookup[e]["bits_per_pixel"] if e in lookup else math.nan
-                        for e in all_efforts
-                    ],
-                    [
-                        lookup[e]["throughput_mp_s"] if e in lookup else math.nan
-                        for e in all_efforts
-                    ],
-                    color=color,
-                    alpha=0.45,
-                    lw=1,
-                )
-                offsets = [
-                    (6, 10),
-                    (6, -15),
-                    (6, 10),
-                    (6, -15),
-                    (6, 10),
-                    (12, -18),
-                    (-22, 14),
-                    (-26, -14),
-                    (-26, 10),
-                    (8, -23),
-                ]
-                for row in line:
-                    ax.plot(
-                        row["bits_per_pixel"],
-                        row["throughput_mp_s"],
-                        marker=markers[(row["effort"] - 1) % len(markers)],
-                        ms=8,
-                        markerfacecolor="white" if mode == "preview" else color,
-                        markeredgecolor=color,
-                        linestyle="none",
+                pairs = {r["effort"]: r for r in source if r["target"] == target}
+                # A pooled row must describe exactly one corpus/resolution panel.
+                if (
+                    image == "pooled"
+                    and len({(r["corpus"], r["resolution_class"]) for r in source}) != 1
+                ):
+                    continue
+                out = {
+                    "metric": metric_name(config),
+                    "image_id": image,
+                    "target": target,
+                    "mode": "interpolated-preview",
+                    "status": "missing-coverage",
+                }
+                if all(e in pairs and pairs[e]["status"] == "ready" for e in (4, 5)):
+                    a, b = pairs[4], pairs[5]
+                    size_key = (
+                        "bits_per_pixel" if image == "pooled" else "encoded_bytes"
                     )
-                    ax.annotate(
-                        f"e{row['effort']}",
-                        (row["bits_per_pixel"], row["throughput_mp_s"]),
-                        xytext=offsets[(row["effort"] - 1) % len(offsets)],
-                        textcoords="offset points",
-                        fontsize=9,
-                        color=color,
+                    time_ratio = (
+                        a["throughput_mp_s"] / b["throughput_mp_s"]
+                        if image == "pooled"
+                        else b["elapsed_ms"] / a["elapsed_ms"]
                     )
-            edge = sorted(frontier(ready), key=lambda r: r["bits_per_pixel"])
-            ax.plot(
-                [r["bits_per_pixel"] for r in edge],
-                [r["throughput_mp_s"] for r in edge],
-                "--",
-                color="#333333",
-                lw=1.2,
-                zorder=0,
-            )
-        else:
-            ax.text(
-                0.5,
-                0.5,
-                "No complete matched-quality points",
-                ha="center",
-                transform=ax.transAxes,
-            )
-        missing = [
-            f"e{r['effort']} ({r['ready_count']}/{r['image_count']})"
-            for r in entries
-            if r["status"] != "ready"
-        ]
-        if missing:
-            ax.text(
-                0.02,
-                0.02,
-                "Missing: " + ", ".join(missing),
-                fontsize=8,
-                transform=ax.transAxes,
-                wrap=True,
-            )
-        count = entries[0]["image_count"] if entries else 0
-        tolerance = entries[0].get("tolerance", 0.5) if entries else 0.5
-        resolution = {
-            "kodak_0_4mp": "Kodak (0.39 MP)",
-            "clic_1_8_to_3_4mp": "CLIC test (~2.8 MP)",
-        }.get(panel[1], panel[1].replace("_", " "))
-        quality_label = (
-            f"target {panel[2]:g} (estimated)"
-            if mode == "preview"
-            else f"{panel[2]:g} ±{tolerance:g}"
-        )
-        ax.set_title(
-            f"{resolution}\nfast-ssim2 {quality_label} · {count} images", fontsize=11
-        )
-        ax.set(
-            xlabel="Compressed size (bits/original pixel)",
-            ylabel="Complete encode throughput (MP/s)",
-        )
-        ax.set_yscale("log")
-        ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:g}"))
-        ax.yaxis.set_minor_formatter(plt.NullFormatter())
-        ax.grid(True, alpha=0.2)
-        ax.margins(x=0.18, y=0.22)
-    for ax in list(axes.flat)[len(panels) :]:
-        ax.set_visible(False)
-    label = "INTERPOLATED PREVIEW" if mode == "preview" else "MEASURED"
-    fig.suptitle(
-        f"{label}: matched-quality speed–compression\nUpper-left is better", fontsize=14
-    )
-    if any(r.get("provisional_timing") for r in points):
-        fig.text(
-            0.99,
-            0.01,
-            "Preview includes incomplete source timing repetitions",
-            ha="right",
-            fontsize=8,
-            color="#8c510a",
-        )
-    fig.legend(
-        handles=[
-            Line2D([], [], color="#2065ac", label="libjxl: effort order"),
-            Line2D(
-                [], [], color="#333333", linestyle="--", label="Nondominated frontier"
-            ),
-        ],
-        loc="outside lower center",
-        ncols=2,
-    )
-    return fig
+                    out.update(
+                        status="ready",
+                        e5_size_change_percent=100 * (b[size_key] / a[size_key] - 1),
+                        e5_encode_time_ratio=time_ratio,
+                        provisional_timing=a.get("provisional_timing", False)
+                        or b.get("provisional_timing", False),
+                    )
+                output.append(out)
+    return output
 
 
-def plot_curves(scores, config):
-    import matplotlib.pyplot as plt
-
-    images = config["images"]
-    fig, axes = plt.subplots(
-        math.ceil(len(images) / 3),
-        min(3, len(images)),
-        squeeze=False,
-        figsize=(5 * min(3, len(images)), 3.8 * math.ceil(len(images) / 3)),
-        layout="constrained",
-    )
-    for ax, image in zip(axes.flat, images):
-        for effort in config["efforts"]:
-            rows = sorted(
-                [
-                    r
-                    for r in scores
-                    if r["image_id"] == image["image_id"] and r["effort"] == effort
-                ],
-                key=lambda r: r["distance"],
-            )
-            ax.plot(
-                [8 * r["encoded_bytes"] / r["pixels"] for r in rows],
-                [r["score"] for r in rows],
-                ".-",
-                label=f"e{effort}",
-                lw=0.9,
-            )
-        for target in config["targets"]:
-            ax.axhline(target, color="gray", ls=":", lw=0.7)
-        ax.set(
-            title=image["image_id"],
-            xlabel="bits/original pixel",
-            ylabel="fast-ssim2 score",
-        )
-        ax.grid(True, alpha=0.2)
-    for ax in list(axes.flat)[len(images) :]:
-        ax.set_visible(False)
-    fig.legend(
-        *axes.flat[0].get_legend_handles_labels(), loc="outside lower center", ncols=10
-    )
-    fig.suptitle(
-        "Measured rate–quality samples (lines are diagnostic, not accepted interpolation)"
-    )
-    return fig
-
-
-def summarize(run, config, modes=("preview", "measured"), render=True):
-    import matplotlib
-
-    if "ipykernel" not in sys.modules:
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+def summarize(run, config, modes=("preview", "measured"), compare_run=None):
+    """Export CSV/JSON summaries; never import or invoke plotting code."""
     summary = run / "summary"
     summary.mkdir(exist_ok=True)
     totals = {}
     for mode in modes:
+        if mode == "measured" and config.get("preview_only"):
+            continue
         rows = per_image_rows(run, config, mode)
         points = aggregate_points(rows)
         write_csv(summary / f"{mode}-matches.csv", rows)
@@ -1131,38 +1131,64 @@ def summarize(run, config, modes=("preview", "measured"), render=True):
             "ready_points": sum(r["status"] == "ready" for r in points),
             "total_points": len(points),
         }
-        if render:
-            fig = plot_pareto(points, mode)
-            for ext in ("png", "svg"):
-                fig.savefig(summary / f"pareto-{mode}.{ext}", dpi=160)
-            plt.close(fig)
     scores = read_records(run, "scores", config)
     write_csv(summary / "quality-scores.csv", scores)
-    if render:
-        fig = plot_curves(scores, config)
-        for ext in ("png", "svg"):
-            fig.savefig(summary / f"rate-quality-diagnostics.{ext}", dpi=140)
-        plt.close(fig)
     write_json(summary / "coverage.json", totals)
+    if compare_run is not None:
+        studies = comparison_studies(run, compare_run)
+        write_csv(summary / "effort4-vs5-preview.csv", effort_comparison_rows(studies))
     print(json.dumps(totals, indent=2))
     return totals
 
 
-def notebook_figures(run):
-    """Pure read/plot entrypoint: no collectors, binaries, or CSV regeneration."""
-    run = Path(run)
-    if not (run / "metadata.json").is_file():
-        print(
-            f"No quality-study data at {run}; collection is never started by this notebook."
-        )
-        return {}
-    config = load_config(run)
-    figures = {}
-    for mode in ("preview", "measured"):
-        rows = per_image_rows(run, config, mode)
-        points = aggregate_points(rows)
-        figures["pareto-" + mode] = plot_pareto(points, mode)
-    return figures
+def collect_full_run(run, config, budget):
+    """Effort-major scoring -> calibration -> matched-output timing, resumable."""
+    require_encoding_allowed(config)
+    for effort in sorted(config["measurement_efforts"]):
+        for name, collector in (
+            ("score", collect_scores),
+            ("calibrate", collect_calibration),
+            ("measure", collect_measurements),
+        ):
+            budget.check()
+            append(
+                run / "execution-events.jsonl",
+                {"event": "phase_started", "phase": name, "effort": effort},
+            )
+            print(f"phase effort={effort} {name}", flush=True)
+            collector(run, config, budget, efforts={effort})
+            append(
+                run / "execution-events.jsonl",
+                {"event": "phase_completed", "phase": name, "effort": effort},
+            )
+            # Publish partial data summaries after each phase.
+            summarize(run, config)
+            write_json(run / "progress.json", run_completion(run, config))
+
+
+def run_completion(run, config):
+    outcomes = {r["match_id"]: r for r in read_records(run, "calibration", config)}
+    measurements = read_records(run, "measurements", config)
+    expected = (
+        len(config["images"])
+        * len(config["measurement_efforts"])
+        * len(config["targets"])
+    )
+    matched = sum(r["status"] == "matched" for r in outcomes.values())
+    samples = collections.Counter(r["match_id"] for r in measurements)
+    complete = sum(
+        r["status"] == "matched" and samples[key] == config["repetitions"]
+        for key, r in outcomes.items()
+    )
+    return {
+        "expected_matches": expected,
+        "calibration_outcomes": len(outcomes),
+        "matched": matched,
+        "unmatched": len(outcomes) - matched,
+        "timed_matches": complete,
+        "timing_samples": len(measurements),
+        "complete": matched == expected and complete == expected,
+    }
 
 
 def parse_args(argv=None):
@@ -1174,33 +1200,62 @@ def parse_args(argv=None):
     init.add_argument("--tuples", type=Path, required=True)
     init.add_argument("--source-run", type=Path, required=True)
     init.add_argument("--scorer", type=Path, required=True)
+    init.add_argument("--metric", choices=METRICS, default="fast-ssim2")
+    init.add_argument("--intensity-target", type=float, default=80.0)
     selection = init.add_mutually_exclusive_group(required=True)
     selection.add_argument("--pilot", action="store_true")
     selection.add_argument("--images", help="comma-separated exact corpus IDs")
     init.add_argument(
-        "--targets", type=lambda s: numbers(s, float), default=[60.0, 70.0, 85.0]
+        "--targets",
+        type=lambda s: numbers(s, float),
     )
-    init.add_argument("--tolerance", type=float, default=0.5)
+    init.add_argument("--tolerance", type=float)
     init.add_argument("--measurement-efforts", type=numbers, default=[3, 5, 7])
     init.add_argument("--max-evaluations", type=int, default=12)
     init.add_argument("--timeout", type=float, default=300)
-    for name in ("score", "calibrate", "measure", "pilot", "preview", "summarize"):
+    init.add_argument("--minimum-distance", type=float, default=0.55)
+    init.add_argument("--maximum-distance", type=float, default=15.266666666667)
+    for name in (
+        "score",
+        "calibrate",
+        "measure",
+        "pilot",
+        "run",
+        "preview",
+        "summarize",
+    ):
         p = sub.add_parser(name)
         p.add_argument("--run", type=Path, required=True)
         p.add_argument("--dry-run", action="store_true")
-        if name in ("score", "calibrate", "measure", "pilot"):
+        if name in ("preview", "summarize"):
+            p.add_argument(
+                "--compare-run",
+                type=Path,
+                help="saved alternative-metric run for e4/e5 diagnostics",
+            )
+        if name in ("score", "calibrate", "measure", "pilot", "run"):
             p.add_argument(
                 "--budget-seconds", type=float, default=900 if name == "pilot" else None
             )
             p.add_argument("--max-jobs", type=int)
     args = parser.parse_args(argv)
     args.run = args.run.resolve()
+    if args.command == "init":
+        if args.targets is None:
+            args.targets = (
+                [1.0, 2.0, 3.0] if args.metric == "butteraugli" else [60.0, 70.0, 85.0]
+            )
+        if args.tolerance is None:
+            args.tolerance = 0.05 if args.metric == "butteraugli" else 0.5
+        if args.metric == "butteraugli" and min(args.targets) < 0:
+            parser.error("Butteraugli targets must be nonnegative")
     for key in (
         "tolerance",
         "timeout",
         "budget_seconds",
         "max_jobs",
         "max_evaluations",
+        "intensity_target",
     ):
         value = getattr(args, key, None)
         if value is not None and (not math.isfinite(value) or value <= 0):
@@ -1209,6 +1264,10 @@ def parse_args(argv=None):
         range(1, 11)
     ):
         parser.error("Efforts must be 1-10")
+    if args.command == "init" and not (
+        0 < args.minimum_distance < args.maximum_distance <= 25
+    ):
+        parser.error("Distance bounds must satisfy 0 < minimum < maximum <= 25")
     if args.command == "init" and args.pilot and args.measurement_efforts != [3, 5, 7]:
         parser.error("The bounded pilot only calibrates efforts 3,5,7")
     return args
@@ -1219,8 +1278,10 @@ def main(argv=None):
     if args.command == "init":
         initialize(args)
         return 0
-    collecting = args.command in ("score", "calibrate", "measure", "pilot")
+    collecting = args.command in ("score", "calibrate", "measure", "pilot", "run")
     config = load_config(args.run, verify=collecting and not args.dry_run)
+    if args.command in ("calibrate", "measure", "pilot", "run"):
+        require_encoding_allowed(config)
     if args.command == "pilot" and not config["pilot"]:
         raise StudyError("pilot requires a --pilot configuration")
     if args.dry_run:
@@ -1252,6 +1313,7 @@ def main(argv=None):
                 args.run,
                 config,
                 ("preview",) if args.command == "preview" else ("preview", "measured"),
+                compare_run=args.compare_run,
             )
             return 0
         # Don't overlap new timing with the existing sweep.
@@ -1265,6 +1327,16 @@ def main(argv=None):
             )
         budget = Budget(args.budget_seconds, args.max_jobs)
         start, status = time.monotonic(), "complete"
+        write_json(
+            args.run / "runner.json",
+            {
+                "pid": os.getpid(),
+                "pgid": os.getpgrp(),
+                "started_at": utc(),
+                "command": args.command,
+                "state": "running",
+            },
+        )
         append(
             args.run / "execution-events.jsonl",
             {"event": "collection_started", "command": args.command},
@@ -1280,6 +1352,7 @@ def main(argv=None):
                     "score": collect_scores,
                     "calibrate": collect_calibration,
                     "measure": collect_measurements,
+                    "run": collect_full_run,
                 }[command](args.run, config, budget)
         except (BudgetExpired, subprocess.TimeoutExpired):
             status = "budget-or-timeout"
@@ -1291,6 +1364,14 @@ def main(argv=None):
             status = "error"
             raise
         finally:
+            if args.command == "run":
+                report = run_completion(args.run, config)
+                write_json(args.run / "progress.json", report)
+                if status == "complete" and not report["complete"]:
+                    status = "incomplete-targets"
+                    print(
+                        "Pass finished, but some targets remain unmatched; see progress.json."
+                    )
             append(
                 args.run / "execution-events.jsonl",
                 {
@@ -1299,6 +1380,16 @@ def main(argv=None):
                     "status": status,
                     "active_seconds": time.monotonic() - start,
                     "completed_jobs": budget.completed,
+                },
+            )
+            write_json(
+                args.run / "runner.json",
+                {
+                    "pid": os.getpid(),
+                    "pgid": os.getpgrp(),
+                    "stopped_at": utc(),
+                    "command": args.command,
+                    "state": status,
                 },
             )
         if args.command == "pilot":

@@ -94,6 +94,19 @@ SAVE_FORMATS = ("png", "svg")
 QUALITY_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_QUALITY_RUN",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-full-20260908",
+    )
+).expanduser()
+BUTTERAUGLI_RUN = pathlib.Path(
+    os.environ.get(
+        "CJXL_BUTTERAUGLI_RUN",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-butteraugli-pilot-20260908",
+    )
+).expanduser()
+# Keep the two-metric comparison on the same three-image pilot cohort.
+BUTTERAUGLI_COMPARE_RUN = pathlib.Path(
+    os.environ.get(
+        "CJXL_BUTTERAUGLI_COMPARE_RUN",
         "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-pilot-20260908",
     )
 ).expanduser()
@@ -895,6 +908,8 @@ def parse_args(argv=None):
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--quality-run", type=pathlib.Path,
                         help="optional saved quality study; never starts collection")
+    parser.add_argument("--butteraugli-run", type=pathlib.Path,
+                        help="optional saved Butteraugli preview; compare with --quality-run")
     args = parser.parse_args(argv)
     if args.expected_timing_samples < 1:
         parser.error("--expected-timing-samples must be positive")
@@ -919,17 +934,347 @@ def main(argv=None):
     )
     if args.quality_run:
         generate_quality_figures(args.quality_run, args.output_dir, args.formats, args.show)
+    if args.butteraugli_run:
+        generate_quality_figures(args.butteraugli_run, args.output_dir, args.formats,
+                                 args.show, compare_run=args.quality_run, prefix="butteraugli-")
     return 0
 
 
-# %%
-def generate_quality_figures(run, output_dir, formats=SAVE_FORMATS, show=False):
-    """Load the sibling quality module without launching any external programs."""
-    import importlib.util
+# %% [markdown]
+# ## Quality-study drawing functions
+#
+# Pareto, rate-quality, and metric-comparison plots live here alongside the
+# runtime and stage plots. The quality script supplies saved-data loading and
+# aggregation only; rendering never starts collection.
 
-    if not (pathlib.Path(run) / "metadata.json").is_file():
-        print("No saved matched-quality study at %s; skipping Pareto plots." % run)
+# %%
+# Presentation labels are independent of the collector's metric implementation.
+QUALITY_METRICS = {
+    "fast-ssim2": {"label": "fast-ssim2", "higher_is_better": True},
+    "butteraugli": {"label": "Butteraugli distance", "higher_is_better": False},
+}
+
+
+def quality_metric_name(config):
+    name = config.get("metric", "fast-ssim2")
+    if name not in QUALITY_METRICS:
+        raise ValueError(f"Unknown metric: {name}")
+    return name
+
+
+def frontier(points):
+    return [
+        p
+        for p in points
+        if not any(
+            q["bits_per_pixel"] <= p["bits_per_pixel"]
+            and q["throughput_mp_s"] >= p["throughput_mp_s"]
+            and (
+                q["bits_per_pixel"] < p["bits_per_pixel"]
+                or q["throughput_mp_s"] > p["throughput_mp_s"]
+            )
+            for q in points
+        )
+    ]
+
+
+def plot_pareto(points, mode):
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.ticker import LogLocator, FuncFormatter
+
+    metrics = {quality_metric_name(r) for r in points}
+    if len(metrics) > 1:
+        raise ValueError(
+            "Plot each metric separately; their scales are not interchangeable"
+        )
+    label_metric = QUALITY_METRICS[next(iter(metrics), "fast-ssim2")]["label"]
+    panels = sorted({(r["corpus"], r["resolution_class"], r["target"]) for r in points})
+    fig, axes = plt.subplots(
+        max(1, math.ceil(len(panels) / 3)),
+        min(3, max(1, len(panels))),
+        figsize=(
+            5.4 * min(3, max(1, len(panels))),
+            4.4 * max(1, math.ceil(len(panels) / 3)),
+        ),
+        squeeze=False,
+        layout="constrained",
+    )
+    markers = ["o", "s", "^", "D", "v", "P", "X", "<", ">", "h"]
+    for ax, panel in zip(axes.flat, panels):
+        entries = [
+            r
+            for r in points
+            if (r["corpus"], r["resolution_class"], r["target"]) == panel
+        ]
+        ready = [r for r in entries if r["status"] == "ready"]
+        if ready:
+            if len({tuple(sorted(r["cohort"])) for r in ready}) != 1:
+                raise ValueError("Plot points have different cohorts")
+            for encoder in sorted({r["encoder"] for r in ready}):
+                line = sorted(
+                    [r for r in ready if r["encoder"] == encoder],
+                    key=lambda r: r["effort"],
+                )
+                color = "#2065ac" if encoder == "libjxl" else "#d55e00"
+                # Missing efforts break the connecting line.
+                all_efforts = sorted(
+                    r["effort"] for r in entries if r["encoder"] == encoder
+                )
+                lookup = {r["effort"]: r for r in line}
+                ax.plot(
+                    [
+                        lookup[e]["bits_per_pixel"] if e in lookup else math.nan
+                        for e in all_efforts
+                    ],
+                    [
+                        lookup[e]["throughput_mp_s"] if e in lookup else math.nan
+                        for e in all_efforts
+                    ],
+                    color=color,
+                    alpha=0.45,
+                    lw=1,
+                )
+                offsets = [
+                    (6, 10),
+                    (6, -15),
+                    (6, 10),
+                    (6, -15),
+                    (6, 10),
+                    (12, -18),
+                    (-22, 14),
+                    (-26, -14),
+                    (-26, 10),
+                    (8, -23),
+                ]
+                for row in line:
+                    ax.plot(
+                        row["bits_per_pixel"],
+                        row["throughput_mp_s"],
+                        marker=markers[(row["effort"] - 1) % len(markers)],
+                        ms=8,
+                        markerfacecolor="white" if mode == "preview" else color,
+                        markeredgecolor=color,
+                        linestyle="none",
+                    )
+                    ax.annotate(
+                        f"e{row['effort']}",
+                        (row["bits_per_pixel"], row["throughput_mp_s"]),
+                        xytext=offsets[(row["effort"] - 1) % len(offsets)],
+                        textcoords="offset points",
+                        arrowprops={"arrowstyle": "-", "lw": 0.5, "color": color},
+                        fontsize=9,
+                        color=color,
+                    )
+            edge = sorted(frontier(ready), key=lambda r: r["bits_per_pixel"])
+            ax.plot(
+                [r["bits_per_pixel"] for r in edge],
+                [r["throughput_mp_s"] for r in edge],
+                "--",
+                color="#333333",
+                lw=1.2,
+                zorder=0,
+            )
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No complete matched-quality points",
+                ha="center",
+                transform=ax.transAxes,
+            )
+        missing = [
+            f"e{r['effort']} ({r['ready_count']}/{r['image_count']})"
+            for r in entries
+            if r["status"] != "ready"
+        ]
+        if missing:
+            ax.text(
+                0.98,
+                0.98,
+                "Missing: " + ", ".join(missing),
+                fontsize=8,
+                transform=ax.transAxes,
+                wrap=True,
+                ha="right",
+                va="top",
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
+            )
+        count = entries[0]["image_count"] if entries else 0
+        tolerance = entries[0].get("tolerance", 0.5) if entries else 0.5
+        resolution = {
+            "kodak_0_4mp": "Kodak (0.39 MP)",
+            "clic_1_8_to_3_4mp": "CLIC test (~2.8 MP)",
+        }.get(panel[1], panel[1].replace("_", " "))
+        quality_label = (
+            f"target {panel[2]:g} (estimated)"
+            if mode == "preview"
+            else f"{panel[2]:g} ±{tolerance:g}"
+        )
+        ax.set_title(
+            f"{resolution}\n{label_metric} {quality_label} · {count} images",
+            fontsize=11,
+        )
+        ax.set(
+            xlabel="Compressed size (bits/original pixel)",
+            ylabel="Complete encode throughput (MP/s)",
+        )
+        ax.set_yscale("log")
+        ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:g}"))
+        ax.yaxis.set_minor_formatter(plt.NullFormatter())
+        ax.grid(True, alpha=0.2)
+        ax.margins(x=0.18, y=0.22)
+    for ax in list(axes.flat)[len(panels) :]:
+        ax.set_visible(False)
+    label = "INTERPOLATED PREVIEW" if mode == "preview" else "MEASURED"
+    fig.suptitle(
+        f"{label}: matched-quality speed–compression\nUpper-left is better", fontsize=14
+    )
+    if any(r.get("provisional_timing") for r in points):
+        fig.text(
+            0.99,
+            0.01,
+            "Preview includes incomplete source timing repetitions",
+            ha="right",
+            fontsize=8,
+            color="#8c510a",
+        )
+    fig.legend(
+        handles=[
+            Line2D([], [], color="#2065ac", label="libjxl: effort order"),
+            Line2D(
+                [], [], color="#333333", linestyle="--", label="Nondominated frontier"
+            ),
+        ],
+        loc="outside lower center",
+        ncols=2,
+    )
+    return fig
+
+
+# %%
+def plot_curves(scores, config):
+    import matplotlib.pyplot as plt
+
+    images = config["images"]
+    fig, axes = plt.subplots(
+        math.ceil(len(images) / 3),
+        min(3, len(images)),
+        squeeze=False,
+        figsize=(5 * min(3, len(images)), 3.8 * math.ceil(len(images) / 3)),
+        layout="constrained",
+    )
+    for ax, image in zip(axes.flat, images):
+        for effort in config["efforts"]:
+            rows = sorted(
+                [
+                    r
+                    for r in scores
+                    if r["image_id"] == image["image_id"] and r["effort"] == effort
+                ],
+                key=lambda r: r["distance"],
+            )
+            ax.plot(
+                [8 * r["encoded_bytes"] / r["pixels"] for r in rows],
+                [r["score"] for r in rows],
+                ".-",
+                label=f"e{effort}",
+                lw=0.9,
+            )
+        for target in config["targets"]:
+            ax.axhline(target, color="gray", ls=":", lw=0.7)
+        ax.set(
+            title=image["image_id"],
+            xlabel="bits/original pixel",
+            ylabel=QUALITY_METRICS[quality_metric_name(config)]["label"]
+            + (
+                " (higher is better)"
+                if QUALITY_METRICS[quality_metric_name(config)]["higher_is_better"]
+                else " (lower is better)"
+            ),
+        )
+        ax.grid(True, alpha=0.2)
+    for ax in list(axes.flat)[len(images) :]:
+        ax.set_visible(False)
+    fig.legend(
+        *axes.flat[0].get_legend_handles_labels(), loc="outside lower center", ncols=10
+    )
+    fig.suptitle(
+        "Measured rate–quality samples (lines are diagnostic, not accepted interpolation)"
+    )
+    return fig
+
+
+# %%
+def plot_effort_comparison(studies):
+    import matplotlib.pyplot as plt
+
+    images = studies[0][1]["images"]
+    fig, axes = plt.subplots(
+        len(studies),
+        len(images),
+        squeeze=False,
+        figsize=(4.7 * len(images), 3.6 * len(studies)),
+        sharex="col",
+        layout="constrained",
+    )
+    for row_index, (_, config, scores) in enumerate(studies):
+        info = QUALITY_METRICS[quality_metric_name(config)]
+        for ax, image in zip(axes[row_index], images):
+            count = 0
+            for effort, color, marker in ((4, "#2065ac", "o"), (5, "#d55e00", "v")):
+                rows = sorted(
+                    (
+                        r
+                        for r in scores
+                        if r["image_id"] == image["image_id"] and r["effort"] == effort
+                    ),
+                    key=lambda r: r["distance"],
+                )
+                count += len(rows)
+                # Show observations, breaking lines at the internal resampling boundary.
+                for resampling in (1, 2):
+                    segment = [r for r in rows if r["resampling"] == resampling]
+                    ax.plot(
+                        [8 * r["encoded_bytes"] / r["pixels"] for r in segment],
+                        [r["score"] for r in segment],
+                        color=color,
+                        marker=marker,
+                        linestyle="-" if effort == 4 else "--",
+                        ms=4,
+                        lw=1.2,
+                        label=f"e{effort}" if resampling == 1 else None,
+                    )
+            direction = (
+                "higher is better" if info["higher_is_better"] else "lower is better"
+            )
+            ax.set(
+                title=f"{image['image_id']} · {count} scored outputs",
+                xlabel="Compressed size (bits/original pixel)",
+                ylabel=f"{info['label']}\n({direction})",
+            )
+            ax.grid(True, alpha=0.2)
+            ax.legend()
+    fig.suptitle(
+        "e4 versus e5 under two metrics\n"
+        "Identical retained encodes; lines are diagnostic, not calibrated matches",
+        fontsize=13,
+    )
+    return fig
+
+
+# %%
+def notebook_figures(run, compare_run=None):
+    """Pure read/plot entrypoint: no collectors, binaries, or CSV regeneration."""
+    run = pathlib.Path(run)
+    if not (run / "metadata.json").is_file():
+        print(
+            f"No quality-study data at {run}; collection is never started by this notebook."
+        )
         return {}
+    import importlib
+
     candidates = []
     if "__file__" in globals():
         candidates.append(pathlib.Path(__file__).resolve().parent)
@@ -942,14 +1287,35 @@ def generate_quality_figures(run, output_dir, formats=SAVE_FORMATS, show=False):
     )
     if source is None:
         raise FileNotFoundError(
-            "Open Jupyter within the libjxl checkout so the quality plotting module can be found."
+            "Open Jupyter within the libjxl checkout so the quality data helpers can be found."
         )
-    spec = importlib.util.spec_from_file_location("cjxl_quality_characterization", source)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    figures = module.notebook_figures(run)
+    # Jupyter may start in the checkout root rather than tools/scripts.
+    sys.path.insert(0, str(source.parent))
+    try:
+        study = importlib.import_module("cjxl_quality_characterization")
+    finally:
+        sys.path.pop(0)
+    config = study.load_config(run)
+    figures = {}
+    for mode in ("preview",) if config.get("preview_only") else ("preview", "measured"):
+        rows = study.per_image_rows(run, config, mode)
+        points = study.aggregate_points(rows)
+        figures["pareto-" + mode] = plot_pareto(points, mode)
+    scores = study.read_records(run, "scores", config)
+    figures["rate-quality-diagnostics"] = plot_curves(scores, config)
+    if compare_run is not None:
+        studies = study.comparison_studies(run, compare_run)
+        figures["effort4-vs5-metrics"] = plot_effort_comparison(studies)
+    return figures
+
+
+# %%
+def generate_quality_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
+                             compare_run=None, prefix=""):
+    """Draw saved quality studies using the plotting functions above."""
+    figures = notebook_figures(run, compare_run=compare_run)
     for name, figure in figures.items():
-        save_figure(figure, pathlib.Path(output_dir), name, formats)
+        save_figure(figure, pathlib.Path(output_dir), prefix + name, formats)
     if show:
         plt.show()
     else:
@@ -995,11 +1361,49 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # Filled markers require a verified score and five independent timing samples.
 # Each point uses the same image cohort; unavailable efforts are identified.
 # Dashed lines identify the nondominated frontier, not the effort-order curve.
+# A separate per-image rate-quality diagnostic shows all scored baseline points,
+# including intervals rejected by preview interpolation. Its lines are not
+# calibrated matches. All figures are saved under OUTPUT_DIR.
 #
 # This cell only reads saved results and generates plots. It never decodes,
 # scores, calibrates, or encodes. Missing measured data is shown explicitly.
 # See doc/runtime-quality.md for opt-in collection and resume commands.
+#
+# The default now reads the paused full 65-image study (2026-09-09).
+# Efforts 1–8 have completed timing rounds, with some unresolved quality targets.
+# Effort 9 calibration is complete, but its timing rounds are only partial;
+# effort 10 has not started. Incomplete efforts are not plotted as measured
+# points, and unresolved images are never silently dropped from a cohort.
 
 # %%
 if __name__ == "__main__" and "ipykernel" in sys.modules:
     quality_figures = generate_quality_figures(QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True)
+
+
+# %% [markdown]
+# ## 8. Butteraugli preview and metric sensitivity
+#
+# This separate study rescores the same retained encodes with libjxl Butteraugli
+# at 80 nits, explicitly interpreting our PFM inputs as linear sRGB. The primary
+# score is conventional Butteraugli distance (lower is better), not its 3-norm
+# auxiliary output and not the encoder's requested distance.
+#
+# All Butteraugli Pareto points are interpolated previews. The targets are on a
+# different scale from fast-ssim2; panels across metrics are not equivalent
+# perceptual-quality levels. Per-image e4/e5 curves compare the same codestreams
+# under both metrics. Lines are diagnostic and break at the resampling boundary.
+# A ranking reversal suggests metric sensitivity, not a universal quality winner.
+# Separate per-image rate-quality diagnostics show the saved Butteraugli scores.
+#
+# Only saved results are read. No calibration, scoring or encoding is launched.
+# The Butteraugli section remains a three-image pilot. Its metric comparison
+# uses BUTTERAUGLI_COMPARE_RUN, not the full-corpus SSIMU2 study above.
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules:
+    butteraugli_figures = generate_quality_figures(
+        BUTTERAUGLI_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        compare_run=(BUTTERAUGLI_COMPARE_RUN
+                     if (BUTTERAUGLI_COMPARE_RUN / "metadata.json").is_file() else None),
+        prefix="butteraugli-",
+    )
