@@ -225,6 +225,31 @@ saving PNG/SVG files in `OUTPUT_DIR` (or `--output-dir` in its script form).
 
 The notebook accepts QUALITY_RUN or the CJXL_QUALITY_RUN environment variable.
 Its script form accepts --quality-run RUN alongside the normal timing CSV.
+`generate_quality_figures()` now draws speed–compression and optional metric
+comparison figures; rate–quality diagnostics run in separate notebook cells.
+Set `RATE_QUALITY_SOURCE` to `"sweep"` or `"calibrated"` (the notebook default).
+The standalone plotting entry point can also be called independently:
+
+```python
+generate_rate_quality_figures(QUALITY_RUN, OUTPUT_DIR, source="sweep", show=True)
+generate_rate_quality_figures(QUALITY_RUN, OUTPUT_DIR, source="calibrated", show=True)
+generate_rate_quality_figures(
+    QUALITY_RUN, OUTPUT_DIR, source="calibrated", view="target-error", show=True
+)
+```
+
+Sweep mode reads original Q10–Q95 observations from `scores.jsonl`. Calibrated
+mode reads the latest outcome per match ID from `calibration.jsonl`, without
+requiring completed timing rounds or plotting intermediate probes. Circles mark
+accepted matches; crosses mark unresolved selected samples. Outcomes with no
+selected score and targets still pending are counted explicitly. Target bands
+show the configured tolerance; the error view plots measured score minus target
+for each image and effort. These diagnostics do not establish timing readiness.
+Rate–quality lines connect samples from the same effort (in target order for
+calibrated results). They are visual guides, not validated interpolation.
+Outputs have distinct names: `rate-quality-sweep`, `rate-quality-calibrated`,
+and `target-error-calibrated`. All modes read saved data only.
+
 Edit the notebook Python source first, then derive/execute its Jupyter form:
 
     jupytext --to ipynb --execute tools/scripts/cjxl_runtime_characterization_notebook.py

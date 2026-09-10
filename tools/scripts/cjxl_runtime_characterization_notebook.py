@@ -92,6 +92,7 @@ OUTPUT_DIR = pathlib.Path(
 EXPECTED_TIMING_SAMPLES = 5
 SAVE_FORMATS = ("png", "svg")
 DEBUG_STAGE_BREAKDOWN_BY_QUALITY = False
+RATE_QUALITY_SOURCE = "calibrated"  # "sweep" or "calibrated"
 QUALITY_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_QUALITY_RUN",
@@ -1179,10 +1180,13 @@ def plot_pareto(points, mode):
 
 
 # %%
-def plot_curves(scores, config):
+def plot_curves(scores, config, source="sweep"):
     import matplotlib.pyplot as plt
 
     images = config["images"]
+    efforts = config["efforts"] if source == "sweep" else config["measurement_efforts"]
+    colors = {e: plt.get_cmap("tab10")((e - 1) % 10) for e in efforts}
+    tolerance = config.get("tolerance", 0.5)
     fig, axes = plt.subplots(
         math.ceil(len(images) / 3),
         min(3, len(images)),
@@ -1191,26 +1195,44 @@ def plot_curves(scores, config):
         layout="constrained",
     )
     for ax, image in zip(axes.flat, images):
-        for effort in config["efforts"]:
+        image_rows = [r for r in scores if r["image_id"] == image["image_id"]]
+        for effort in efforts:
             rows = sorted(
                 [
                     r
-                    for r in scores
-                    if r["image_id"] == image["image_id"] and r["effort"] == effort
+                    for r in image_rows
+                    if r["effort"] == effort and r.get("bits_per_pixel") is not None
                 ],
-                key=lambda r: r["distance"],
+                key=lambda r: r["distance"] if source == "sweep" else r["target"],
             )
-            ax.plot(
-                [8 * r["encoded_bytes"] / r["pixels"] for r in rows],
-                [r["score"] for r in rows],
-                ".-",
-                label=f"e{effort}",
-                lw=0.9,
-            )
+            if source == "sweep":
+                ax.plot(
+                    [r["bits_per_pixel"] for r in rows],
+                    [r["score"] for r in rows],
+                    ".-", color=colors[effort], lw=0.9,
+                )
+            else:
+                ax.plot(
+                    [r["bits_per_pixel"] for r in rows],
+                    [r["score"] for r in rows],
+                    color=colors[effort], lw=0.9, zorder=1,
+                )
+                for accepted, marker in ((True, "o"), (False, "x")):
+                    points = [r for r in rows if r["accepted"] == accepted]
+                    ax.scatter(
+                        [r["bits_per_pixel"] for r in points],
+                        [r["score"] for r in points],
+                        marker=marker, color=colors[effort], s=20,
+                    )
         for target in config["targets"]:
             ax.axhline(target, color="gray", ls=":", lw=0.7)
+            if source == "calibrated":
+                ax.axhspan(target - tolerance, target + tolerance,
+                           color="gray", alpha=0.13)
+        if source == "sweep" and not any(r.get("bits_per_pixel") is not None for r in image_rows):
+            ax.text(0.5, 0.5, "No scored sweep samples", ha="center",
+                    transform=ax.transAxes)
         ax.set(
-            title=image["image_id"],
             xlabel="bits/original pixel",
             ylabel=QUALITY_METRICS[quality_metric_name(config)]["label"]
             + (
@@ -1219,16 +1241,75 @@ def plot_curves(scores, config):
                 else " (lower is better)"
             ),
         )
+        ax.set_title(image["image_id"] + ("\n" + calibration_coverage(image_rows)
+                     if source == "calibrated" else ""), fontsize=10)
         ax.grid(True, alpha=0.2)
     for ax in list(axes.flat)[len(images) :]:
         ax.set_visible(False)
-    fig.legend(
-        *axes.flat[0].get_legend_handles_labels(), loc="outside lower center", ncols=10
-    )
+    handles = [mlines.Line2D([], [], color=colors[e], marker="o", linestyle="-",
+                            label=f"e{e}") for e in efforts]
+    if source == "calibrated":
+        handles.extend(calibration_marker_legend())
+    fig.legend(handles=handles, loc="outside lower center", ncols=6)
     fig.suptitle(
-        "Measured rate–quality samples (lines are diagnostic, not accepted interpolation)"
+        "Original sweep: measured rate–quality samples\n"
+        "Lines are diagnostic, not accepted interpolation"
+        if source == "sweep" else
+        "Calibrated rate–quality samples\n"
+        f"Target bands: ±{tolerance:g}; lines are diagnostic, not accepted interpolation"
     )
     return fig
+
+
+# %%
+def calibration_marker_legend():
+    return [
+        mlines.Line2D([], [], color="#333333", marker=marker, linestyle="none",
+                      label=label)
+        for marker, label in (("o", "Accepted match"), ("x", "Unresolved sample"))
+    ]
+
+
+def calibration_coverage(rows):
+    accepted = sum(r["accepted"] for r in rows)
+    pending = sum(r["status"] == "pending" for r in rows)
+    unresolved = len(rows) - accepted - pending
+    unscored = sum(r["score_error"] is None and r["status"] != "pending" for r in rows)
+    return (f"{accepted}/{len(rows)} matched · {unresolved} unresolved · {pending} pending"
+            + (f"\n{unscored} unresolved without a selected score" if unscored else ""))
+
+
+def plot_calibration_error(rows, config):
+    targets = config["targets"]
+    efforts = config["measurement_efforts"]
+    tolerance = config.get("tolerance", 0.5)
+    figure, axes = subplot_grid(len(targets), columns=min(3, len(targets)),
+                                width=5.4, height=4.3)
+    # Deterministic horizontal offsets keep individual images visible.
+    offsets = dict(zip((i["image_id"] for i in config["images"]),
+                       np.linspace(-0.22, 0.22, len(config["images"]))
+                       if len(config["images"]) > 1 else [0.0]))
+    for axis, target in zip(axes, targets):
+        subset = [r for r in rows if r["target"] == target]
+        axis.axhspan(-tolerance, tolerance, color="gray", alpha=0.13)
+        axis.axhline(0, color="gray", ls=":", lw=0.8)
+        for effort in efforts:
+            for accepted, marker in ((True, "o"), (False, "x")):
+                points = [r for r in subset if r["effort"] == effort
+                          and r["score_error"] is not None and r["accepted"] == accepted]
+                axis.scatter(
+                    [effort + offsets[r["image_id"]] for r in points],
+                    [r["score_error"] for r in points], marker=marker,
+                    color=plt.get_cmap("tab10")((effort - 1) % 10), s=18, alpha=0.7,
+                )
+        axis.set(xlabel="Effort", ylabel="Measured score − target",
+                 xticks=efforts, xlim=(min(efforts) - 0.5, max(efforts) + 0.5))
+        axis.set_title(f"Target {target:g}\n" + calibration_coverage(subset), fontsize=10)
+    figure.legend(handles=calibration_marker_legend(), loc="outside lower center", ncols=2)
+    metric = QUALITY_METRICS[quality_metric_name(config)]["label"]
+    figure.suptitle(f"{metric} calibration error · tolerance ±{tolerance:g}\n"
+                   "One point per image and effort; timing completion is not required")
+    return figure
 
 
 # %%
@@ -1333,9 +1414,6 @@ def notebook_figures(run, compare_run=None):
         rows = study.per_image_rows(run, config, mode)
         points = study.aggregate_points(rows)
         figures["pareto-" + mode] = plot_pareto(points, mode)
-    if config.get("preview_available", True):
-        scores = study.read_records(run, "scores", config)
-        figures["rate-quality-diagnostics"] = plot_curves(scores, config)
     if compare_run is not None:
         studies = study.comparison_studies(run, compare_run)
         figures["effort4-vs5-metrics"] = plot_effort_comparison(studies)
@@ -1345,7 +1423,7 @@ def notebook_figures(run, compare_run=None):
 # %%
 def generate_quality_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
                              compare_run=None, prefix=""):
-    """Draw saved quality studies using the plotting functions above."""
+    """Draw speed–compression and optional metric-comparison figures only."""
     figures = notebook_figures(run, compare_run=compare_run)
     for name, figure in figures.items():
         save_figure(figure, pathlib.Path(output_dir), prefix + name, formats)
@@ -1355,6 +1433,70 @@ def generate_quality_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
         for figure in figures.values():
             plt.close(figure)
     return figures
+
+
+# %%
+def rate_quality_samples(run, config, source="sweep"):
+    """Select saved observations, independently of runtime measurement readiness."""
+    if source not in ("sweep", "calibrated"):
+        raise ValueError("source must be 'sweep' or 'calibrated'")
+    study = load_quality_helpers()
+    if source == "sweep":
+        rows = study.read_records(run, "scores", config)
+    else:
+        latest = {r["match_id"]: r for r in study.read_records(run, "calibration", config)}
+        rows = []
+        for image in config["images"]:
+            for effort in config["measurement_efforts"]:
+                for target in config["targets"]:
+                    key = study.match_key(image["image_id"], effort, target)
+                    rows.append(latest.get(key, {
+                        "match_id": key, "image_id": image["image_id"],
+                        "effort": effort, "target": target, "status": "pending",
+                    }))
+    result = []
+    for original in rows:
+        row = dict(original)
+        score = row.get("score")
+        scored = score is not None and math.isfinite(score)
+        pixels, size = row.get("pixels"), row.get("encoded_bytes")
+        row["bits_per_pixel"] = (
+            8 * size / pixels if scored and pixels is not None and pixels > 0
+            and size is not None and size > 0 and math.isfinite(size / pixels) else None
+        )
+        if source == "calibrated":
+            row["score_error"] = score - row["target"] if scored else None
+            row["accepted"] = (row["status"] == "matched" and scored
+                               and abs(row["score_error"]) <= config.get("tolerance", 0.5))
+        result.append(row)
+    return result
+
+
+def generate_rate_quality_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
+                                  source="sweep", view="rate-quality", prefix=""):
+    """Draw saved sweep or calibration observations without collecting data."""
+    if source not in ("sweep", "calibrated"):
+        raise ValueError("source must be 'sweep' or 'calibrated'")
+    if view not in ("rate-quality", "target-error"):
+        raise ValueError("view must be 'rate-quality' or 'target-error'")
+    if view == "target-error" and source != "calibrated":
+        raise ValueError("target-error view requires source='calibrated'")
+    run = pathlib.Path(run)
+    if not (run / "metadata.json").is_file():
+        print(f"No saved quality-study data at {run}; skipping rate–quality diagnostics.")
+        return {}
+    configure_style()
+    config = load_quality_helpers().load_config(run)
+    rows = rate_quality_samples(run, config, source)
+    figure = (plot_curves(rows, config, source) if view == "rate-quality"
+              else plot_calibration_error(rows, config))
+    name = f"{view}-{source}"
+    save_figure(figure, output_dir, prefix + name, formats)
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return {name: figure}
 
 
 # %%
@@ -1455,9 +1597,8 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
 # Filled markers require a verified score and five independent timing samples.
 # Each point uses the same image cohort; unavailable efforts are identified.
 # Dashed lines identify the nondominated frontier, not the effort-order curve.
-# A separate per-image rate-quality diagnostic shows all scored baseline points,
-# including intervals rejected by preview interpolation. Its lines are not
-# calibrated matches. All figures are saved under OUTPUT_DIR.
+# Rate-quality diagnostics are generated independently in the following cells.
+# All figures are saved under OUTPUT_DIR.
 #
 # This cell only reads saved results and generates plots. It never decodes,
 # scores, calibrates, or encodes. Missing measured data is shown explicitly.
@@ -1475,6 +1616,45 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 
 
 # %% [markdown]
+# ### Rate–quality diagnostics: sweep or calibrated results
+#
+# Set `RATE_QUALITY_SOURCE` to `"sweep"` for the original Q10–Q95 sweep, or
+# `"calibrated"` for the latest outcome at each image/effort/quality target.
+# This cell runs independently of the speed–compression cell above.
+# Lines connect samples within each effort and do not certify valid interpolation.
+# Calibrated samples are connected in target order, with target ± tolerance
+# bands. Circles are accepted matches; crosses are unresolved selected samples.
+# Unresolved outcomes without a selected score and pending targets are counted
+# in each panel. Calibration points do not require completed runtime measurements.
+# Only saved records are read; outputs use separate source-specific filenames.
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules:
+    rate_quality_figures = generate_rate_quality_figures(
+        QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True, source=RATE_QUALITY_SOURCE,
+    )
+
+
+# %% [markdown]
+# ### Calibration proximity to targets
+#
+# In calibrated mode this companion view plots `measured score - target` for
+# each image and effort. The shaded band is the configured acceptance tolerance.
+# Horizontal offsets separate images, not fractional efforts. Missing and
+# unresolved cases remain in the coverage counts even when no dot can be drawn.
+# Call `generate_rate_quality_figures(..., source="calibrated", view="target-error")`
+# directly to run this view independently of the selected rate-quality mode.
+
+# %%
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and RATE_QUALITY_SOURCE == "calibrated"):
+    calibration_error_figures = generate_rate_quality_figures(
+        QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        source="calibrated", view="target-error",
+    )
+
+
+# %% [markdown]
 # ## 8. Butteraugli preview and metric sensitivity
 #
 # This separate study rescores the same retained encodes with libjxl Butteraugli
@@ -1487,7 +1667,7 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # perceptual-quality levels. Per-image e4/e5 curves compare the same codestreams
 # under both metrics. Lines are diagnostic and break at the resampling boundary.
 # A ranking reversal suggests metric sensitivity, not a universal quality winner.
-# Separate per-image rate-quality diagnostics show the saved Butteraugli scores.
+# The following independent diagnostic cell shows the saved Butteraugli sweep scores.
 #
 # Only saved results are read. No calibration, scoring or encoding is launched.
 # The Butteraugli section remains a three-image pilot. Its metric comparison
@@ -1500,6 +1680,14 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         compare_run=(BUTTERAUGLI_COMPARE_RUN
                      if (BUTTERAUGLI_COMPARE_RUN / "metadata.json").is_file() else None),
         prefix="butteraugli-",
+    )
+
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules:
+    butteraugli_rate_quality_figures = generate_rate_quality_figures(
+        BUTTERAUGLI_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        source="sweep", prefix="butteraugli-",
     )
 
 
