@@ -26,6 +26,7 @@
 #   "matplotlib>=3.8,<4",
 #   "numpy>=1.26,<3",
 #   "pandas>=2.2,<3",
+#   "scipy>=1.13,<2",
 # ]
 # ///
 
@@ -128,6 +129,13 @@ BUTTERAUGLI_COMPARE_RUN = pathlib.Path(
         "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-pilot-20260908",
     )
 ).expanduser()
+
+# BD-rate is independent of the matched-quality Pareto and rate-quality plots.
+BD_RATE_QUALITY_RANGE = (75.0, 85.0)
+BD_RATE_BASELINE = ("libjxl", 7)
+BD_RATE_EFFORTS = None  # None reads every configured effort; incomplete points are omitted.
+BD_RATE_IMAGE_IDS = None  # None preserves the baseline study's full image cohort.
+BD_RATE_COMPARE_RUN = GJXL_FIXED_RUN  # Set to None for libjxl only.
 
 
 # %% [markdown]
@@ -1566,6 +1574,182 @@ def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
     return {name: figure}
 
 
+# %% [markdown]
+# ## BD-rate drawing functions
+#
+# Each marker summarizes an effort over the same measured score interval.
+# BD-rate is calculated per image before averaging. The x-axis averages
+# complete-call times interpolated on a common score grid. It is an estimate
+# from the saved fixed sweep, not an additional matched-quality measurement.
+
+# %%
+def load_bd_rate_helpers():
+    import importlib
+
+    source = pathlib.Path(load_quality_helpers().__file__).resolve().parent
+    sys.path.insert(0, str(source))
+    try:
+        return importlib.import_module("cjxl_bd_rate")
+    finally:
+        sys.path.pop(0)
+
+
+def plot_bd_rate(report, by_resolution=False):
+    """Draw only complete fixed-cohort points, in effort order, with coverage."""
+    points = report["points"]
+    if by_resolution:
+        available = {point["scope"] for point in points} - {"all"}
+        scopes = ([scope for scope in RESOLUTION_NAMES if scope in available]
+                  + sorted(available - RESOLUTION_NAMES.keys()))
+        figure, axes = subplot_grid(len(scopes), columns=min(3, len(scopes)),
+                                    width=5.5, height=4.4)
+    else:
+        scopes = ["all"]
+        figure, axis = plt.subplots(figsize=(10, 6.4), layout="constrained")
+        axes = [axis]
+    colors = {"libjxl": "#4477AA", "gjxl": "#CC6677"}
+    labels = {"libjxl": "libjxl", "gjxl": "GJXL (Metal)"}
+    baseline = report["baseline"]
+    annotations = []
+    for axis, scope in zip(axes, scopes):
+        group = [point for point in points if point["scope"] == scope]
+        coverage = []
+        for encoder in dict.fromkeys(source["encoder"] for source in report["sources"]):
+            selected = sorted((point for point in group if point["encoder"] == encoder),
+                              key=lambda point: point["effort"])
+            complete = [point for point in selected if point["status"] == "ready"]
+            # NaNs break the effort curve at missing settings; no implicit bridge.
+            axis.plot(
+                [point.get("mean_encode_ms", math.nan) if point["status"] == "ready"
+                 else math.nan for point in selected],
+                [point.get("bd_rate_pchip", math.nan) if point["status"] == "ready"
+                 else math.nan for point in selected],
+                "o-", color=colors[encoder], label=labels[encoder], lw=1.6, ms=5,
+            )
+            if complete:
+                axis.vlines(
+                    [point["mean_encode_ms"] for point in complete],
+                    [min(point["bd_rate_pchip"], point["bd_rate_akima"]) for point in complete],
+                    [max(point["bd_rate_pchip"], point["bd_rate_akima"]) for point in complete],
+                    color=colors[encoder], alpha=0.4, lw=5,
+                )
+            # Identical encoder policies can make adjacent effort labels coincide.
+            clusters = []
+            for point in complete:
+                if (clusters and abs(math.log(point["mean_encode_ms"]
+                                              / clusters[-1][0]["mean_encode_ms"])) < 0.08
+                        and abs(point["bd_rate_pchip"] - clusters[-1][0]["bd_rate_pchip"]) < 0.04):
+                    clusters[-1].append(point)
+                else:
+                    clusters.append([point])
+            for cluster in clusters:
+                x = math.exp(np.mean([math.log(point["mean_encode_ms"]) for point in cluster]))
+                y = np.mean([point["bd_rate_pchip"] for point in cluster])
+                label = axis.annotate(
+                    "e" + ",".join(str(point["effort"]) for point in cluster),
+                    (x, y), xytext=(0, 9 if encoder == "libjxl" else -16),
+                    textcoords="offset points", ha="center", color=colors[encoder], fontsize=8,
+                    arrowprops={"arrowstyle": "-", "color": colors[encoder],
+                                "lw": 0.5, "alpha": 0.5},
+                )
+                label.set_in_layout(False)
+                annotations.append((label, 1 if encoder == "libjxl" else -1))
+            missing = [f"e{point['effort']} ({point['ready_count']}/{point['image_count']})"
+                       for point in selected if point["status"] != "ready"]
+            if missing:
+                coverage.append(
+                    labels[encoder] + " omitted: " + ", ".join(missing)
+                    if len(missing) <= 3 else
+                    f"{labels[encoder]}: {len(complete)}/{len(selected)} efforts complete (see report)"
+                )
+        title = "All images" if scope == "all" else RESOLUTION_NAMES.get(scope, scope)
+        axis.set_title(f"{title} · {group[0]['image_count']} images", fontsize=11)
+        axis.axhline(0, color="#60666C", lw=0.8, zorder=0)
+        axis.set(xscale="log", xlabel="Mean encode time (ms, interpolated)",
+                 ylabel=f"BD-rate vs {baseline['encoder']} e{baseline['effort']} (%)")
+        axis.margins(x=0.14, y=0.23)
+        axis.grid(True, alpha=0.25)
+        if not any(point["status"] == "ready" for point in group):
+            axis.set(xlim=(1, 10), ylim=(-1, 1))
+            axis.text(0.5, 0.5, "No complete points for this interval and cohort",
+                      ha="center", transform=axis.transAxes, fontsize=9)
+        axis.text(0, -0.23, "\n".join(coverage) if coverage else "All selected efforts complete",
+                  transform=axis.transAxes, va="top", fontsize=7, color="#60666C", wrap=True)
+    handles, legend_labels = axes[0].get_legend_handles_labels()
+    figure.legend(handles, legend_labels, loc="outside lower center", ncols=2)
+    low, high = report["quality_range"]
+    figure.suptitle(
+        f"Speed vs. compression efficiency · SSIMU2 {low:g}–{high:g}\n"
+        "Equal-image mean BD-rate; lower-left is better\n"
+        "PCHIP; vertical spans show Akima sensitivity, not confidence intervals",
+        fontsize=12,
+    )
+    # Resolve label collisions in display coordinates, including across encoders.
+    # Keep leaders for displaced labels so tightly spaced efforts remain readable.
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    occupied = {axis: [] for axis in axes}
+    for label, direction in annotations:
+        original = label.get_position()
+        for level in range(6):
+            placed = False
+            for horizontal in (0, -14, 14, -28, 28):
+                label.set_position((horizontal, original[1] + direction * 12 * level))
+                # Text extent excludes the leader line when checking collisions.
+                box = matplotlib.text.Text.get_window_extent(label, renderer).padded(2)
+                inside = label.axes.get_window_extent(renderer)
+                if (inside.contains(box.x0, box.y0) and inside.contains(box.x1, box.y1)
+                        and not any(box.overlaps(other) for other in occupied[label.axes])):
+                    placed = True
+                    break
+            if placed:
+                break
+        occupied[label.axes].append(box)
+        label.arrow_patch.set_visible(label.get_position() != original)
+    return figure
+
+
+def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
+                             compare_run=None, baseline_encoder="libjxl", baseline_effort=7,
+                             quality_range=(75, 85), efforts=None, image_ids=None):
+    """Generate independent saved-sweep plots and a per-image JSON coverage report."""
+    import json
+
+    runs = [run] + ([compare_run] if compare_run is not None else [])
+    helper = load_bd_rate_helpers()
+    report = helper.analyze(
+        helper.load_studies(runs), baseline_encoder, baseline_effort,
+        quality_range, efforts, image_ids,
+    )
+    configure_style()
+    figures = {
+        "speed-bd-rate": plot_bd_rate(report),
+        "speed-bd-rate-by-resolution": plot_bd_rate(report, by_resolution=True),
+    }
+    for name, figure in figures.items():
+        save_figure(figure, output_dir, name, formats)
+    output_dir = pathlib.Path(output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "speed-bd-rate-report.json"
+    report_path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    for source in report["sources"]:
+        points = [point for point in report["points"]
+                  if point["scope"] == "all" and point["encoder"] == source["encoder"]]
+        ready = [str(point["effort"]) for point in points if point["status"] == "ready"]
+        print(f"BD-rate {source['encoder']}: complete efforts {', '.join(ready) or 'none'}")
+        for point in points:
+            if point["status"] != "ready":
+                print(f"  e{point['effort']}: {point['ready_count']}/{point['image_count']} images; "
+                      f"{point['missing_reasons']}")
+    print(f"BD-rate per-image results, coverage, and method sensitivity: {report_path}")
+    if show:
+        plt.show()
+    else:
+        for figure in figures.values():
+            plt.close(figure)
+    return figures
+
+
 # %%
 if __name__ == "__main__" and "ipykernel" not in sys.modules:
     raise SystemExit(main())
@@ -1651,6 +1835,45 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
 # %%
 if __name__ == "__main__" and "ipykernel" in sys.modules:
     quality_figures = generate_quality_figures(QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True)
+
+
+# %% [markdown]
+# ### Speed versus BD-rate
+#
+# This independent section reads the original fixed-sweep scores and saved
+# timing repetitions. `BD_RATE_COMPARE_RUN = None` selects libjxl alone; its
+# default adds GJXL's fixed sweep. Change `BD_RATE_BASELINE`,
+# `BD_RATE_QUALITY_RANGE`, `BD_RATE_EFFORTS`, or `BD_RATE_IMAGE_IDS` above.
+#
+# Each effort is compared with the baseline on the same raw measured SSIMU2
+# interval (default 75–85), integrating log(bytes) per image with PCHIP and
+# checking Akima sensitivity. Negative BD-rate means fewer bytes. Images
+# receive equal weight; resolution panels keep their own fixed manifest cohort.
+# Q10's resampled libjxl points are excluded. Reversals, insufficient supporting
+# points, missing quality brackets, and incomplete timing are reported, never
+# extrapolated or silently removed from an effort's cohort.
+#
+# X is the mean warm complete-call time in ms: each fixed-sweep timing is the
+# median of the configured repetitions, log-linearly interpolated on 101
+# evenly spaced scores, then averaged over that grid and the images. It is
+# an interpolation estimate. Startup, file I/O, decoding, and scoring are
+# excluded. Libjxl uses 8 workers; GJXL uses a CPU participant cap of 8 + Metal.
+# This plot neither needs nor initiates another calibration or benchmark run.
+#
+# Outputs: `speed-bd-rate`, `speed-bd-rate-by-resolution` in `SAVE_FORMATS`,
+# plus `speed-bd-rate-report.json` with per-image values, coverage reasons,
+# configuration/ledger identities, and PCHIP–Akima differences. Method
+# sensitivity is not a confidence interval or a bound on interpolation error.
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules:
+    bd_rate_figures = generate_bd_rate_figures(
+        QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        compare_run=BD_RATE_COMPARE_RUN,
+        baseline_encoder=BD_RATE_BASELINE[0], baseline_effort=BD_RATE_BASELINE[1],
+        quality_range=BD_RATE_QUALITY_RANGE, efforts=BD_RATE_EFFORTS,
+        image_ids=BD_RATE_IMAGE_IDS,
+    )
 
 
 # %% [markdown]

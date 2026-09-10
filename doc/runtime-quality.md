@@ -12,6 +12,66 @@ runtime, and stage plots—live directly in
 CLI exports data only and never imports the notebook or plotting dependencies.
 The notebook imports the CLI's saved-data helpers, not the other way around.
 
+## Speed versus BD-rate
+
+The independent **Speed versus BD-rate** notebook cell reads the fixed-sweep
+scores and saved timing ledgers. It does not start encoding, decoding, scoring,
+calibration, or profiling. Its defaults compare libjxl and the GJXL fixed sweep
+against libjxl effort 7 on measured fast-ssim2 scores 75–85. Set
+`BD_RATE_COMPARE_RUN = None` for libjxl alone. `BD_RATE_BASELINE`,
+`BD_RATE_QUALITY_RANGE`, `BD_RATE_EFFORTS`, and `BD_RATE_IMAGE_IDS` control the
+reference setting, score interval, efforts, and explicit image cohort.
+
+The notebook function can also be called independently:
+
+```python
+bd_rate_figures = generate_bd_rate_figures(
+    QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+    compare_run=GJXL_FIXED_RUN,  # or None
+    baseline_encoder="libjxl", baseline_effort=7,
+    quality_range=(75, 85), efforts=None, image_ids=None,
+)
+```
+
+`cjxl_bd_rate.py` provides the saved-data analysis and reusable numerical
+`bd_rate()` function. SciPy is declared in the notebook's script dependencies;
+the collection CLI retains its standard-library-only dependency boundary.
+
+For each image, PCHIP interpolates **log(encoded bytes)** against the **raw
+measured fast-ssim2 score**. The difference from the baseline is integrated over
+the explicit interval, divided by the interval width, exponentiated, and
+reported as a percentage. Negative is smaller. Per-image BD percentages are
+averaged with equal image weights; no rate–quality curve is fitted to pooled
+images. Akima is computed over the same interval as a sensitivity diagnostic.
+Vertical spans in the plot show the PCHIP–Akima difference, not a confidence
+interval or an accuracy bound. The score interval is never automatically
+shortened or extrapolated to make a curve fit.
+
+Only unresampled points are used, excluding libjxl's Q10 transition. Curves
+need at least four finite, strictly increasing rate/score pairs in encoder
+distance order. Reversals, duplicate distances, and missing brackets are
+reported as unavailable. Arbitrary quality ranges can legitimately leave no
+complete aggregate points; the diagnostic report identifies why.
+
+The x-axis is an **interpolated mean complete-encode time in milliseconds**.
+Saved repetitions first give a median per image/setting. Log time is linearly
+interpolated on 101 evenly spaced scores in the same interval; times in ms are
+averaged over that grid and then over the images. Every retained unresampled
+curve point must have the configured number of timing repetitions. A missing
+image invalidates that effort's aggregate, without silently reducing its
+cohort. Each resolution panel uses its own fixed manifest cohort. Timing
+ledgers are joined to scores by codestream and configuration identity, so
+finishing timing repetitions does not require rescoring the retained outputs.
+These are warm complete calls, excluding startup, file I/O, decoding, and
+scoring. Libjxl's 8 workers and GJXL's CPU participant cap of 8 plus Metal have
+different thread semantics.
+
+The cell saves `speed-bd-rate` and `speed-bd-rate-by-resolution` in
+`SAVE_FORMATS`, plus `speed-bd-rate-report.json`. The report retains per-image
+BD values, aggregate coverage/reasons, interpolation differences, the explicit
+cohort and interval, and configuration/ledger identities. Rate-only results
+remain in the report when timing is incomplete, but do not become plot markers.
+
 ## GJXL matched-quality comparison
 
 The collector also supports `--encoder gjxl`. It uses a separate run directory
