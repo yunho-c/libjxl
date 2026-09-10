@@ -12,6 +12,87 @@ runtime, and stage plots—live directly in
 CLI exports data only and never imports the notebook or plotting dependencies.
 The notebook imports the CLI's saved-data helpers, not the other way around.
 
+## GJXL matched-quality comparison
+
+The collector also supports `--encoder gjxl`. It uses a separate run directory
+and calibrates directly from newly scored probes; it does not require an
+original GJXL quality sweep. GJXL interpolated previews are not generated.
+Its measured results use the same external fast-ssim2 adapter, pinned decoder,
+reference PFM bytes, target scores, and tolerance as the libjxl study.
+
+Build `gjxl_quality_benchmark` in the GJXL checkout with
+`-DCMAKE_BUILD_TYPE=Release -DGJXL_BUILD_BENCHMARKS=ON`. The harness links the
+production embedded Metal shaders and forces fully-resident Metal, default
+density, automatic effort-driven compression, and no optional final-score pass.
+It rejects backend fallback and inconsistent codestreams. Initialization copies
+the standalone harness into the run and records its SHA-256, build/cache and
+shader hashes, source-file hashes, dirty diff, revision, and submodule state in
+`encoder-build.json`. Existing libjxl snapshots are never rewritten.
+
+Example bounded four-image pilot, run from the libjxl checkout:
+
+```sh
+python3.13 tools/scripts/cjxl_quality_characterization.py init \
+  --encoder gjxl \
+  --run ../libjxl-runtime-study-2026-09-03/quality-gjxl-pilot-20260909 \
+  --corpus ../libjxl-runtime-study-2026-09-03/corpus/corpus.json \
+  --source-run ../libjxl-runtime-study-2026-09-03/run-e8ff0976 \
+  --scorer tools/scripts/quality_metric/target/release/cjxl-quality-metric \
+  --benchmark ../gjxl-metal-kernel-dataflow/build/quality-study/gjxl_quality_benchmark \
+  --gjxl-source ../gjxl-metal-kernel-dataflow \
+  --images kodak/01,kodak/02,kodak/03,unsplash/campus_interior/12mp \
+  --measurement-efforts 3,5,7 --minimum-distance 0.01 --maximum-distance 25 \
+  --max-evaluations 24 --timeout 1800
+
+caffeinate -i -m -s python3.13 -u \
+  ../libjxl-runtime-study-2026-09-03/quality-gjxl-pilot-20260909/collector.py run \
+  --run ../libjxl-runtime-study-2026-09-03/quality-gjxl-pilot-20260909 \
+  --budget-seconds 1800 --check-warmups
+```
+
+Here `--source-run` identifies the original **libjxl** build record, solely to
+pin the common decoder and its runtime dependencies; no GJXL source tuples are
+needed. Direct search reuses prior probes and preserves unresolved targets.
+Each accepted setting retains a named codestream and five independent timing
+samples. Stopping and rerunning the frozen command resumes completed work.
+Budgets apply per invocation; do not automatically renew them or overlap either
+encoder's collection with other benchmark work.
+
+The GJXL timer surrounds the unprofiled **entire public encoding call**, not its
+internal `total_nanoseconds` field. PFM reading, process/Metal initialization,
+one validation encode, and one explicit warmup are untimed. CPU/GPU encoding,
+transfers, synchronization, and public-call teardown are included; file writes
+and external quality scoring are excluded. The harness's `--num-threads 8`
+means at most eight participating CPU threads, whereas the libjxl harness uses
+eight worker threads. These are documented resource settings, not identical
+thread-participation semantics. The GPU remains available to GJXL.
+
+Optional `--check-warmups` first performs a separate, resumable diagnostic on
+the first and largest selected images, at the highest selected effort and
+distance 1.2. It alternates one and three explicit warmups across five fresh
+process pairs, within the **same** collection budget. Results are stored in
+`warmup-checks.jsonl`, `warmup-check/`, and `warmup-check-summary.json`, never in
+the calibrated measurement ledger. A median difference over 5% flags review;
+it does not silently change the measurement protocol or establish causality.
+
+Set `GJXL_RUN` / `CJXL_GJXL_RUN` in the notebook, or pass `--gjxl-run` alongside
+`--quality-run` in its script form. The measured comparison uses GJXL's explicit
+manifest image cohort and effort selection in both encoders. It verifies metric,
+decoder, reference hashes, geometry, target/tolerance, and repetition/warmup
+compatibility. Incomplete images remain in the cohort. The resulting
+`pareto-measured-libjxl-vs-gjxl.png/svg` labels encoder curves and flags any saved
+warmup-sensitivity warning. It does not require equal requested distances or
+identical codestreams across encoders, and it never starts collection.
+
+The saved 2026-09-09 pilot completed in 268 seconds, including the warmup check:
+36/36 settings matched, 194 calibration probes, 180/180 timing measurements,
+and 20 separate warmup-check samples. The comparison has all 18 GJXL points;
+the paused libjxl baseline is missing the 12MP effort-5 target-60 point.
+Three versus one explicit warmups changed sentinel median time by -7.8% on
+Kodak 01 and -2.8% on the 12MP image. The Kodak result flags warmup sensitivity,
+so treat this as pilot evidence, not a settled corpus-wide speed comparison.
+The original libjxl ledgers remain unchanged and collection remains paused.
+
 ## Figure semantics
 
 Default targets are **fast-ssim2 60, 70 and 85, with ±0.5-point tolerance**.

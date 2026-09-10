@@ -40,6 +40,152 @@ METRICS = {
 }
 
 
+def encoder_name(config):
+    name = config.get("encoder", "libjxl")
+    if name not in ("libjxl", "gjxl"):
+        raise StudyError(f"Unknown encoder: {name}")
+    return name
+
+
+def initialize_gjxl(args, images):
+    """New GJXL study: independent probes, shared pinned decoder and metric."""
+    metadata_path = args.source_run / "metadata.json"
+    source_metadata = json.loads(metadata_path.read_text())
+    ordinary = source_metadata["configuration"]["build_records"]["ordinary"]["content"]
+    decoder = ordinary["binaries"]["djxl"]
+    verify_file(decoder["path"], decoder["sha256"])
+    files = {decoder["path"]: decoder["sha256"]}
+    for pattern in ("*.dylib", "*.so*"):
+        for library in (Path(ordinary["build"]) / "lib").glob(pattern):
+            if library.is_file():
+                files[str(library.resolve())] = digest(library)
+    scorer = args.scorer.resolve()
+    metric_version = json.loads(
+        subprocess.check_output([str(scorer), "--version"], text=True)
+    )
+    if metric_version.get("fast_ssim2_revision") != METRIC_REVISION:
+        raise StudyError("Use the pinned quality_metric adapter")
+    files[str(scorer)] = digest(scorer)
+    benchmark = args.benchmark.resolve()
+    version = json.loads(
+        subprocess.check_output([str(benchmark), "--version"], text=True)
+    )
+    source = args.gjxl_source.resolve()
+    revision = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+    ).strip()
+    if version != {
+        "encoder": "gjxl",
+        "schema_version": 1,
+        "revision": revision,
+        "shader_source": "embedded-production",
+    }:
+        raise StudyError("GJXL harness version does not match its source checkout")
+    # The harness uses embedded shaders and statically linked GJXL. Refuse an
+    # unexpected external runtime rather than silently lose it when snapshotting.
+    dependencies = subprocess.check_output(["otool", "-L", str(benchmark)], text=True)
+    if any(
+        not line.strip().startswith(("/usr/lib/", "/System/Library/"))
+        for line in dependencies.splitlines()[1:]
+    ):
+        raise StudyError(
+            "GJXL harness must use only embedded/static GJXL and system libraries"
+        )
+    tracked = (
+        subprocess.check_output(["git", "-C", str(source), "ls-files", "-z"])
+        .decode()
+        .split("\0")
+    )
+    tracked.append("benchmarks/quality_benchmark.cpp")
+    build_record = {
+        "revision": revision,
+        "source": str(source),
+        "source_hashes": {
+            name: digest(source / name)
+            for name in sorted(set(tracked))
+            if name and (source / name).is_file()
+        },
+        "source_diff": subprocess.check_output(
+            ["git", "-C", str(source), "diff", "HEAD", "--binary"], text=True
+        ),
+        "submodules": subprocess.check_output(
+            ["git", "-C", str(source), "submodule", "status", "--recursive"], text=True
+        ),
+        "original_benchmark": str(benchmark),
+        "benchmark_sha256": digest(benchmark),
+        "version": version,
+        "dependencies": dependencies,
+    }
+    for name in ("CMakeCache.txt", "metal/gjxl.metallib"):
+        artifact = benchmark.parent / name
+        if not artifact.is_file():
+            raise StudyError(f"Missing GJXL build provenance: {artifact}")
+        build_record[name] = {"path": str(artifact), "sha256": digest(artifact)}
+    if (
+        "CMAKE_BUILD_TYPE:STRING=Release"
+        not in (benchmark.parent / "CMakeCache.txt").read_text()
+    ):
+        raise StudyError("Use a Release GJXL harness")
+    for image in images:
+        if image["color_encoding"] != COLOR:
+            raise StudyError("Only canonical linear-sRGB PFM inputs are supported")
+        verify_file(image["pfm_path"], image["pfm_sha256"])
+    if args.run.exists():
+        raise StudyError("Run directory already exists; resume it instead")
+    args.run.mkdir(parents=True)
+    frozen = args.run / "gjxl_quality_benchmark"
+    shutil.copy2(benchmark, frozen)
+    verify_file(frozen, build_record["benchmark_sha256"])
+    files[str(frozen)] = build_record["benchmark_sha256"]
+    write_json(args.run / "encoder-build.json", build_record)
+    config = {
+        "schema_version": SCHEMA,
+        "encoder": "gjxl",
+        "metric": "fast-ssim2",
+        "metric_version": metric_version,
+        "preview_available": False,
+        "intensity_target": args.intensity_target,
+        "targets": args.targets,
+        "tolerance": args.tolerance,
+        "images": images,
+        "efforts": args.measurement_efforts,
+        "measurement_efforts": args.measurement_efforts,
+        "scorer": str(scorer),
+        "djxl": decoder["path"],
+        "benchmark": str(frozen),
+        "encoder_revision": revision,
+        "tool_hashes": files,
+        "encoder_build_sha256": digest(args.run / "encoder-build.json"),
+        "source_run": str(args.source_run.resolve()),
+        "source_metadata_sha256": digest(metadata_path),
+        "corpus_sha256": digest(args.corpus),
+        "num_threads": 8,
+        "thread_semantics": "maximum-participating-cpu-threads",
+        "backend": "metal",
+        "metal_aq_mode": "fully-resident",
+        "density": "default",
+        "compression": "automatic",
+        "collect_final_score": False,
+        "repetitions": 5,
+        "warmups": 1,
+        "seed": 20260908,
+        "minimum_distance": args.minimum_distance,
+        "maximum_distance": args.maximum_distance,
+        "max_evaluations": args.max_evaluations,
+        "timeout": args.timeout,
+        "pilot": args.pilot,
+        "collector_snapshot_sha256": digest(__file__),
+    }
+    config["configuration_id"] = identity(config)
+    (args.run / "collector.py").write_bytes(Path(__file__).read_bytes())
+    write_json(args.run / "metadata.json", config)
+    append(
+        args.run / "execution-events.jsonl",
+        {"event": "initialized", "configuration_id": config["configuration_id"]},
+    )
+    print(f"Initialized {args.run}: {len(images)} images; no collection started")
+
+
 def metric_name(config):
     # Backward-compatible with the original fast-ssim2 run/test fixtures.
     name = config.get("metric", "fast-ssim2")
@@ -330,6 +476,8 @@ def initialize(args):
             raise StudyError("Unknown image IDs")
     else:
         raise StudyError("Specify --pilot or an explicit --images list")
+    if args.encoder == "gjxl":
+        return initialize_gjxl(args, images)
     metadata_path = args.source_run / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
     ordinary = metadata["configuration"]["build_records"]["ordinary"]["content"]
@@ -443,7 +591,10 @@ def load_config(run, verify=False):
     identifier = expected.pop("configuration_id")
     if identity(expected) != identifier:
         raise StudyError("Configuration changed; initialize a separate run")
-    verify_file(run / "source-tuples.csv", config["tuple_snapshot_sha256"])
+    if encoder_name(config) == "libjxl":
+        verify_file(run / "source-tuples.csv", config["tuple_snapshot_sha256"])
+    else:
+        verify_file(run / "encoder-build.json", config["encoder_build_sha256"])
     if verify:
         if config.get("collector_snapshot_sha256"):
             verify_file(run / "collector.py", config["collector_snapshot_sha256"])
@@ -470,6 +621,8 @@ def read_records(run, name, config, verify=False):
             key = (row.get("match_id"), row.get("repetition"))
         elif name == "probes":
             key = (row.get("image_id"), row.get("effort"), row.get("distance"))
+        elif name == "warmup-checks":
+            key = (row.get("image_id"), row.get("warmups"), row.get("repetition"))
         if key is not None:
             if key in seen:
                 raise StudyError("Duplicate observation in " + name)
@@ -484,6 +637,8 @@ def save_record(run, name, config, row):
 
 
 def source_rows(run, config):
+    if encoder_name(config) == "gjxl":
+        return []
     with (run / "source-tuples.csv").open(newline="") as f:
         return [
             r
@@ -492,16 +647,19 @@ def source_rows(run, config):
         ]
 
 
-def base_row(image, effort, distance):
+def base_row(image, effort, distance, config=None):
+    encoder = encoder_name(config or {})
     return {
         **{key: image[key] for key in SOURCE_FIELDS},
-        "encoder": "libjxl",
+        "encoder": encoder,
         "pixels": image["width"] * image["height"],
         "effort": effort,
         "distance": distance,
         "reference_sha256": image["pfm_sha256"],
         # The frozen libjxl baseline automatically resamples at distance >= 10.
-        "resampling": None if distance is None else (2 if distance >= 10 else 1),
+        "resampling": None
+        if distance is None
+        else (2 if encoder == "libjxl" and distance >= 10 else 1),
     }
 
 
@@ -527,7 +685,9 @@ def collect_scores(run, config, budget, efforts=None):
                 budget.check()
                 verify_file(row["output_path"], row["output_sha256"])
                 result = {
-                    **base_row(image, int(row["effort"]), float(row["distance"])),
+                    **base_row(
+                        image, int(row["effort"]), float(row["distance"]), config
+                    ),
                     **scorer.score(row["output_path"]),
                     "source_job_id": row["job_id"],
                     "output_path": row["output_path"],
@@ -671,7 +831,8 @@ def harness(config, image, effort, distance, directory, run, budget, warmups):
         document.get("stage_profile_enabled")
         or document.get("schema_version") != 1
         or document.get("timing_semantics") != "complete-encode-wall-time"
-        or document.get("revision") != config["libjxl_revision"]
+        or document.get("revision")
+        != config.get("encoder_revision", config.get("libjxl_revision"))
         or document.get("thread_count") != config["num_threads"]
         or document.get("effort") != effort
         or document.get("input_width") != image["width"]
@@ -680,7 +841,32 @@ def harness(config, image, effort, distance, directory, run, budget, warmups):
         or len(document["samples"]) != 1
     ):
         raise StudyError("Unexpected uninstrumented harness schema/configuration")
+    if encoder_name(config) == "gjxl" and any(
+        document.get(key) != value
+        for key, value in {
+            "encoder": "gjxl",
+            "stage_profile_enabled": False,
+            "backend": "metal",
+            "metal_aq_mode": "fully-resident",
+            "density": "default",
+            "compression": "automatic",
+            "collect_final_score": False,
+            "thread_semantics": "maximum-participating-cpu-threads",
+            "resampling": 1,
+            "input_layout": "planar-linear-srgb-f32",
+            "validation_encodes": 1,
+            "warmups": warmups,
+            "sample_count": 1,
+        }.items()
+    ):
+        raise StudyError("Unexpected GJXL backend, policy or warmup protocol")
     sample = document["samples"][0]
+    if encoder_name(config) == "gjxl" and (
+        sample.get("sample_index") != 0
+        or type(sample.get("elapsed_nanoseconds")) is not int
+        or type(sample.get("encoded_bytes")) is not int
+    ):
+        raise StudyError("GJXL requires integer raw timing samples")
     if (
         sample["encoded_bytes"] != output.stat().st_size
         or sample["elapsed_nanoseconds"] <= 0
@@ -740,7 +926,7 @@ def collect_calibration(run, config, budget, efforts=None):
                                 0,
                             )
                             result = {
-                                **base_row(image, effort, distance),
+                                **base_row(image, effort, distance, config),
                                 **scorer.score(output),
                                 "output_sha256": digest(output),
                                 "output_path": str(destination),
@@ -870,7 +1056,7 @@ def per_image_rows(run, config, mode):
         for target in config["targets"]:
             for effort in efforts:
                 row = {
-                    **base_row(image, effort, None),
+                    **base_row(image, effort, None, config),
                     "mode": mode,
                     "target": target,
                     "metric": metric_name(config),
@@ -1014,6 +1200,61 @@ def aggregate_points(rows):
     return result
 
 
+def encoder_comparison_points(libjxl_run, gjxl_run, image_ids=None):
+    """Measured encoder comparison, not the identical-codestream metric study."""
+    runs = [Path(libjxl_run), Path(gjxl_run)]
+    configs = [load_config(run) for run in runs]
+    a, b = configs
+    if [encoder_name(config) for config in configs] != ["libjxl", "gjxl"]:
+        raise StudyError("Encoder comparison requires a libjxl run and a GJXL run")
+    if metric_name(a) != metric_name(b) or a["metric_version"] != b["metric_version"]:
+        raise StudyError("Encoder comparison requires the same metric implementation")
+    for key in (
+        "targets",
+        "tolerance",
+        "intensity_target",
+        "repetitions",
+        "warmups",
+        "num_threads",
+    ):
+        if a[key] != b[key]:
+            raise StudyError(f"Encoder comparison has incompatible {key}")
+    if a["tool_hashes"][a["djxl"]] != b["tool_hashes"][b["djxl"]]:
+        raise StudyError("Encoder comparison requires the same pinned decoder")
+    selected = (
+        list(image_ids)
+        if image_ids is not None
+        else [i["image_id"] for i in b["images"]]
+    )
+    if not selected or len(set(selected)) != len(selected):
+        raise StudyError("Select a nonempty, unique comparison cohort")
+    references = []
+    for config in configs:
+        images = {i["image_id"]: i for i in config["images"]}
+        if not set(selected) <= images.keys():
+            raise StudyError("Comparison cohort is absent from one of the runs")
+        references.append(
+            [
+                tuple(images[name][key] for key in (*SOURCE_FIELDS, "pfm_sha256"))
+                for name in selected
+            ]
+        )
+    if references[0] != references[1]:
+        raise StudyError("Encoder comparison reference hashes or geometry differ")
+    efforts = set(b["measurement_efforts"])
+    if not efforts <= set(a["measurement_efforts"]):
+        raise StudyError("Comparison efforts are absent from the libjxl study")
+    points = []
+    for run, config in zip(runs, configs):
+        rows = [
+            row
+            for row in per_image_rows(run, config, "measured")
+            if row["image_id"] in selected and row["effort"] in efforts
+        ]
+        points.extend(aggregate_points(rows))
+    return points
+
+
 def comparison_studies(run, compare_run):
     """Read-only comparison of the same references, encodes, and source timings."""
     studies = []
@@ -1119,6 +1360,8 @@ def summarize(run, config, modes=("preview", "measured"), compare_run=None):
     summary.mkdir(exist_ok=True)
     totals = {}
     for mode in modes:
+        if mode == "preview" and not config.get("preview_available", True):
+            continue
         if mode == "measured" and config.get("preview_only"):
             continue
         rows = per_image_rows(run, config, mode)
@@ -1141,15 +1384,101 @@ def summarize(run, config, modes=("preview", "measured"), compare_run=None):
     return totals
 
 
+def collect_warmup_check(run, config, budget):
+    """Opt-in sentinel study; never mixed with calibrated measurement records."""
+    if encoder_name(config) != "gjxl":
+        raise StudyError("The warmup check is currently a GJXL-only diagnostic")
+    images = config["images"]
+    sentinels = {images[0]["image_id"]: images[0]}
+    large = max(images, key=lambda image: image["width"] * image["height"])
+    sentinels[large["image_id"]] = large
+    effort, distance = max(config["measurement_efforts"]), 1.2
+    records = read_records(run, "warmup-checks", config, verify=True)
+    done = {(r["image_id"], r["warmups"], r["repetition"]) for r in records}
+    folder = run / "warmup-check"
+    folder.mkdir(exist_ok=True)
+    for repetition in range(5):
+        for image in sentinels.values():
+            for warmups in (1, 3) if repetition % 2 == 0 else (3, 1):
+                if (image["image_id"], warmups, repetition) in done:
+                    continue
+                budget.check()
+                with tempfile.TemporaryDirectory(prefix="gjxl-warmup-check-") as temp:
+                    output, raw, sample = harness(
+                        config,
+                        image,
+                        effort,
+                        distance,
+                        Path(temp),
+                        run,
+                        budget,
+                        warmups,
+                    )
+                    retained = folder / (identity(image["image_id"])[:16] + ".jxl")
+                    if retained.exists():
+                        verify_file(output, digest(retained))
+                    else:
+                        output.replace(retained)
+                    token = identity([image["image_id"], warmups, repetition])[:24]
+                    raw.replace(folder / (token + ".json"))
+                    row = dict(
+                        base_row(image, effort, distance, config),
+                        warmups=warmups,
+                        repetition=repetition,
+                        elapsed_ms=sample["elapsed_nanoseconds"] / 1e6,
+                        output_path=str(retained),
+                        output_sha256=digest(retained),
+                    )
+                    save_record(run, "warmup-checks", config, row)
+                    records.append(row)
+                    budget.completed += 1
+                    print(
+                        f"warmup-check {image['image_id']} warmups={warmups} repetition={repetition + 1}",
+                        flush=True,
+                    )
+    summary = []
+    for image_id in sentinels:
+        medians = {
+            warmups: statistics.median(
+                r["elapsed_ms"]
+                for r in records
+                if r["image_id"] == image_id and r["warmups"] == warmups
+            )
+            for warmups in (1, 3)
+        }
+        change = 100 * (medians[3] / medians[1] - 1)
+        summary.append(
+            dict(
+                image_id=image_id,
+                effort=effort,
+                distance=distance,
+                median_ms_by_warmups=medians,
+                three_vs_one_change_percent=change,
+                needs_review=abs(change) > 5,
+            )
+        )
+    write_json(
+        run / "warmup-check-summary.json",
+        {
+            "configuration_id": config["configuration_id"],
+            "results": summary,
+            "interpretation": "Separate 5-pair diagnostic; changes over 5% flag review, not an automatic protocol change.",
+        },
+    )
+
+
 def collect_full_run(run, config, budget):
     """Effort-major scoring -> calibration -> matched-output timing, resumable."""
     require_encoding_allowed(config)
     for effort in sorted(config["measurement_efforts"]):
-        for name, collector in (
+        phases = (
             ("score", collect_scores),
             ("calibrate", collect_calibration),
             ("measure", collect_measurements),
-        ):
+        )
+        for name, collector in phases:
+            if name == "score" and encoder_name(config) == "gjxl":
+                continue
             budget.check()
             append(
                 run / "execution-events.jsonl",
@@ -1197,7 +1526,14 @@ def parse_args(argv=None):
     init = sub.add_parser("init", help="freeze inputs/configuration; does not collect")
     init.add_argument("--run", type=Path, required=True)
     init.add_argument("--corpus", type=Path, required=True)
-    init.add_argument("--tuples", type=Path, required=True)
+    init.add_argument("--tuples", type=Path)
+    init.add_argument("--encoder", choices=("libjxl", "gjxl"), default="libjxl")
+    init.add_argument(
+        "--benchmark", type=Path, help="GJXL quality benchmark executable"
+    )
+    init.add_argument(
+        "--gjxl-source", type=Path, help="source checkout used for the GJXL build"
+    )
     init.add_argument("--source-run", type=Path, required=True)
     init.add_argument("--scorer", type=Path, required=True)
     init.add_argument("--metric", choices=METRICS, default="fast-ssim2")
@@ -1238,9 +1574,25 @@ def parse_args(argv=None):
                 "--budget-seconds", type=float, default=900 if name == "pilot" else None
             )
             p.add_argument("--max-jobs", type=int)
+        if name == "run":
+            p.add_argument(
+                "--check-warmups",
+                action="store_true",
+                help="GJXL-only: run a resumable sentinel warmup check within the same budget",
+            )
     args = parser.parse_args(argv)
     args.run = args.run.resolve()
     if args.command == "init":
+        if args.encoder == "libjxl" and args.tuples is None:
+            parser.error("libjxl init requires --tuples")
+        if args.encoder == "gjxl" and (
+            args.benchmark is None
+            or args.gjxl_source is None
+            or args.metric != "fast-ssim2"
+        ):
+            parser.error(
+                "GJXL init requires --benchmark, --gjxl-source and --metric fast-ssim2"
+            )
         if args.targets is None:
             args.targets = (
                 [1.0, 2.0, 3.0] if args.metric == "butteraugli" else [60.0, 70.0, 85.0]
@@ -1260,8 +1612,9 @@ def parse_args(argv=None):
         value = getattr(args, key, None)
         if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"--{key.replace('_', '-')} must be finite and positive")
-    if args.command == "init" and not set(args.measurement_efforts) <= set(
-        range(1, 11)
+    if args.command == "init" and (
+        not args.measurement_efforts
+        or not set(args.measurement_efforts) <= set(range(1, 11))
     ):
         parser.error("Efforts must be 1-10")
     if args.command == "init" and not (
@@ -1342,6 +1695,8 @@ def main(argv=None):
             {"event": "collection_started", "command": args.command},
         )
         try:
+            if getattr(args, "check_warmups", False):
+                collect_warmup_check(args.run, config, budget)
             commands = (
                 ("score", "calibrate", "measure")
                 if args.command == "pilot"

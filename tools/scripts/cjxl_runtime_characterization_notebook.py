@@ -97,6 +97,12 @@ QUALITY_RUN = pathlib.Path(
         "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-full-20260908",
     )
 ).expanduser()
+GJXL_RUN = pathlib.Path(
+    os.environ.get(
+        "CJXL_GJXL_RUN",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-pilot-20260909",
+    )
+).expanduser()
 BUTTERAUGLI_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_BUTTERAUGLI_RUN",
@@ -910,7 +916,11 @@ def parse_args(argv=None):
                         help="optional saved quality study; never starts collection")
     parser.add_argument("--butteraugli-run", type=pathlib.Path,
                         help="optional saved Butteraugli preview; compare with --quality-run")
+    parser.add_argument("--gjxl-run", type=pathlib.Path,
+                        help="optional saved GJXL study; compare with --quality-run")
     args = parser.parse_args(argv)
+    if args.gjxl_run and not args.quality_run:
+        parser.error("--gjxl-run requires --quality-run")
     if args.expected_timing_samples < 1:
         parser.error("--expected-timing-samples must be positive")
     args.formats = tuple(
@@ -937,6 +947,9 @@ def main(argv=None):
     if args.butteraugli_run:
         generate_quality_figures(args.butteraugli_run, args.output_dir, args.formats,
                                  args.show, compare_run=args.quality_run, prefix="butteraugli-")
+    if args.gjxl_run:
+        generate_encoder_comparison(args.quality_run, args.gjxl_run, args.output_dir,
+                                    args.formats, args.show)
     return 0
 
 
@@ -989,6 +1002,7 @@ def plot_pareto(points, mode):
             "Plot each metric separately; their scales are not interchangeable"
         )
     label_metric = QUALITY_METRICS[next(iter(metrics), "fast-ssim2")]["label"]
+    encoders = sorted({r["encoder"] for r in points})
     panels = sorted({(r["corpus"], r["resolution_class"], r["target"]) for r in points})
     fig, axes = plt.subplots(
         max(1, math.ceil(len(panels) / 3)),
@@ -1084,7 +1098,8 @@ def plot_pareto(points, mode):
                 transform=ax.transAxes,
             )
         missing = [
-            f"e{r['effort']} ({r['ready_count']}/{r['image_count']})"
+            (r["encoder"] + " " if len(encoders) > 1 else "")
+            + f"e{r['effort']} ({r['ready_count']}/{r['image_count']})"
             for r in entries
             if r["status"] != "ready"
         ]
@@ -1142,7 +1157,10 @@ def plot_pareto(points, mode):
         )
     fig.legend(
         handles=[
-            Line2D([], [], color="#2065ac", label="libjxl: effort order"),
+            *[Line2D([], [], color="#2065ac" if name == "libjxl" else "#d55e00",
+                     label=("libjxl: effort order" if name == "libjxl" else
+                            "gjxl (fully-resident Metal): effort order"))
+              for name in (encoders or ["libjxl"])],
             Line2D(
                 [], [], color="#333333", linestyle="--", label="Nondominated frontier"
             ),
@@ -1265,14 +1283,7 @@ def plot_effort_comparison(studies):
 
 
 # %%
-def notebook_figures(run, compare_run=None):
-    """Pure read/plot entrypoint: no collectors, binaries, or CSV regeneration."""
-    run = pathlib.Path(run)
-    if not (run / "metadata.json").is_file():
-        print(
-            f"No quality-study data at {run}; collection is never started by this notebook."
-        )
-        return {}
+def load_quality_helpers():
     import importlib
 
     candidates = []
@@ -1295,14 +1306,29 @@ def notebook_figures(run, compare_run=None):
         study = importlib.import_module("cjxl_quality_characterization")
     finally:
         sys.path.pop(0)
+    return study
+
+
+def notebook_figures(run, compare_run=None):
+    """Pure read/plot entrypoint: no collectors, binaries, or CSV regeneration."""
+    run = pathlib.Path(run)
+    if not (run / "metadata.json").is_file():
+        print(
+            f"No quality-study data at {run}; collection is never started by this notebook."
+        )
+        return {}
+    study = load_quality_helpers()
     config = study.load_config(run)
     figures = {}
-    for mode in ("preview",) if config.get("preview_only") else ("preview", "measured"):
+    modes = (("measured",) if not config.get("preview_available", True) else
+             ("preview",) if config.get("preview_only") else ("preview", "measured"))
+    for mode in modes:
         rows = study.per_image_rows(run, config, mode)
         points = study.aggregate_points(rows)
         figures["pareto-" + mode] = plot_pareto(points, mode)
-    scores = study.read_records(run, "scores", config)
-    figures["rate-quality-diagnostics"] = plot_curves(scores, config)
+    if config.get("preview_available", True):
+        scores = study.read_records(run, "scores", config)
+        figures["rate-quality-diagnostics"] = plot_curves(scores, config)
     if compare_run is not None:
         studies = study.comparison_studies(run, compare_run)
         figures["effort4-vs5-metrics"] = plot_effort_comparison(studies)
@@ -1322,6 +1348,38 @@ def generate_quality_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
         for figure in figures.values():
             plt.close(figure)
     return figures
+
+
+# %%
+def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
+                                formats=SAVE_FORMATS, show=False):
+    """Compare saved measured points on GJXL's explicit manifest cohort."""
+    if not (pathlib.Path(gjxl_run) / "metadata.json").is_file():
+        print("No saved GJXL study at %s; skipping encoder comparison." % gjxl_run)
+        return {}
+    study = load_quality_helpers()
+    points = study.encoder_comparison_points(libjxl_run, gjxl_run)
+    figure = plot_pareto(points, "measured")
+    warmup_report = pathlib.Path(gjxl_run) / "warmup-check-summary.json"
+    if warmup_report.is_file():
+        import json
+        if any(row["needs_review"] for row in json.loads(warmup_report.read_text())["results"]):
+            figure.suptitle(
+                "MEASURED PILOT: libjxl versus fully-resident Metal GJXL\n"
+                "Matched perceptual quality; upper-left is better\n"
+                "Warmup sensitivity flagged: consult warmup-check-summary.json",
+                fontsize=13,
+            )
+    figure.text(0.99, 0.01,
+                "Warm complete calls; libjxl: 8 workers; GJXL: CPU participant cap 8 + Metal",
+                ha="right", fontsize=8)
+    name = "pareto-measured-libjxl-vs-gjxl"
+    save_figure(figure, pathlib.Path(output_dir), name, formats)
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return {name: figure}
 
 
 # %%
@@ -1407,3 +1465,22 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
                      if (BUTTERAUGLI_COMPARE_RUN / "metadata.json").is_file() else None),
         prefix="butteraugli-",
     )
+
+
+# %% [markdown]
+# ## 9. Measured libjxl versus GJXL
+#
+# GJXL_RUN selects a separate forced fully-resident Metal study. The comparison
+# uses exactly its manifest image cohort and effort selections in both encoders;
+# it never intersects away incomplete images. Quality targets and the external
+# scorer/decoder must match, but requested distance and effort semantics need not.
+# GJXL points require five complete timing samples at an accepted score.
+# Its preview is intentionally unavailable: no original GJXL quality sweep is
+# required. Warm public-call timing includes CPU/GPU work and excludes startup,
+# file I/O and external scoring. The CPU thread settings have different semantics.
+# Only saved data is read; this cell never starts collection.
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules:
+    encoder_comparison_figures = generate_encoder_comparison(
+        QUALITY_RUN, GJXL_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True)
