@@ -91,6 +91,7 @@ OUTPUT_DIR = pathlib.Path(
 ).expanduser()
 EXPECTED_TIMING_SAMPLES = 5
 SAVE_FORMATS = ("png", "svg")
+DEBUG_STAGE_BREAKDOWN_BY_QUALITY = False
 QUALITY_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_QUALITY_RUN",
@@ -681,8 +682,12 @@ def expanded_wall_rows(frame):
     return rows, columns
 
 
-def plot_expanded_wall_breakdown(frame):
+def plot_expanded_wall_breakdown(frame, quality=None):
+    # Check completeness across all qualities before selecting one so the
+    # debug figures retain exactly the same efforts as the pooled figure.
     rows, columns = expanded_wall_rows(frame)
+    if quality is not None:
+        rows = rows[rows["quality"] == quality]
     resolutions = resolution_order(frame)
     figure, axes = subplot_grid(len(resolutions), width=5.4, height=4.1)
     groups = {
@@ -754,6 +759,8 @@ def plot_expanded_wall_breakdown(frame):
     )
     figure.suptitle(
         "Expanded wall-time composition (pooled across images and qualities)"
+        if quality is None
+        else "Expanded wall-time composition — Q%d (pooled across images)" % quality
     )
     return figure
 
@@ -1408,6 +1415,35 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         SAVE_FORMATS,
         show=True,
     )
+
+
+# %% [markdown]
+# ### Debug: wall-time composition by quality
+#
+# Set `DEBUG_STAGE_BREAKDOWN_BY_QUALITY = True` in the configuration cell,
+# then run this cell to repeat the expanded wall-time plot for each quality.
+# It reads the saved CSV independently of the normal figure-generation cell.
+# Each resolution panel keeps the pooled plot's complete efforts across all
+# qualities, with the same stage colors and 0–100% scale. Stage durations are
+# summed across images before dividing by complete profiled wall time; these
+# are composition percentages, not absolute runtimes.
+# Figures are displayed and saved as `debug-stage-wall-breakdown-q*.png/svg`
+# under `OUTPUT_DIR`, using `SAVE_FORMATS`. No profiling is started.
+
+# %%
+if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
+    configure_style()
+    debug_frame = load_image_tuples(INPUT_CSV)
+    for quality in sorted(debug_frame["quality"].unique()):
+        debug_figure = plot_expanded_wall_breakdown(debug_frame, quality=quality)
+        # save_figure(
+        #     debug_figure,
+        #     OUTPUT_DIR,
+        #     f"debug-stage-wall-breakdown-q{quality}",
+        #     SAVE_FORMATS,
+        # )
+        plt.show()
+        plt.close(debug_figure)
 
 
 # %% [markdown]
