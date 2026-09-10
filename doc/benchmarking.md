@@ -1,5 +1,8 @@
 # Benchmarking
 
+For warm sequential-versus-concurrent image encoding wall time and GJXL-compatible
+CSV output, see [Image batch benchmark](image-batch-benchmark.md).
+
 For speed benchmarks on single images in single or multi-threaded decoding
 `djxl` can print decoding speed information. See `djxl --help` for details
 on the decoding options and note that the output image is optional for

@@ -173,6 +173,22 @@ endif()  # JPEGXL_ENABLE_TOOLS
 
 # Other developer tools.
 if(JPEGXL_ENABLE_DEVTOOLS)
+  # Warm image-level encoding throughput; no benchmark_xl codec dependencies.
+  add_executable(jxl_image_batch_benchmark benchmark/image_batch_benchmark.cc)
+  target_compile_features(jxl_image_batch_benchmark PRIVATE cxx_std_17)
+  target_link_libraries(jxl_image_batch_benchmark
+    jxl_extras_codec jxl_threads jxl_tool)
+  list(APPEND TOOL_BINARIES jxl_image_batch_benchmark)
+  if(BUILD_TESTING)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME image_batch_benchmark_cli
+        COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/scripts/image_batch_benchmark_test.py"
+          --benchmark $<TARGET_FILE:jxl_image_batch_benchmark>)
+    endif()
+  endif()
+
   list(APPEND INTERNAL_TOOL_BINARIES
     butteraugli_main
     decode_and_encode
