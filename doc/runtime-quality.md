@@ -93,6 +93,118 @@ Kodak 01 and -2.8% on the 12MP image. The Kodak result flags warmup sensitivity,
 so treat this as pilot evidence, not a settled corpus-wide speed comparison.
 The original libjxl ledgers remain unchanged and collection remains paused.
 
+## GJXL fixed nominal-quality sweep
+
+`init --encoder gjxl --mode fixed` freezes a nominal-Q grid, separately from
+matched-quality calibration. It reuses the original runtime study's Q-to-distance
+mapping, effort-major shuffled schedule, and per-tuple timing statistics through
+`cjxl_sweep_common.py`. A hashed copy of that helper is saved alongside the frozen
+collector, so later checkout edits cannot change a run's scheduling or summaries.
+The original libjxl runtime runner also uses these pure helpers; its CSV values
+and scheduling are unchanged.
+
+The grid defaults to Q10,30,50,70,80,90,95 and efforts 3,5,7. `--efforts` is an
+alias for `--measurement-efforts`; `--all-images` explicitly selects the full
+corpus manifest. `--targets` still means perceptual-score targets for the
+**interpolated preview**, not nominal Q. A fixed sweep never performs calibration
+or publishes matched-quality measured points. GJXL does not inherit libjxl's
+automatic downsampling at Q10; recorded GJXL resampling remains 1.
+
+To initialize a full fixed grid from the libjxl checkout (initialization itself
+does not encode):
+
+```sh
+cmake -S ../gjxl-metal-kernel-dataflow \
+  -B ../gjxl-metal-kernel-dataflow/build/quality-study \
+  -DCMAKE_BUILD_TYPE=Release -DGJXL_BUILD_BENCHMARKS=ON
+cmake --build ../gjxl-metal-kernel-dataflow/build/quality-study \
+  --target gjxl_quality_benchmark -j 8
+
+python3.13 tools/scripts/cjxl_quality_characterization.py init \
+  --encoder gjxl --mode fixed \
+  --run ../libjxl-runtime-study-2026-09-03/fixed-gjxl-full \
+  --corpus ../libjxl-runtime-study-2026-09-03/corpus/corpus.json \
+  --source-run ../libjxl-runtime-study-2026-09-03/run-e8ff0976 \
+  --scorer tools/scripts/quality_metric/target/release/cjxl-quality-metric \
+  --benchmark ../gjxl-metal-kernel-dataflow/build/quality-study/gjxl_quality_benchmark \
+  --gjxl-source ../gjxl-metal-kernel-dataflow \
+  --all-images --qualities 10,30,50,70,80,90,95 \
+  --efforts 1,2,3,4,5,6,7,8,9,10 --timeout 1800
+```
+
+Inspect the plan, then explicitly start a bounded session:
+
+```sh
+python3.13 ../libjxl-runtime-study-2026-09-03/fixed-gjxl-full/collector.py run \
+  --run ../libjxl-runtime-study-2026-09-03/fixed-gjxl-full --dry-run
+
+caffeinate -i -m -s python3.13 -u \
+  ../libjxl-runtime-study-2026-09-03/fixed-gjxl-full/collector.py run \
+  --run ../libjxl-runtime-study-2026-09-03/fixed-gjxl-full \
+  --budget-seconds 28800 --check-warmups
+```
+
+The eight-hour budget is a limit, not a completion estimate. Ctrl-C or the budget
+retains completed observations; repeat the frozen command to resume. Do not run
+another encoder/metric benchmark concurrently. The full 65-image grid has 4,550
+tuples and 22,750 timed samples, plus untimed validation/warmups and scoring.
+For a small run, replace `--all-images` with `--images kodak/01` and reduce the
+quality/effort lists.
+
+Each effort completes all five independent timing repetitions, then scores its
+unique codestreams before advancing. Every process performs one untimed validation
+encode and one explicit warmup. Every repetition's JXL is compared against the
+retained output; complete raw reports are saved. Scoring is separate from timing
+and only consumes tuples with all repetitions, keeping score-linked timing
+statistics stable. The optional warmup diagnostic remains separate and does not
+automatically alter this protocol.
+
+Outputs include:
+
+- `timings.jsonl`: one observation per image/Q/effort/repetition.
+- `outputs/IMAGE_ID/qNNN-eNN.jxl`: one retained codestream per tuple.
+- `raw/fixed-*.json`: hashed raw timing reports, including backend/warmup settings.
+- `scores.jsonl`: pinned external quality scores and decoded/reference hashes.
+- `summary/image-tuples.csv`: original-style timing columns plus encoder,
+  resampling, expected corpus-panel image count, and completeness flags.
+- `summary/fixed-coverage.json`, `progress.json`: explicit expected/finished counts.
+- `summary/preview-matches.csv`, `preview-points.csv`: non-extrapolated
+  interpolated quality matches; no `measured-points.csv` is generated.
+
+Set the notebook's `GJXL_FIXED_RUN` (or `CJXL_GJXL_FIXED_RUN` before launching
+Jupyter) to this directory. Section 10 renders timing figures, an interpolated
+Pareto preview, and sweep rate-quality diagnostics. Timing-only CSVs are accepted:
+missing stages remain unknown, and stage charts are skipped. Encoder-specific
+labels prevent GJXL timing charts from being mislabeled as libjxl. Incomplete
+corpus panels are marked partial; they are not treated as complete cohorts.
+
+### Reusing fixed samples for calibrated runs
+
+When initializing a **new** GJXL matched run with the usual arguments, add
+`--seed-run ../libjxl-runtime-study-2026-09-03/fixed-gjxl-full` (omit `--mode fixed`).
+Use a fresh destination; do not change the fixed run's configuration or an existing
+matched run. Initialization checks the exact encoder/decoder binary hashes,
+metric implementation, reference geometry/hashes, and timing protocol. It freezes
+the selected scored observations and source CSV, then calibration can reuse
+those samples and brackets without rescoring or re-encoding them. Unscored or
+unselected fixed tuples are not imported. The frozen score snapshot does not
+follow subsequent ledger updates; retain the source codestreams, whose hashes
+are checked on use. Accepted matches still receive five fresh matched-quality
+timing measurements rather than treating fixed-grid samples as new measurements.
+
+### Implementation smoke check
+
+`fixed-gjxl-smoke-20260909` used Kodak 01, Q10/50/90, efforts 3/5 and five
+repetitions: six codestreams, 30 timing samples and six scores. It stopped after
+four samples and resumed to completion; resuming the completed run performed no
+additional encoding or scoring. All raw reports and retained output hashes were
+verified. `fixed-gjxl-seeded-smoke-20260909` then reused the exact e3/Q90 score for
+one matched target, with zero new calibration probes and five fresh timings.
+These are plumbing checks, not evidence of corpus-wide performance or warmup
+sufficiency. No full fixed sweep was started. The notebook executed successfully
+with the smoke run enabled, and the existing libjxl/GJXL study ledgers were
+unchanged.
+
 ## Figure semantics
 
 Default targets are **fast-ssim2 60, 70 and 85, with ±0.5-point tolerance**.

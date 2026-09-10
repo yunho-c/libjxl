@@ -105,6 +105,11 @@ GJXL_RUN = pathlib.Path(
         "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-pilot-20260909",
     )
 ).expanduser()
+# Optional separate fixed-Q study. Reading it never starts collection.
+GJXL_FIXED_RUN = (
+    pathlib.Path(os.environ["CJXL_GJXL_FIXED_RUN"]).expanduser()
+    if os.environ.get("CJXL_GJXL_FIXED_RUN") else None
+)
 BUTTERAUGLI_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_BUTTERAUGLI_RUN",
@@ -139,12 +144,6 @@ REQUIRED_COLUMNS = frozenset(
         "complete_encode_p90_ms",
         "complete_encode_stdev_ms",
         "bits_per_pixel",
-        "profiled_complete_wall_ms",
-        "frontend_residual_wall_ms",
-        "phase_wall_coefficient_tokenization_ms",
-        "phase_wall_entropy_model_construction_ms",
-        "phase_wall_model_and_token_emission_ms",
-        "phase_wall_framing_and_assembly_ms",
     )
 )
 
@@ -198,6 +197,14 @@ def load_image_tuples(path):
         raise ValueError("CSV is missing required columns: %s" % ", ".join(missing))
     if frame.empty:
         raise ValueError("CSV contains no tuple rows: %s" % path)
+    if "encoder" not in frame:
+        frame["encoder"] = "libjxl"
+    if frame["encoder"].isna().any() or frame["encoder"].nunique() != 1:
+        raise ValueError("Use one encoder per fixed-sweep CSV; do not pool encoders")
+    # Absent instrumentation is unknown, never zero-time work.
+    for column in ("profiled_complete_wall_ms", *(c for c, _, _ in STAGE_COMPONENTS)):
+        if column not in frame:
+            frame[column] = math.nan
     if frame["job_id"].duplicated().any():
         duplicates = frame.loc[frame["job_id"].duplicated(), "job_id"].head(3)
         raise ValueError("CSV contains duplicate job_id values: %s" % list(duplicates))
@@ -251,6 +258,11 @@ def resolution_order(frame):
     )
 
 
+def encoder_label(frame):
+    name = frame["encoder"].iloc[0] if "encoder" in frame else "libjxl"
+    return "gjxl (fully-resident Metal)" if name == "gjxl" else str(name)
+
+
 def resolution_label(frame, resolution_class):
     values = frame.loc[frame["resolution_class"] == resolution_class, "megapixels"]
     median_mp = values.median()
@@ -285,6 +297,8 @@ def aggregate_cells(frame, expected_timing_samples=5):
             "timing_sample_max": int(group["timing_sample_count"].max()),
             "timing_complete": bool(
                 group["timing_sample_count"].ge(expected_timing_samples).all()
+                and ("expected_image_count" not in group
+                     or group["image_id"].nunique() == group["expected_image_count"].max())
             ),
             "relative_p10_p90_percent": float(
                 (
@@ -432,7 +446,7 @@ def plot_runtime_vs_effort(frame, cells):
     ]
     handles.append(incomplete_marker_legend())
     figure.legend(handles=handles, loc="outside lower center", ncols=8)
-    figure.suptitle("libjxl complete-encode runtime versus effort")
+    figure.suptitle(encoder_label(frame) + " complete-encode runtime versus effort")
     return figure
 
 
@@ -537,7 +551,7 @@ def plot_resolution_scaling(frame, cells):
         axis.set_yscale("log")
     handles, labels = axes[0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="outside lower center", ncols=7)
-    figure.suptitle("libjxl runtime scaling with resolution")
+    figure.suptitle(encoder_label(frame) + " runtime scaling with resolution")
     return figure
 
 
@@ -645,7 +659,7 @@ def plot_stage_breakdown(frame, cells):
     handles, labels = axes[0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="outside lower center", ncols=3)
     figure.suptitle(
-        "libjxl instrumented wall-time composition (pooled across images and qualities)"
+        encoder_label(frame) + " instrumented wall-time composition (pooled across images and qualities)"
     )
     return figure
 
@@ -878,9 +892,10 @@ def generate_characterization(
         "quality-effort-heatmaps": plot_quality_effort_heatmaps(frame, cells),
         "resolution-scaling": plot_resolution_scaling(frame, cells),
         "rate-runtime-tradeoff": plot_rate_runtime_tradeoff(frame, cells),
-        "stage-wall-breakdown": plot_stage_breakdown(frame, cells),
         "timing-variability": plot_timing_variability(frame, expected_timing_samples),
     }
+    if cells["stage_complete"].any():
+        figures["stage-wall-breakdown"] = plot_stage_breakdown(frame, cells)
     if "wall_inclusive_quantizer_refinement_ms" in frame.columns:
         figures["quantizer-refinement-wall"] = plot_refinement_wall(frame)
     written = []
@@ -1408,7 +1423,8 @@ def notebook_figures(run, compare_run=None):
     study = load_quality_helpers()
     config = study.load_config(run)
     figures = {}
-    modes = (("measured",) if not config.get("preview_available", True) else
+    modes = (("preview",) if study.is_fixed(config) else
+             ("measured",) if not config.get("preview_available", True) else
              ("preview",) if config.get("preview_only") else ("preview", "measured"))
     for mode in modes:
         rows = study.per_image_rows(run, config, mode)
@@ -1708,3 +1724,29 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 if __name__ == "__main__" and "ipykernel" in sys.modules:
     encoder_comparison_figures = generate_encoder_comparison(
         QUALITY_RUN, GJXL_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True)
+
+
+# %% [markdown]
+# ## 10. Optional GJXL fixed-quality sweep
+#
+# Set GJXL_FIXED_RUN (or CJXL_GJXL_FIXED_RUN before starting Jupyter) to a
+# separately initialized --mode fixed run. These cells only read saved data.
+# Runtime figures accept timing-only CSVs: missing stages remain unknown and
+# stage plots are omitted. The quality Pareto is explicitly an interpolated
+# preview, not a matched-quality measurement. Q labels use libjxl's nominal
+# Q-to-distance mapping; GJXL does not inherit libjxl's Q10 downsampling policy.
+# Partial groups are identified using the manifest's expected image count.
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules and GJXL_FIXED_RUN is not None:
+    fixed_csv = GJXL_FIXED_RUN / "summary/image-tuples.csv"
+    if fixed_csv.is_file() and fixed_csv.stat().st_size:
+        fixed_output = OUTPUT_DIR / "gjxl-fixed"
+        fixed_results = generate_characterization(
+            fixed_csv, fixed_output, EXPECTED_TIMING_SAMPLES, SAVE_FORMATS, show=True)
+        fixed_quality_figures = generate_quality_figures(
+            GJXL_FIXED_RUN, fixed_output, SAVE_FORMATS, show=True)
+        fixed_rate_figures = generate_rate_quality_figures(
+            GJXL_FIXED_RUN, fixed_output, SAVE_FORMATS, show=True, source="sweep")
+    else:
+        print("No fixed-sweep timing summary yet; collection is never started here.")

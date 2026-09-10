@@ -15,6 +15,7 @@ import csv
 import datetime
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -45,6 +46,70 @@ def encoder_name(config):
     if name not in ("libjxl", "gjxl"):
         raise StudyError(f"Unknown encoder: {name}")
     return name
+
+
+def is_fixed(config):
+    return config.get("collection_mode") == "fixed"
+
+
+def sweep_helpers(run=None, config=None):
+    """Frozen runs load their own hashed copy, never mutable checkout helpers."""
+    path = (
+        Path(run) if run is not None else Path(__file__).parent
+    ) / "cjxl_sweep_common.py"
+    if config is not None:
+        verify_file(path, config["sweep_helpers_sha256"])
+    spec = importlib.util.spec_from_file_location("quality_sweep_helpers", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def seed_snapshot(args, images, metric_version, decoder_hash, benchmark_hash):
+    """Import immutable observations, not a live dependency on a changing ledger."""
+    if args.seed_run is None:
+        return None
+    source = args.seed_run.resolve()
+    config = load_config(source, verify=True)
+    if not is_fixed(config) or encoder_name(config) != "gjxl":
+        raise StudyError("--seed-run requires a GJXL fixed sweep")
+    if (
+        config["metric_version"] != metric_version
+        or metric_name(config) != "fast-ssim2"
+        or config["intensity_target"] != args.intensity_target
+        or config["tool_hashes"][config["djxl"]] != decoder_hash
+        or config["tool_hashes"][config["benchmark"]] != benchmark_hash
+        or (config["num_threads"], config["warmups"], config["repetitions"])
+        != (8, 1, 5)
+    ):
+        raise StudyError(
+            "Seed sweep uses different binaries, metric or timing protocol"
+        )
+    selected = {i["image_id"]: i for i in images}
+    for image in config["images"]:
+        if image["image_id"] in selected and any(
+            image[key] != selected[image["image_id"]][key]
+            for key in (*SOURCE_FIELDS, "pfm_sha256", "color_encoding")
+        ):
+            raise StudyError("Seed sweep reference or geometry differs")
+    scores = [
+        r
+        for r in read_records(source, "scores", config, verify=True)
+        if r["image_id"] in selected and r["effort"] in args.measurement_efforts
+    ]
+    if not scores:
+        raise StudyError("Seed sweep has no scored observations for the selected grid")
+    return {
+        "source_run": str(source),
+        "configuration_id": config["configuration_id"],
+        "metadata_sha256": digest(source / "metadata.json"),
+        "scores": scores,
+        "tuples": [
+            r
+            for r in fixed_rows(source, config)
+            if r["job_id"] in {s["source_job_id"] for s in scores}
+        ],
+    }
 
 
 def initialize_gjxl(args, images):
@@ -130,6 +195,13 @@ def initialize_gjxl(args, images):
         if image["color_encoding"] != COLOR:
             raise StudyError("Only canonical linear-sRGB PFM inputs are supported")
         verify_file(image["pfm_path"], image["pfm_sha256"])
+    seeds = seed_snapshot(
+        args,
+        images,
+        metric_version,
+        decoder["sha256"],
+        build_record["benchmark_sha256"],
+    )
     if args.run.exists():
         raise StudyError("Run directory already exists; resume it instead")
     args.run.mkdir(parents=True)
@@ -176,9 +248,38 @@ def initialize_gjxl(args, images):
         "pilot": args.pilot,
         "collector_snapshot_sha256": digest(__file__),
     }
+    if args.mode == "fixed":
+        helper_path = Path(__file__).with_name("cjxl_sweep_common.py")
+        config.update(
+            collection_mode="fixed",
+            qualities=args.qualities,
+            preview_available=True,
+            sweep_helpers_sha256=digest(helper_path),
+        )
+        config["quality_to_distance"] = {
+            str(q): sweep_helpers().quality_to_distance(q) for q in args.qualities
+        }
+        shutil.copy2(helper_path, args.run / helper_path.name)
+    if seeds is not None:
+        write_json(args.run / "seed-scores.json", seeds)
+        write_csv(args.run / "source-tuples.csv", seeds["tuples"])
+        config.update(
+            seed_snapshot_sha256=digest(args.run / "seed-scores.json"),
+            tuple_snapshot_sha256=digest(args.run / "source-tuples.csv"),
+            preview_available=True,
+        )
     config["configuration_id"] = identity(config)
     (args.run / "collector.py").write_bytes(Path(__file__).read_bytes())
     write_json(args.run / "metadata.json", config)
+    if seeds is not None:
+        for original in seeds["scores"]:
+            row = {
+                k: v
+                for k, v in original.items()
+                if k not in ("configuration_id", "recorded_at", "schema_version")
+            }
+            row["seed_configuration_id"] = seeds["configuration_id"]
+            save_record(args.run, "scores", config, row)
     append(
         args.run / "execution-events.jsonl",
         {"event": "initialized", "configuration_id": config["configuration_id"]},
@@ -474,6 +575,8 @@ def initialize(args):
         images = [r for r in images if r["image_id"] in selected]
         if selected != {r["image_id"] for r in images}:
             raise StudyError("Unknown image IDs")
+    elif args.all_images:
+        pass
     else:
         raise StudyError("Specify --pilot or an explicit --images list")
     if args.encoder == "gjxl":
@@ -595,6 +698,12 @@ def load_config(run, verify=False):
         verify_file(run / "source-tuples.csv", config["tuple_snapshot_sha256"])
     else:
         verify_file(run / "encoder-build.json", config["encoder_build_sha256"])
+        if config.get("tuple_snapshot_sha256"):
+            verify_file(run / "source-tuples.csv", config["tuple_snapshot_sha256"])
+    if config.get("sweep_helpers_sha256"):
+        verify_file(run / "cjxl_sweep_common.py", config["sweep_helpers_sha256"])
+    if config.get("seed_snapshot_sha256"):
+        verify_file(run / "seed-scores.json", config["seed_snapshot_sha256"])
     if verify:
         if config.get("collector_snapshot_sha256"):
             verify_file(run / "collector.py", config["collector_snapshot_sha256"])
@@ -613,6 +722,8 @@ def read_records(run, name, config, verify=False):
             raise StudyError("Mixed configurations in " + name)
         if verify and row.get("output_path"):
             verify_file(row["output_path"], row["output_sha256"])
+        if verify and row.get("raw_path"):
+            verify_file(row["raw_path"], row["raw_sha256"])
         # Calibration can contain repeated failure outcomes; observations cannot.
         key = None
         if name == "scores":
@@ -623,6 +734,8 @@ def read_records(run, name, config, verify=False):
             key = (row.get("image_id"), row.get("effort"), row.get("distance"))
         elif name == "warmup-checks":
             key = (row.get("image_id"), row.get("warmups"), row.get("repetition"))
+        elif name == "timings":
+            key = row["sample_id"]
         if key is not None:
             if key in seen:
                 raise StudyError("Duplicate observation in " + name)
@@ -637,7 +750,10 @@ def save_record(run, name, config, row):
 
 
 def source_rows(run, config):
-    if encoder_name(config) == "gjxl":
+    if is_fixed(config):
+        # Freeze a score's associated timing statistics only after all repetitions.
+        return [row for row in fixed_rows(run, config) if row["timing_complete"]]
+    if encoder_name(config) == "gjxl" and not config.get("tuple_snapshot_sha256"):
         return []
     with (run / "source-tuples.csv").open(newline="") as f:
         return [
@@ -875,12 +991,155 @@ def harness(config, image, effort, distance, directory, run, budget, warmups):
     return output, raw, sample
 
 
+def fixed_key(image_id, quality, effort):
+    return f"{image_id}|quality={quality}|effort={effort}"
+
+
+def fixed_rows(run, config):
+    """Original fixed-sweep timing columns, plus explicit encoder/coverage data."""
+    helper = sweep_helpers(run, config)
+    groups = collections.defaultdict(list)
+    images = {i["image_id"]: i for i in config["images"]}
+    expected = collections.Counter(
+        (i["corpus"], i["resolution_class"]) for i in images.values()
+    )
+    for row in read_records(run, "timings", config):
+        if (
+            row["image_id"] not in images
+            or row["quality"] not in config["qualities"]
+            or row["effort"] not in config["efforts"]
+            or row["job_id"]
+            != fixed_key(row["image_id"], row["quality"], row["effort"])
+            or not 0 <= row["repetition"] < config["repetitions"]
+            or row["sample_id"] != f"{row['job_id']}|repetition={row['repetition']}"
+        ):
+            raise StudyError("Timing observation is outside the fixed grid")
+        groups[row["job_id"]].append(row)
+    rows = []
+    for key, samples in sorted(groups.items()):
+        try:
+            row = helper.summarize_timing_samples(samples)
+        except helper.StudyError as error:
+            raise StudyError(str(error)) from error
+        image = images[row["image_id"]]
+        row.update(
+            encoder=encoder_name(config),
+            resampling=1,
+            reference_sha256=image["pfm_sha256"],
+            expected_image_count=expected[(image["corpus"], image["resolution_class"])],
+            timing_complete=len(samples) == config["repetitions"],
+            thread_semantics=config["thread_semantics"],
+        )
+        rows.append(row)
+    return rows
+
+
+def collect_fixed_timings(run, config, budget, efforts=None):
+    """Five fresh processes per tuple, with output parity and raw report retention."""
+    require_encoding_allowed(config)
+    helper = sweep_helpers(run, config)
+    existing = read_records(run, "timings", config, verify=True)
+    # Also check tuple/repetition membership and cross-repetition consistency.
+    fixed_rows(run, config)
+    done = {r["sample_id"] for r in existing}
+    selected = sorted(e for e in config["efforts"] if efforts is None or e in efforts)
+    for effort in selected:
+        for repetition in range(config["repetitions"]):
+            jobs = helper.shuffled_tuple_jobs(
+                config["images"],
+                config["qualities"],
+                (effort,),
+                config["seed"],
+                "timing",
+                repetition,
+                helper.SCHEDULE_EFFORT_MAJOR,
+            )
+            for position, (image, quality, _) in enumerate(jobs):
+                key = fixed_key(image["image_id"], quality, effort)
+                sample_id = f"{key}|repetition={repetition}"
+                if sample_id in done:
+                    continue
+                budget.check()
+                distance = config["quality_to_distance"][str(quality)]
+                retained = (
+                    run
+                    / "outputs"
+                    / image["image_id"]
+                    / f"q{quality:03d}-e{effort:02d}.jxl"
+                )
+                with tempfile.TemporaryDirectory(prefix="gjxl-fixed-") as temp:
+                    output, raw, sample = harness(
+                        config,
+                        image,
+                        effort,
+                        distance,
+                        Path(temp),
+                        run,
+                        budget,
+                        config["warmups"],
+                    )
+                    if retained.exists():
+                        verify_file(output, digest(retained))
+                    else:
+                        retained.parent.mkdir(parents=True, exist_ok=True)
+                        output.replace(retained)
+                    raw_path = (
+                        run / "raw" / ("fixed-" + identity(sample_id)[:24] + ".json")
+                    )
+                    raw_path.parent.mkdir(exist_ok=True)
+                    raw.replace(raw_path)
+                    row = {
+                        **base_row(image, effort, distance, config),
+                        "job_id": key,
+                        "sample_id": sample_id,
+                        "quality": quality,
+                        "repetition": repetition,
+                        "thread_count": config["num_threads"],
+                        "elapsed_nanoseconds": sample["elapsed_nanoseconds"],
+                        "encoded_bytes": sample["encoded_bytes"],
+                        "output_path": str(retained),
+                        "output_sha256": digest(retained),
+                        "raw_path": str(raw_path),
+                        "raw_sha256": digest(raw_path),
+                        "harness_revision": config["encoder_revision"],
+                        "schedule_position": position,
+                        "schedule_policy": helper.SCHEDULE_EFFORT_MAJOR,
+                        "schedule_seed": helper.phase_shuffle_seed(
+                            config["seed"], "timing", repetition, effort
+                        ),
+                    }
+                    save_record(run, "timings", config, row)
+                    done.add(sample_id)
+                    budget.completed += 1
+                    print(f"fixed {sample_id}", flush=True)
+
+
+def fixed_completion(run, config):
+    rows = fixed_rows(run, config)
+    expected = len(config["images"]) * len(config["efforts"]) * len(config["qualities"])
+    scored = {r["source_job_id"] for r in read_records(run, "scores", config)}
+    complete = sum(r["timing_complete"] for r in rows)
+    score_count = sum(r["job_id"] in scored for r in rows)
+    return {
+        "expected_tuples": expected,
+        "timed_tuples": complete,
+        "timing_samples": sum(r["timing_sample_count"] for r in rows),
+        "expected_timing_samples": expected * config["repetitions"],
+        "scored_tuples": score_count,
+        "complete": complete == score_count == expected,
+    }
+
+
 def match_key(image_id, effort, target):
     return f"{image_id}|effort={effort}|target={target:g}"
 
 
 def collect_calibration(run, config, budget, efforts=None):
     require_encoding_allowed(config)
+    if is_fixed(config):
+        raise StudyError(
+            "Fixed sweeps do not calibrate; initialize a matched run with --seed-run"
+        )
     scores = read_records(run, "scores", config, verify=True)
     probes = read_records(run, "probes", config, verify=True)
     outcomes = read_records(run, "calibration", config, verify=True)
@@ -1205,6 +1464,10 @@ def encoder_comparison_points(libjxl_run, gjxl_run, image_ids=None):
     runs = [Path(libjxl_run), Path(gjxl_run)]
     configs = [load_config(run) for run in runs]
     a, b = configs
+    if any(is_fixed(config) for config in configs):
+        raise StudyError(
+            "Measured encoder comparison requires matched runs, not a fixed-sweep preview"
+        )
     if [encoder_name(config) for config in configs] != ["libjxl", "gjxl"]:
         raise StudyError("Encoder comparison requires a libjxl run and a GJXL run")
     if metric_name(a) != metric_name(b) or a["metric_version"] != b["metric_version"]:
@@ -1358,8 +1621,13 @@ def summarize(run, config, modes=("preview", "measured"), compare_run=None):
     """Export CSV/JSON summaries; never import or invoke plotting code."""
     summary = run / "summary"
     summary.mkdir(exist_ok=True)
+    if is_fixed(config):
+        write_csv(summary / "image-tuples.csv", fixed_rows(run, config))
+        write_json(summary / "fixed-coverage.json", fixed_completion(run, config))
     totals = {}
     for mode in modes:
+        if mode == "measured" and is_fixed(config):
+            continue
         if mode == "preview" and not config.get("preview_available", True):
             continue
         if mode == "measured" and config.get("preview_only"):
@@ -1476,8 +1744,17 @@ def collect_full_run(run, config, budget):
             ("calibrate", collect_calibration),
             ("measure", collect_measurements),
         )
+        if is_fixed(config):
+            phases = (
+                ("fixed-timing", collect_fixed_timings),
+                ("score", collect_scores),
+            )
         for name, collector in phases:
-            if name == "score" and encoder_name(config) == "gjxl":
+            if (
+                name == "score"
+                and encoder_name(config) == "gjxl"
+                and not is_fixed(config)
+            ):
                 continue
             budget.check()
             append(
@@ -1496,6 +1773,8 @@ def collect_full_run(run, config, budget):
 
 
 def run_completion(run, config):
+    if is_fixed(config):
+        return fixed_completion(run, config)
     outcomes = {r["match_id"]: r for r in read_records(run, "calibration", config)}
     measurements = read_records(run, "measurements", config)
     expected = (
@@ -1529,6 +1808,18 @@ def parse_args(argv=None):
     init.add_argument("--tuples", type=Path)
     init.add_argument("--encoder", choices=("libjxl", "gjxl"), default="libjxl")
     init.add_argument(
+        "--mode",
+        choices=("matched", "fixed"),
+        default="matched",
+        help="GJXL fixed nominal-quality grid or matched perceptual quality",
+    )
+    init.add_argument("--qualities", type=numbers, default=[10, 30, 50, 70, 80, 90, 95])
+    init.add_argument(
+        "--seed-run",
+        type=Path,
+        help="GJXL fixed sweep whose scored outputs seed a new matched run",
+    )
+    init.add_argument(
         "--benchmark", type=Path, help="GJXL quality benchmark executable"
     )
     init.add_argument(
@@ -1541,12 +1832,17 @@ def parse_args(argv=None):
     selection = init.add_mutually_exclusive_group(required=True)
     selection.add_argument("--pilot", action="store_true")
     selection.add_argument("--images", help="comma-separated exact corpus IDs")
+    selection.add_argument(
+        "--all-images", action="store_true", help="select the full corpus manifest"
+    )
     init.add_argument(
         "--targets",
         type=lambda s: numbers(s, float),
     )
     init.add_argument("--tolerance", type=float)
-    init.add_argument("--measurement-efforts", type=numbers, default=[3, 5, 7])
+    init.add_argument(
+        "--measurement-efforts", "--efforts", type=numbers, default=[3, 5, 7]
+    )
     init.add_argument("--max-evaluations", type=int, default=12)
     init.add_argument("--timeout", type=float, default=300)
     init.add_argument("--minimum-distance", type=float, default=0.55)
@@ -1583,6 +1879,14 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     args.run = args.run.resolve()
     if args.command == "init":
+        if (
+            args.mode == "fixed" or args.seed_run is not None
+        ) and args.encoder != "gjxl":
+            parser.error("--mode fixed and --seed-run currently require --encoder gjxl")
+        if args.mode == "fixed" and args.seed_run is not None:
+            parser.error("--seed-run is for a new matched run, not a fixed sweep")
+        if args.mode == "fixed" and not set(args.qualities) <= set(range(1, 100)):
+            parser.error("Fixed qualities must be 1-99; lossless is not included")
         if args.encoder == "libjxl" and args.tuples is None:
             parser.error("libjxl init requires --tuples")
         if args.encoder == "gjxl" and (
@@ -1637,6 +1941,10 @@ def main(argv=None):
         require_encoding_allowed(config)
     if args.command == "pilot" and not config["pilot"]:
         raise StudyError("pilot requires a --pilot configuration")
+    if is_fixed(config) and args.command in ("calibrate", "pilot"):
+        raise StudyError(
+            "Use run/measure/score for fixed sweeps; calibration requires a separate matched run"
+        )
     if args.dry_run:
         print(
             json.dumps(
@@ -1647,10 +1955,25 @@ def main(argv=None):
                     "efforts": config["efforts"],
                     "measurement_efforts": config["measurement_efforts"],
                     "targets": config["targets"],
-                    "max_matched_jobs": len(config["images"])
-                    * len(config["measurement_efforts"])
-                    * len(config["targets"]),
+                    **(
+                        {
+                            "max_matched_jobs": len(config["images"])
+                            * len(config["measurement_efforts"])
+                            * len(config["targets"])
+                        }
+                        if not is_fixed(config)
+                        else {}
+                    ),
                     "budget_seconds": getattr(args, "budget_seconds", None),
+                    **(
+                        {
+                            "collection_mode": "fixed",
+                            "qualities": config["qualities"],
+                            "fixed_grid": fixed_completion(args.run, config),
+                        }
+                        if is_fixed(config)
+                        else {}
+                    ),
                 },
                 indent=2,
             )
@@ -1706,7 +2029,9 @@ def main(argv=None):
                 {
                     "score": collect_scores,
                     "calibrate": collect_calibration,
-                    "measure": collect_measurements,
+                    "measure": collect_fixed_timings
+                    if is_fixed(config)
+                    else collect_measurements,
                     "run": collect_full_run,
                 }[command](args.run, config, budget)
         except (BudgetExpired, subprocess.TimeoutExpired):
@@ -1719,13 +2044,23 @@ def main(argv=None):
             status = "error"
             raise
         finally:
-            if args.command == "run":
+            if args.command == "run" or is_fixed(config):
                 report = run_completion(args.run, config)
                 write_json(args.run / "progress.json", report)
-                if status == "complete" and not report["complete"]:
-                    status = "incomplete-targets"
+                if (
+                    args.command == "run"
+                    and status == "complete"
+                    and not report["complete"]
+                ):
+                    status = (
+                        "incomplete-fixed-sweep"
+                        if is_fixed(config)
+                        else "incomplete-targets"
+                    )
                     print(
-                        "Pass finished, but some targets remain unmatched; see progress.json."
+                        "Pass finished with missing timings/scores; see progress.json."
+                        if is_fixed(config)
+                        else "Pass finished, but some targets remain unmatched; see progress.json."
                     )
             append(
                 args.run / "execution-events.jsonl",
@@ -1747,6 +2082,9 @@ def main(argv=None):
                     "state": status,
                 },
             )
+            if is_fixed(config):
+                # Publish useful partial snapshots after a bounded interruption too.
+                summarize(args.run, config)
         if args.command == "pilot":
             summarize(args.run, config)
         return 0 if status == "complete" else 130
