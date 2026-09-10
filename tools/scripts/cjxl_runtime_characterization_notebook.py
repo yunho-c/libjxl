@@ -92,6 +92,8 @@ OUTPUT_DIR = pathlib.Path(
 EXPECTED_TIMING_SAMPLES = 5
 SAVE_FORMATS = ("png", "svg")
 DEBUG_STAGE_BREAKDOWN_BY_QUALITY = False
+# False shows mean milliseconds per image/quality encode instead of percentages.
+NORMALIZE_STAGE_BARS = True
 RATE_QUALITY_SOURCE = "calibrated"  # "sweep" or "calibrated"
 QUALITY_RUN = pathlib.Path(
     os.environ.get(
@@ -629,9 +631,9 @@ def plot_rate_runtime_tradeoff(frame, cells):
 
 
 # %%
-def plot_stage_breakdown(frame, cells):
+def plot_stage_breakdown(frame, cells, normalize=True):
     if "wall_exclusive_frame_setup_other_ms" in frame.columns:
-        return plot_expanded_wall_breakdown(frame)
+        return plot_expanded_wall_breakdown(frame, normalize=normalize)
     resolutions = resolution_order(frame)
     figure, axes = subplot_grid(len(resolutions), width=5.1, height=3.9)
     for axis, resolution in zip(axes, resolutions):
@@ -642,23 +644,25 @@ def plot_stage_breakdown(frame, cells):
         efforts = np.array(sorted(int(value) for value in subset["effort"].unique()))
         bottoms = np.zeros(len(efforts))
         totals = grouped["profiled_complete_wall_ms"].sum().reindex(efforts).to_numpy()
+        counts = grouped["image_count"].sum().reindex(efforts).to_numpy()
         for column, label, color in STAGE_COMPONENTS:
             values = grouped[column].sum().reindex(efforts).to_numpy()
-            percentages = values / totals * 100
+            heights = values / totals * 100 if normalize else values / counts
             axis.bar(
                 efforts,
-                percentages,
+                heights,
                 bottom=bottoms,
                 color=color,
                 width=0.78,
                 label=label,
             )
-            bottoms += percentages
+            bottoms += heights
         axis.set_title(resolution_label(frame, resolution))
         axis.set_xlabel("Effort")
-        axis.set_ylabel("Profiled complete wall time (%)")
+        axis.set_ylabel("Profiled complete wall time (%)" if normalize
+                        else "Mean profiled wall time (ms/encode)")
         axis.set_xticks(efforts)
-        axis.set_ylim(0, 100)
+        axis.set_ylim(bottom=0, top=100 if normalize else None)
     handles, labels = axes[0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="outside lower center", ncols=3)
     figure.suptitle(
@@ -674,6 +678,9 @@ def plot_stage_breakdown(frame, cells):
 # The exclusive stages, including the outside-frame API remainder, sum to
 # complete profiled encode wall time. DC preparation includes trial passes;
 # the inclusive quantizer figure below includes those within refinement.
+# Set `NORMALIZE_STAGE_BARS = False` for mean milliseconds per encode.
+# Each bar then averages the image/quality tuples included at that effort,
+# so its height does not grow simply because more qualities are pooled.
 
 
 # %%
@@ -700,7 +707,8 @@ def expanded_wall_rows(frame):
     return rows, columns
 
 
-def plot_expanded_wall_breakdown(frame, quality=None):
+def plot_expanded_wall_breakdown(frame, quality=None, normalize=True):
+    """Stack exclusive stage percentages, or mean milliseconds per encode."""
     # Check completeness across all qualities before selecting one so the
     # debug figures retain exactly the same efforts as the pooled figure.
     rows, columns = expanded_wall_rows(frame)
@@ -751,19 +759,22 @@ def plot_expanded_wall_breakdown(frame, quality=None):
         grouped = subset.groupby("effort", observed=True)[
             columns + ["profiled_complete_wall_ms"]
         ].sum()
+        counts = subset.groupby("effort", observed=True).size().reindex(grouped.index)
         bottom = np.zeros(len(grouped))
         for (label, names), color in zip(groups.items(), colors):
             values = grouped[["wall_exclusive_" + name + "_ms" for name in names]].sum(
                 axis=1
             )
-            share = 100 * values / grouped["profiled_complete_wall_ms"]
-            axis.bar(grouped.index, share, bottom=bottom, color=color, label=label)
-            bottom += share.to_numpy()
+            heights = (100 * values / grouped["profiled_complete_wall_ms"]
+                       if normalize else values / counts)
+            axis.bar(grouped.index, heights, bottom=bottom, color=color, label=label)
+            bottom += heights.to_numpy()
         axis.set_title(resolution_label(frame, resolution))
         axis.set_xlabel("Effort")
-        axis.set_ylabel("Complete profiled wall time (%)")
+        axis.set_ylabel("Complete profiled wall time (%)" if normalize
+                        else "Mean profiled wall time (ms/encode)")
         axis.set_xticks(grouped.index)
-        axis.set_ylim(0, 100)
+        axis.set_ylim(bottom=0, top=100 if normalize else None)
         if grouped.empty:
             axis.text(
                 0.5,
@@ -886,6 +897,7 @@ def generate_characterization(
     expected_timing_samples=5,
     formats=("png", "svg"),
     show=False,
+    normalize_stage_bars=True,
 ):
     configure_style()
     frame = load_image_tuples(input_csv)
@@ -898,7 +910,9 @@ def generate_characterization(
         "timing-variability": plot_timing_variability(frame, expected_timing_samples),
     }
     if cells["stage_complete"].any():
-        figures["stage-wall-breakdown"] = plot_stage_breakdown(frame, cells)
+        figures["stage-wall-breakdown"] = plot_stage_breakdown(
+            frame, cells, normalize=normalize_stage_bars
+        )
     if "wall_inclusive_quantizer_refinement_ms" in frame.columns:
         figures["quantizer-refinement-wall"] = plot_refinement_wall(frame)
     written = []
@@ -1577,6 +1591,7 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         EXPECTED_TIMING_SAMPLES,
         SAVE_FORMATS,
         show=True,
+        normalize_stage_bars=NORMALIZE_STAGE_BARS,
     )
 
 
@@ -1587,9 +1602,9 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # then run this cell to repeat the expanded wall-time plot for each quality.
 # It reads the saved CSV independently of the normal figure-generation cell.
 # Each resolution panel keeps the pooled plot's complete efforts across all
-# qualities, with the same stage colors and 0–100% scale. Stage durations are
-# summed across images before dividing by complete profiled wall time; these
-# are composition percentages, not absolute runtimes.
+# qualities and stage colors. `NORMALIZE_STAGE_BARS = True` uses a 0–100% scale;
+# `False` shows mean milliseconds per encode with an automatically scaled axis.
+# Percentage bars divide summed stage durations by summed complete wall time.
 # Figures are displayed and saved as `debug-stage-wall-breakdown-q*.png/svg`
 # under `OUTPUT_DIR`, using `SAVE_FORMATS`. No profiling is started.
 
@@ -1598,7 +1613,9 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
     configure_style()
     debug_frame = load_image_tuples(INPUT_CSV)
     for quality in sorted(debug_frame["quality"].unique()):
-        debug_figure = plot_expanded_wall_breakdown(debug_frame, quality=quality)
+        debug_figure = plot_expanded_wall_breakdown(
+            debug_frame, quality=quality, normalize=NORMALIZE_STAGE_BARS
+        )
         # save_figure(
         #     debug_figure,
         #     OUTPUT_DIR,
