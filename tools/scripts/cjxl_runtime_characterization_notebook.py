@@ -30,7 +30,7 @@
 # ///
 
 # %% [markdown]
-# # libjxl runtime-characterization figures
+# # libjxl and GJXL runtime-characterization figures
 #
 # This notebook reads `image-tuples.csv` (or an explicitly labeled partial
 # snapshot) produced by `cjxl_runtime_characterization.py summarize`.
@@ -102,14 +102,17 @@ QUALITY_RUN = pathlib.Path(
 GJXL_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_GJXL_RUN",
-        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-pilot-20260909",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-full-20260910",
     )
 ).expanduser()
-# Optional separate fixed-Q study. Reading it never starts collection.
-GJXL_FIXED_RUN = (
-    pathlib.Path(os.environ["CJXL_GJXL_FIXED_RUN"]).expanduser()
-    if os.environ.get("CJXL_GJXL_FIXED_RUN") else None
-)
+# Completed full fixed-Q study; set to None to skip its section.
+# Reading either GJXL study never starts collection.
+GJXL_FIXED_RUN = pathlib.Path(
+    os.environ.get(
+        "CJXL_GJXL_FIXED_RUN",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/fixed-gjxl-full-20260910",
+    )
+).expanduser()
 BUTTERAUGLI_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_BUTTERAUGLI_RUN",
@@ -1018,6 +1021,7 @@ def plot_pareto(points, mode):
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.ticker import LogLocator, FuncFormatter
+    from textwrap import fill
 
     metrics = {quality_metric_name(r) for r in points}
     if len(metrics) > 1:
@@ -1130,7 +1134,8 @@ def plot_pareto(points, mode):
             ax.text(
                 0.98,
                 0.98,
-                "Missing: " + ", ".join(missing),
+                fill("Missing: " + ", ".join(missing), width=64,
+                     break_long_words=False, break_on_hyphens=False),
                 fontsize=8,
                 transform=ax.transAxes,
                 wrap=True,
@@ -1711,6 +1716,13 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # ## 9. Measured libjxl versus GJXL
 #
 # GJXL_RUN selects a separate forced fully-resident Metal study. The comparison
+# now uses the full 65-image, efforts 1–10 GJXL run from 2026-09-10, alongside
+# the paused libjxl study. GJXL has 1,947/1,950 accepted and fully timed settings.
+# The three unresolved cases are CLIC image 28d24b9c83de066597ff96a68769884f,
+# target 60, efforts 4/5/6. Those aggregate CLIC points remain missing (31/32);
+# neither encoder's incomplete points are filled in or silently re-cohorted.
+#
+# The comparison
 # uses exactly its manifest image cohort and effort selections in both encoders;
 # it never intersects away incomplete images. Quality targets and the external
 # scorer/decoder must match, but requested distance and effort semantics need not.
@@ -1727,10 +1739,45 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 
 
 # %% [markdown]
+# ### GJXL-only measured Pareto and calibration diagnostics
+#
+# These views use GJXL_RUN independently of the paused libjxl baseline. They
+# show accepted measured speed–compression points, per-image calibrated
+# rate–quality curves, and score error relative to each target. The three
+# unresolved outcomes remain in coverage counts even though they have no
+# selected calibration score to draw. These are measured plots, unlike the
+# fixed-sweep interpolation below. Files use a `gjxl-` prefix.
+# The fixed sweep's separate warmup diagnostic is retained in
+# GJXL_FIXED_RUN / `warmup-check-summary.json`; it does not change the protocol.
+
+# %%
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and (GJXL_RUN / "metadata.json").is_file()):
+    gjxl_study = load_quality_helpers()
+    gjxl_progress = gjxl_study.run_completion(
+        GJXL_RUN, gjxl_study.load_config(GJXL_RUN))
+    print(
+        f"GJXL: {gjxl_progress['timed_matches']}/{gjxl_progress['expected_matches']} "
+        f"settings fully timed; {gjxl_progress['timing_samples']} timing samples; "
+        f"{gjxl_progress['unmatched']} unresolved targets."
+    )
+    gjxl_quality_figures = generate_quality_figures(
+        GJXL_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True, prefix="gjxl-")
+    gjxl_rate_quality_figures = generate_rate_quality_figures(
+        GJXL_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        source="calibrated", prefix="gjxl-")
+    gjxl_calibration_error_figures = generate_rate_quality_figures(
+        GJXL_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        source="calibrated", view="target-error", prefix="gjxl-")
+
+
+# %% [markdown]
 # ## 10. Optional GJXL fixed-quality sweep
 #
 # Set GJXL_FIXED_RUN (or CJXL_GJXL_FIXED_RUN before starting Jupyter) to a
 # separately initialized --mode fixed run. These cells only read saved data.
+# The default is the complete 2026-09-10 sweep: 4,550 tuples, 22,750 timing
+# samples, and 4,550 quality scores across all 65 images and efforts 1–10.
 # Runtime figures accept timing-only CSVs: missing stages remain unknown and
 # stage plots are omitted. The quality Pareto is explicitly an interpolated
 # preview, not a matched-quality measurement. Q labels use libjxl's nominal
