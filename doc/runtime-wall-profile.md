@@ -258,6 +258,14 @@ in the same cell. It works independently of the corpus/quality selector and
 also works in the offline HTML. `STAGE_TABLE_SHOW_PERCENT` controls its initial
 state. The toggle affects presentation only; CSV values remain numeric.
 
+**Hide stages <1 ms** hides columns whose unrounded maximum across the
+displayed efforts is strictly below 1 ms for the selected quality/corpus.
+The threshold always uses milliseconds, even in a percentage view. Stages
+with a maximum of exactly 1 ms remain visible. `STAGE_TABLE_HIDE_SMALL` sets
+the initial state. The filter and percentage toggle remain independent when
+switching quality/corpus. Effort and Total stay visible; totals and percentage
+denominators still include hidden stages. DataFrames and CSVs retain all stages.
+
 - `stage_wall_table`: selected DataFrame with effort rows and stage columns,
   in mean ms/encode by default.
 - `stage_wall_percent`: all views indexed by resolution, quality and effort;
