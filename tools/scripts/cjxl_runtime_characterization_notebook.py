@@ -137,6 +137,17 @@ BD_RATE_EFFORTS = None  # None reads every configured effort; incomplete points 
 BD_RATE_IMAGE_IDS = None  # None preserves the baseline study's full image cohort.
 BD_RATE_COMPARE_RUN = GJXL_FIXED_RUN  # Set to None for libjxl only.
 
+# Independent saved batch benchmark; set to None to skip its section.
+BATCH_BENCHMARK_RUN = pathlib.Path(
+    os.environ.get(
+        "CJXL_BATCH_BENCHMARK_RUN",
+        "/Users/yunhocho/GitHub/gjxl/build/benchmarks/"
+        "image-batch-20260910T182839Z-af56a1yo",
+    )
+).expanduser()
+BATCH_BENCHMARK_SIZES = None  # None shows every collected batch size.
+BATCH_SHOW_ROUND_RANGE = True
+
 
 # %% [markdown]
 # ## Load and validate the per-tuple table
@@ -1751,6 +1762,134 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
 
 
 # %%
+def load_batch_benchmark(run):
+    """Read saved summaries; never import the bundle's collection/analysis scripts."""
+    import json
+
+    run = pathlib.Path(run).expanduser()
+    metadata = json.loads((run / "metadata.json").read_text())
+    summary = pd.read_csv(run / "summary.csv")
+    keys = ["size_class", "batch_size", "codec"]
+    numeric = ["images_per_second", "throughput_round_min", "throughput_round_max"]
+    missing = set(keys + numeric) - set(summary.columns)
+    if missing:
+        raise ValueError(f"Batch summary is missing columns: {sorted(missing)}")
+    for column in ["batch_size", *numeric]:
+        summary[column] = pd.to_numeric(summary[column], errors="raise")
+    if (not np.isfinite(summary[["batch_size", *numeric]].to_numpy()).all()
+            or (summary[["batch_size", *numeric]] <= 0).any().any()):
+        raise ValueError("Batch sizes and throughput values must be finite and positive")
+    if (summary["batch_size"] % 1 != 0).any():
+        raise ValueError("Batch sizes must be integers")
+    summary["batch_size"] = summary["batch_size"].astype(int)
+    if summary.duplicated(keys).any():
+        raise ValueError("Batch summary contains duplicate resolution/batch/encoder rows")
+    expected = {(image["size_class"], batch, codec)
+                for image in metadata["images"] for batch in metadata["batch_sizes"]
+                for codec in ("gjxl", "libjxl")}
+    actual = set(summary[keys].itertuples(index=False, name=None))
+    if not expected or actual != expected:
+        raise ValueError("Batch summary does not cover the complete metadata grid")
+    if (summary["throughput_round_min"] > summary["throughput_round_max"]).any():
+        raise ValueError("Batch summary contains inverted round ranges")
+    return metadata, summary
+
+
+def plot_batch_benchmark(metadata, summary, batch_sizes=None, show_round_range=True):
+    """Compare aggregate batch throughput, preserving resolution and batch size."""
+    batches = sorted(metadata["batch_sizes"] if batch_sizes is None else batch_sizes)
+    if (not batches or len(set(batches)) != len(batches)
+            or not set(batches).issubset(metadata["batch_sizes"])):
+        raise ValueError("Select distinct batch sizes present in the saved benchmark")
+    dimensions = {}
+    for image in metadata["images"]:
+        shape = (image["width"], image["height"])
+        previous = dimensions.setdefault(image["size_class"], shape)
+        if previous != shape:
+            raise ValueError("Images in a batch resolution class must have equal dimensions")
+    resolutions = sorted(dimensions, key=lambda key: math.prod(dimensions[key]))
+    figure, axes = subplot_grid(len(resolutions), columns=min(3, len(resolutions)),
+                                width=5.5, height=max(3.5, 0.9 * len(batches) + 2.0))
+    colors = {"gjxl": "#CC6677", "libjxl": "#4477AA"}
+    lookup = summary.set_index(["size_class", "batch_size", "codec"])
+    positions = np.arange(len(batches))
+    for axis, resolution in zip(axes, resolutions):
+        rates = {codec: np.array([lookup.loc[(resolution, batch, codec), "images_per_second"]
+                                 for batch in batches]) for codec in colors}
+        ratios = rates["gjxl"] / rates["libjxl"]
+        maximum = 0.0
+        for codec, offset in (("gjxl", -0.18), ("libjxl", 0.18)):
+            values = rates[codec]
+            y = positions + offset
+            axis.barh(y, values, height=0.3, color=colors[codec], zorder=2)
+            ends = values
+            if show_round_range:
+                low = np.array([lookup.loc[(resolution, batch, codec), "throughput_round_min"]
+                                for batch in batches])
+                high = np.array([lookup.loc[(resolution, batch, codec), "throughput_round_max"]
+                                 for batch in batches])
+                # Draw endpoints directly: these are round ranges, not confidence intervals.
+                axis.hlines(y, low, high, color="#333333", linewidth=1.1, zorder=3)
+                axis.vlines(low, y - 0.07, y + 0.07, color="#333333", linewidth=1, zorder=3)
+                axis.vlines(high, y - 0.07, y + 0.07, color="#333333", linewidth=1, zorder=3)
+                ends = np.maximum(values, high)
+            maximum = max(maximum, float(ends.max()))
+            for row, value, end in zip(positions, values, ends):
+                label = f"{value:.2f}" + (f" ({ratios[row]:.2f}×)" if codec == "gjxl" else "")
+                axis.annotate(label, (end, y[row]), xytext=(5, 0),
+                              textcoords="offset points", va="center", fontsize=9)
+        width, height = dimensions[resolution]
+        image_count = sum(image["size_class"] == resolution for image in metadata["images"])
+        axis.set_title(f"{width:,} × {height:,}\n{image_count} photographs")
+        axis.set(xlabel="Throughput (images/second) · higher is better",
+                 yticks=positions, yticklabels=[f"Batch {batch}" for batch in batches],
+                 xlim=(0, maximum * 1.4), ylim=(len(batches) - 0.5, -0.6))
+        axis.grid(False)
+        axis.grid(axis="x", alpha=0.2)
+    gjxl_label = f"GJXL · {metadata['gjxl_aq_mode']} {metadata['gjxl_backend'].title()}"
+    figure.legend(handles=[mlines.Line2D([], [], color=colors[codec], linewidth=8, label=label)
+                           for codec, label in (("gjxl", gjxl_label),
+                                                ("libjxl", f"libjxl · {metadata['libjxl_threads_per_image']} threads/image"))],
+                  loc="lower center", bbox_to_anchor=(0.5, 0.10), ncols=2)
+    figure.get_layout_engine().set(rect=(0, 0.20, 1, 0.80))
+    machine = next((line.split(":", 1)[1].strip() for line in metadata.get("machine", "").splitlines()
+                    if line.startswith("machdep.cpu.brand_string:")), "")
+    figure.suptitle("GJXL versus libjxl · image-batch throughput\n"
+                   + (f"{machine} · " if machine else "")
+                   + f"effort {metadata['effort']} · requested distance {metadata['distance']:g}")
+    ranges = (f"Whiskers: range of {metadata['process_repetitions']} collection rounds, not confidence intervals. "
+              if show_round_range else "")
+    policy = metadata["gjxl_thread_policy"].replace("_", " ")
+    figure.text(
+        0.5, 0.02,
+        "Parentheses: GJXL/libjxl throughput. " + ranges + "\n"
+        "Timed: linear RGB → in-memory codestream; input preparation/loading excluded. Each batch repeats one photograph.\n"
+        f"Quality is not matched. GJXL CPU threads: {policy}; per-image thread settings stay fixed as batches grow.",
+        fontsize=9, ha="center", va="bottom",
+    )
+    return figure
+
+
+def generate_batch_benchmark_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
+                                    batch_sizes=None, show_round_range=True):
+    """Render the saved batch summary independently of the quality-study plots."""
+    run = pathlib.Path(run).expanduser()
+    if not (run / "metadata.json").is_file() or not (run / "summary.csv").is_file():
+        print(f"No saved image-batch summary at {run}; skipping batch throughput.")
+        return {}
+    metadata, summary = load_batch_benchmark(run)
+    configure_style()
+    figure = plot_batch_benchmark(metadata, summary, batch_sizes, show_round_range)
+    name = "batch-throughput-by-resolution"
+    save_figure(figure, output_dir, name, formats)
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return {name: figure}
+
+
+# %%
 if __name__ == "__main__" and "ipykernel" not in sys.modules:
     raise SystemExit(main())
 
@@ -2037,3 +2176,33 @@ if __name__ == "__main__" and "ipykernel" in sys.modules and GJXL_FIXED_RUN is n
             GJXL_FIXED_RUN, fixed_output, SAVE_FORMATS, show=True, source="sweep")
     else:
         print("No fixed-sweep timing summary yet; collection is never started here.")
+
+
+# %% [markdown]
+# ## 11. Image-batch throughput by resolution
+#
+# `BATCH_BENCHMARK_RUN` points to an independent saved benchmark bundle. Set it
+# to `None` to skip this section, or select batch sizes with `BATCH_BENCHMARK_SIZES`.
+# `BATCH_SHOW_ROUND_RANGE` toggles the collection-round range whiskers.
+# Each panel compares GJXL and libjxl images/second at the same resolution and
+# batch size. Parenthesized ratios are GJXL throughput divided by libjxl throughput:
+# greater than 1 means higher GJXL throughput. Panels use separate throughput scales.
+#
+# The default bundle uses three photographs, each repeated within a batch,
+# at effort 7 and requested distance 1.2. This is not matched decoded quality.
+# GJXL uses fully-resident Metal and automatic CPU threading per image;
+# libjxl uses 14 threads per image. The total CPU budget is not held constant
+# as batches grow. Input preparation/loading are outside the timed interval.
+#
+# Saved throughput is total image count divided by summed per-image batch times,
+# using each image's median of process medians. Whiskers show the range of two
+# round summaries, not confidence intervals. This cell only reads the saved
+# metadata and summary CSV; it never invokes `run.py`, `analyze.py`, or encoders.
+
+# %%
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and BATCH_BENCHMARK_RUN is not None):
+    batch_benchmark_figures = generate_batch_benchmark_figures(
+        BATCH_BENCHMARK_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        batch_sizes=BATCH_BENCHMARK_SIZES, show_round_range=BATCH_SHOW_ROUND_RANGE,
+    )
