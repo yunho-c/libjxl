@@ -102,6 +102,7 @@ STAGE_TABLE_RESOLUTION = "clic_1_8_to_3_4mp"
 STAGE_TABLE_UNIT = "ms"  # "ms" or "percent"
 STAGE_TABLE_SHOW_PERCENT = False  # Initial state of the Plotly percentage toggle.
 STAGE_TABLE_HIDE_SMALL = False  # Hide stages whose maximum across efforts is <1 ms.
+STAGE_TABLE_COMPACT = False  # Combine the 15 stage columns into 10 paper categories.
 RATE_QUALITY_SOURCE = "calibrated"  # "sweep" or "calibrated"
 QUALITY_RUN = pathlib.Path(
     os.environ.get(
@@ -826,6 +827,22 @@ def plot_expanded_wall_breakdown(frame, quality=None, normalize=True):
     return figure
 
 
+def compact_wall_stage_groups():
+    """Fold the expanded partition without hiding quality-dependent stages."""
+    return {
+        "Preprocessing": ("Input unpack / color", "Inverse Gaborish"),
+        "Downsampling": ("Downsampling",),
+        "AQ / AC / CfL heuristics": ("Initial AQ", "AC/CfL tile heuristics"),
+        "Feature search": ("Feature search",),
+        "Perceptual refinement": ("Perceptual refinement",),
+        "Coefficients / metadata": ("Final coefficients", "DC / metadata / ordering"),
+        "AR filter selection": ("AR filter selection",),
+        "Entropy model": ("Entropy model",),
+        "Tokenization / output": ("Tokenization", "Model/token emission", "Assembly"),
+        "Frame / API remainder": ("Frame / API remainder",),
+    }
+
+
 def build_stage_wall_tables(frame):
     """Return numeric effort-by-stage tables and explicit coverage exclusions.
 
@@ -896,14 +913,26 @@ def build_stage_wall_tables(frame):
     percentages["Total (ms)"] = milliseconds["Total (ms)"]
     if not np.allclose(percentages[list(groups)].sum(axis=1), 100, rtol=0, atol=1e-6):
         raise ValueError("Stage percentages do not sum to 100")
+    compact_groups = compact_wall_stage_groups()
+    members = [name for names in compact_groups.values() for name in names]
+    if set(members) != set(groups) or len(members) != len(set(members)):
+        raise ValueError("Compact wall groups must partition the expanded stages exactly")
+    compact_ms = pd.DataFrame({label: milliseconds[list(names)].sum(axis=1)
+                               for label, names in compact_groups.items()})
+    compact_percent = compact_ms.div(milliseconds["Total (ms)"], axis=0) * 100
+    compact_ms["Total (ms)"] = milliseconds["Total (ms)"]
+    compact_percent["Total (ms)"] = milliseconds["Total (ms)"]
     return {"percent": percentages, "ms": milliseconds,
-            "coverage": pd.DataFrame(coverage), "groups": groups}
+            "compact_ms": compact_ms, "compact_percent": compact_percent,
+            "coverage": pd.DataFrame(coverage), "groups": groups,
+            "compact_groups": compact_groups}
 
 
 def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
-                          show_percent=False, hide_small=False):
+                          show_percent=False, hide_small=False, compact=False):
     """Plotly table with a corpus/quality selector; each view has effort rows."""
     import textwrap
+    from itertools import product
     import plotly.graph_objects as go
 
     if unit not in ("percent", "ms"):
@@ -916,13 +945,11 @@ def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
         raise ValueError(f"No complete wall table for {selected}")
     active = contexts.index(selected)
     stage_unit = "% of profiled wall time" if unit == "percent" else "ms/encode"
-    headers = ["Effort", *["<br>".join(textwrap.wrap(label, 17, break_long_words=False))
-                           for label in data.columns]]
     figure = go.Figure()
     buttons = []
-    views = {hidden: {key: [] for key in (
+    views = {(folded, hidden): {key: [] for key in (
         "plain", "combined", "header.values", "columnwidth", "cells.fill.color", "cells.align"
-    )} for hidden in (False, True)}
+    )} for folded, hidden in product((False, True), repeat=2)}
     show_percent = show_percent and unit == "ms"
     row_height = 46 if show_percent else 30
     max_rows = max(len(data.xs(context)) for context in contexts)
@@ -931,8 +958,6 @@ def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
         return "0" if value == 0 else "<0.1" if value < 0.1 else f"{value:,.1f}"
 
     for position, (res, q) in enumerate(contexts):
-        table = data.xs((res, q), level=("resolution_class", "quality"))
-        shares = tables["percent"].xs((res, q), level=("resolution_class", "quality"))
         count = frame.loc[frame["resolution_class"] == res, "image_id"].nunique()
         excluded = tables["coverage"].query("resolution_class == @res and not included")["effort"].tolist()
         quality_label = ("Pooled Q" + "/".join(str(q) for q in sorted(frame["quality"].unique()))
@@ -940,30 +965,37 @@ def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
         title = (f"libjxl encoding stages · {resolution_label(frame, res)} · {quality_label}"
                  f"<br><sup>{count} images; stages in {stage_unit}; total in ms/encode"
                  + ("; excluded efforts: " + ", ".join(map(str, excluded)) if excluded else "") + "</sup>")
-        values = [[f"E{effort}" for effort in table.index]]
-        combined = [values[0]]
-        # Keep the DataFrames numeric and unrounded. Only display cells are formatted.
-        for column in table:
-            suffix = " ms" if unit == "ms" or column == "Total (ms)" else "%"
-            cells = [format_number(value) + suffix for value in table[column]]
-            values.append(cells)
-            combined.append(cells if column == "Total (ms)" else [
-                f"{value}<br>({format_number(share)}%)"
-                for value, share in zip(cells, shares[column])
-            ])
-        stripes = ["#F1F4F7" if row % 2 == 0 else "white" for row in range(len(table))]
-        milliseconds = tables["ms"].xs((res, q), level=("resolution_class", "quality"))
-        for hidden, view in views.items():
-            kept = [0] + [i + 1 for i, column in enumerate(table.columns)
-                          if not hidden or column == "Total (ms)"
-                          or milliseconds[column].max() >= 1.0]
-            view["plain"].append([values[i] for i in kept])
-            view["combined"].append([combined[i] for i in kept])
-            view["header.values"].append([headers[i] for i in kept])
-            view["columnwidth"].append([55, *([105] * (len(kept) - 2)), 100])
-            view["cells.fill.color"].append([stripes] * len(kept))
-            view["cells.align"].append(["left"] + ["right"] * (len(kept) - 1))
-        initial = views[hide_small]
+        for folded in (False, True):
+            prefix = "compact_" if folded else ""
+            table = tables[prefix + unit].xs((res, q))
+            shares = tables[prefix + "percent"].xs((res, q))
+            milliseconds = tables[prefix + "ms"].xs((res, q))
+            headers = ["Effort", *["<br>".join(textwrap.wrap(label, 17, break_long_words=False))
+                                   for label in table.columns]]
+            values = [[f"E{effort}" for effort in table.index]]
+            combined = [values[0]]
+            # Sum unrounded stages before formatting or applying the 1 ms filter.
+            for column in table:
+                suffix = " ms" if unit == "ms" or column == "Total (ms)" else "%"
+                cells = [format_number(value) + suffix for value in table[column]]
+                values.append(cells)
+                combined.append(cells if column == "Total (ms)" else [
+                    f"{value}<br>({format_number(share)}%)"
+                    for value, share in zip(cells, shares[column])
+                ])
+            stripes = ["#F1F4F7" if row % 2 == 0 else "white" for row in range(len(table))]
+            for hidden in (False, True):
+                view = views[folded, hidden]
+                kept = [0] + [i + 1 for i, column in enumerate(table.columns)
+                              if not hidden or column == "Total (ms)"
+                              or milliseconds[column].max() >= 1.0]
+                view["plain"].append([values[i] for i in kept])
+                view["combined"].append([combined[i] for i in kept])
+                view["header.values"].append([headers[i] for i in kept])
+                view["columnwidth"].append([55, *([105] * (len(kept) - 2)), 100])
+                view["cells.fill.color"].append([stripes] * len(kept))
+                view["cells.align"].append(["left"] + ["right"] * (len(kept) - 1))
+        initial = views[compact, hide_small]
         figure.add_trace(go.Table(
             visible=position == active,
             columnwidth=initial["columnwidth"][-1],
@@ -979,52 +1011,39 @@ def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
                                                    {"title.text": title}]))
     menus = [dict(buttons=buttons, active=active, x=0, xanchor="left",
                   y=1.08, yanchor="bottom")]
-    hide_menu_index = 2 if unit == "ms" else 1
+    # Each option combination has its own native buttons, with only the current
+    # set visible. Switching sets avoids recursive cross-updates of button args
+    # as more toggles are added, and works offline without JavaScript callbacks.
+    states = list(product((False, True), (False, True), (False, True) if unit == "ms" else (False,)))
+    initial_state = (bool(compact), bool(hide_small), bool(show_percent))
+    controls = [(2, "Show percentages", 0.70)] if unit == "ms" else []
+    controls += [(1, "Hide stages <1 ms", 0.86), (0, "Compact stages", 1.0)]
+    menu_specs = [(state, option, label, x) for state in states for option, label, x in controls]
 
-    def column_update(hidden, percentages):
-        view = views[hidden]
+    def state_update(state):
+        folded, hidden, percentages = state
+        view = views[folded, hidden]
         return {"cells.values": view["combined" if percentages else "plain"],
+                "cells.height": 46 if percentages else 30,
                 **{key: view[key] for key in (
                     "header.values", "columnwidth", "cells.fill.color", "cells.align")}}
 
-    def percentage_update(hidden, percentages):
-        return {"cells.values": views[hidden]["combined" if percentages else "plain"],
-                "cells.height": 46 if percentages else 30}
-
-    def percentage_layout(percentages):
-        # Refresh only the other toggle's data arguments, avoiding recursive menus.
-        return {"height": 285 + (46 if percentages else 30) * max_rows,
-                f"updatemenus[{hide_menu_index}].buttons[0].args[0]": column_update(True, percentages),
-                f"updatemenus[{hide_menu_index}].buttons[0].args2[0]": column_update(False, percentages)}
-
-    def column_layout(hidden):
-        return ({"updatemenus[1].buttons[0].args[0]": percentage_update(hidden, True),
-                 "updatemenus[1].buttons[0].args2[0]": percentage_update(hidden, False)}
-                if unit == "ms" else {})
-
-    if unit == "ms":
-        # Update all traces so changing corpus/quality preserves the toggle state.
-        # Plotly's args2 toggles back without a widget or a live Python kernel.
+    for state, option, label, x in menu_specs:
+        target = tuple(not value if i == option else value for i, value in enumerate(state))
+        layout = {"height": 285 + (46 if target[2] else 30) * max_rows,
+                  "width": 1280 if target[0] else 1740}
+        for index, (menu_state, menu_option, _, _) in enumerate(menu_specs, start=1):
+            layout[f"updatemenus[{index}].visible"] = menu_state == target
+            layout[f"updatemenus[{index}].active"] = 0 if menu_state[menu_option] else -1
         menus.append(dict(
-            type="buttons", active=0 if show_percent else -1,
-            x=0.83, xanchor="right", y=1.08, yanchor="bottom",
-            buttons=[dict(
-                label="Show percentages", method="update",
-                args=[percentage_update(hide_small, True), percentage_layout(True)],
-                args2=[percentage_update(hide_small, False), percentage_layout(False)],
-            )],
+            type="buttons", visible=state == initial_state, active=0 if state[option] else -1,
+            x=x, xanchor="right", y=1.08, yanchor="bottom",
+            buttons=[dict(label=label, method="update", args=[state_update(target), layout])],
         ))
-    menus.append(dict(
-        type="buttons", active=0 if hide_small else -1,
-        x=1, xanchor="right", y=1.08, yanchor="bottom",
-        buttons=[dict(label="Hide stages <1 ms", method="update",
-                      args=[column_update(True, show_percent), column_layout(True)],
-                      args2=[column_update(False, show_percent), column_layout(False)])],
-    ))
     figure.update_layout(
         title=dict(text=buttons[active]["args"][1]["title.text"], x=0.01,
                    y=0.94, yanchor="top", font_size=18),
-        width=1740, height=285 + row_height * max_rows,
+        width=1280 if compact else 1740, height=285 + row_height * max_rows,
         margin=dict(l=12, r=12, t=135, b=70), paper_bgcolor="white",
         font_family="Arial",
         updatemenus=menus,
@@ -1033,34 +1052,38 @@ def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
                           text="Exclusive stages partition the profiled encode. Percentages use summed durations. "
                                "0 = measured zero; &lt;0.1 = positive below display precision. Rounding may affect row sums."
                                "<br>Hidden stages have a maximum below 1 ms across efforts in the selected view. "
-                               "Totals and percentage denominators still include them.")],
+                               "The filter applies after compact grouping. Totals and percentage denominators include hidden stages.")],
     )
     return figure
 
 
 def generate_stage_wall_tables(input_csv, output_dir, quality=80, resolution=None,
-                               unit="ms", show=False, show_percent=False, hide_small=False):
+                               unit="ms", show=False, show_percent=False, hide_small=False,
+                               compact=False):
     """Read a saved snapshot and export numeric CSVs plus an offline Plotly table."""
     import hashlib
     import json
 
     frame = load_image_tuples(input_csv)
     tables = build_stage_wall_tables(frame)
-    figure = plot_stage_wall_table(tables, frame, quality, resolution, unit, show_percent, hide_small)
+    figure = plot_stage_wall_table(tables, frame, quality, resolution, unit,
+                                  show_percent, hide_small, compact)
     selected_resolution = resolution or tables[unit].index.get_level_values("resolution_class")[0]
     selected_quality = "Pooled" if quality is None else f"Q{quality:g}"
-    tables["selected"] = tables[unit].xs((selected_resolution, selected_quality),
+    selected_data = tables[("compact_" if compact else "") + unit]
+    tables["selected"] = selected_data.xs((selected_resolution, selected_quality),
                                         level=("resolution_class", "quality"))
     output_dir = pathlib.Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("percent", "ms"):
-        tables[name].to_csv(output_dir / f"stage-wall-{name}.csv", float_format="%.12g")
+    for name in ("percent", "ms", "compact_percent", "compact_ms"):
+        tables[name].to_csv(output_dir / f"stage-wall-{name.replace('_', '-')}.csv", float_format="%.12g")
     tables["selected"].to_csv(output_dir / "stage-wall-selected.csv", float_format="%.12g")
     tables["coverage"].to_csv(output_dir / "stage-wall-coverage.csv", index=False)
     source = pathlib.Path(input_csv).expanduser().resolve()
     report = {
         "source_csv": str(source), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "stage_groups": tables["groups"],
+        "compact_stage_groups": tables["compact_groups"],
         "units": {"percent": "stage columns: percent; Total (ms): ms/encode",
                   "ms": "all columns: mean ms/encode"},
         "aggregation": "Mean representative instrumented sample per image/quality tuple; percentages are ratios of summed durations, not means of image percentages.",
@@ -1069,9 +1092,10 @@ def generate_stage_wall_tables(input_csv, output_dir, quality=80, resolution=Non
         "selected_view": {"resolution_class": selected_resolution,
                           "quality": selected_quality, "unit": unit,
                           "show_percent": bool(show_percent and unit == "ms"),
-                          "hide_stages_below_1_ms": bool(hide_small)},
+                          "hide_stages_below_1_ms": bool(hide_small),
+                          "compact": bool(compact)},
         "thread_count": int(frame["thread_count"].iloc[0]) if "thread_count" in frame else None,
-        "trial_dc_accounting": "DC / metadata / ordering includes trial DC work; Perceptual refinement excludes it.",
+        "trial_dc_accounting": "DC / metadata / ordering (Coefficients / metadata in compact mode) includes trial DC work; Perceptual refinement excludes it.",
     }
     metadata_path = source.parent.parent / "metadata.json"
     if metadata_path.is_file():
@@ -2226,11 +2250,25 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
 # %% [markdown]
 # ### Paper table: encoding wall time by effort and stage
 #
-# The table keeps the expanded plot's 15 mutually exclusive stage categories.
+# The full table keeps the expanded plot's 15 mutually exclusive stage categories.
 # AC/CfL remains one combined parallel pass; splitting it would not yield
 # additive elapsed times. Trial DC preparation stays in **DC / metadata /
 # ordering**, so **Perceptual refinement** excludes that DC time. See
 # `doc/runtime-wall-profile.md` for the timer boundaries.
+# **Compact stages** folds these into 10 columns using the following sums:
+#
+# | Compact column | Expanded columns |
+# | --- | --- |
+# | Preprocessing | Input unpack / color + Inverse Gaborish |
+# | AQ / AC / CfL heuristics | Initial AQ + AC/CfL tile heuristics |
+# | Coefficients / metadata | Final coefficients + DC / metadata / ordering |
+# | Tokenization / output | Tokenization + Model/token emission + Assembly |
+#
+# Downsampling, Feature search, Perceptual refinement, AR filter selection,
+# Entropy model, and Frame / API remainder stay separate. Totals and accounting
+# are unchanged; compact Coefficients / metadata still includes trial DC work.
+# `STAGE_TABLE_COMPACT` sets the initial grouping and the selected DataFrame/CSV.
+# All three buttons work independently and retain their state across the dropdown.
 #
 # Use a **fixed quality and corpus/resolution** for a paper table, with other
 # qualities in supplementary tables. Q10 changes the internal image resolution;
@@ -2249,14 +2287,17 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
 # `STAGE_TABLE_HIDE_SMALL` sets its initial state. It works with either unit and
 # with the percentage toggle. Effort and Total remain visible. Hidden stages
 # still contribute to the total and percentage denominator, so visible stages
-# may sum to less than the total or 100%. DataFrames and CSVs retain all stages.
+# may sum to less than the total or 100%. The filter runs **after grouping** in
+# compact mode. DataFrames and CSVs retain all columns of their grouping.
 #
 # Each row is one effort. `stage_wall_table` is the selected numeric DataFrame,
 # in milliseconds by default, as is `stage-wall-selected.csv`. CSV values stay
 # numeric; the percentage toggle only changes the Plotly display.
 # `stage_wall_percent` and `stage_wall_ms` contain all views, indexed by
 # `(resolution_class, quality, effort)`. All stage columns in the percentage
-# table are percentages; **Total (ms)** always gives mean profiled milliseconds
+# table are percentages. `stage_wall_compact_ms` and `stage_wall_compact_percent`
+# provide the corresponding compact tables. In every table,
+# **Total (ms)** always gives mean profiled milliseconds
 # per encode. Percentages divide summed stage durations by summed total time,
 # matching the expanded plot. They are not the equal-image mean of percentages.
 # Milliseconds average the saved representative instrumented sample per tuple
@@ -2269,7 +2310,8 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
 # zero. The current snapshot supports E1–E9. E10 is incomplete.
 #
 # This cell reads `INPUT_CSV` independently, exports `stage-wall-selected.csv`,
-# `stage-wall-percent.csv`, `stage-wall-ms.csv`, `stage-wall-coverage.csv`, and
+# `stage-wall-percent.csv`, `stage-wall-ms.csv`, `stage-wall-coverage.csv`,
+# `stage-wall-compact-ms.csv`, `stage-wall-compact-percent.csv`, plus
 # `stage-wall-methodology.json` under `OUTPUT_DIR`, and saves an offline
 # `stage-wall-table.html`. CSV values retain precision; the Plotly display uses
 # one decimal and distinguishes measured zero from positive values below 0.1.
@@ -2286,10 +2328,13 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         resolution=STAGE_TABLE_RESOLUTION, unit=STAGE_TABLE_UNIT, show=True,
         show_percent=STAGE_TABLE_SHOW_PERCENT,
         hide_small=STAGE_TABLE_HIDE_SMALL,
+        compact=STAGE_TABLE_COMPACT,
     )
     stage_wall_table = stage_wall_tables["selected"]
     stage_wall_percent = stage_wall_tables["percent"]
     stage_wall_ms = stage_wall_tables["ms"]
+    stage_wall_compact_ms = stage_wall_tables["compact_ms"]
+    stage_wall_compact_percent = stage_wall_tables["compact_percent"]
     stage_wall_coverage = stage_wall_tables["coverage"]
     display(stage_wall_table)
 

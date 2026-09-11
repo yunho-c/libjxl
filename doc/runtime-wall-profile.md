@@ -234,6 +234,24 @@ tokenization, entropy-model construction and emission are distinct serializer
 costs. They are accounting categories, not a strictly sequential pipeline.
 The wide table is intended for a full-width layout or supplementary material.
 
+**Compact stages** folds the 15 stage columns into 10 using this fixed mapping:
+
+| Compact column | Expanded columns summed |
+| --- | --- |
+| Preprocessing | Input unpack / color + Inverse Gaborish |
+| AQ / AC / CfL heuristics | Initial AQ + AC/CfL tile heuristics |
+| Coefficients / metadata | Final coefficients + DC / metadata / ordering |
+| Tokenization / output | Tokenization + Model/token emission + Assembly |
+
+Downsampling, Feature search, Perceptual refinement, AR filter selection,
+Entropy model, and Frame / API remainder remain separate. Grouping sums the
+unrounded exclusive durations and preserves totals and percentage denominators.
+Coefficients / metadata includes trial DC preparation; Perceptual refinement
+continues to exclude it. `STAGE_TABLE_COMPACT` defaults to `False` and sets the
+initial grouping and the selected DataFrame/CSV. The Plotly button affects only
+the figure and works independently of the percentage toggle, the small-stage
+filter, and the corpus/quality dropdown, including in the offline HTML.
+
 Keep quality and corpus/resolution explicit rather than treating the
 all-quality average as an encoder property. In this study, Q10 enables
 encoder-side downsampling. At effort 7, Q50 (distance 4.6) and Q70 (2.8) straddle
@@ -262,15 +280,20 @@ state. The toggle affects presentation only; CSV values remain numeric.
 displayed efforts is strictly below 1 ms for the selected quality/corpus.
 The threshold always uses milliseconds, even in a percentage view. Stages
 with a maximum of exactly 1 ms remain visible. `STAGE_TABLE_HIDE_SMALL` sets
-the initial state. The filter and percentage toggle remain independent when
+the initial state. In compact mode, the threshold applies to the combined
+column, so small constituent stages can together exceed 1 ms and remain visible.
+The filter and percentage toggle remain independent when
 switching quality/corpus. Effort and Total stay visible; totals and percentage
-denominators still include hidden stages. DataFrames and CSVs retain all stages.
+denominators still include hidden stages. DataFrames and CSVs retain every
+column in their respective grouping.
 
 - `stage_wall_table`: selected DataFrame with effort rows and stage columns,
   in mean ms/encode by default.
 - `stage_wall_percent`: all views indexed by resolution, quality and effort;
   stage columns are percentages and `Total (ms)` is mean profiled ms/encode.
 - `stage_wall_ms`: the same views with every duration in mean ms/encode.
+- `stage_wall_compact_ms` and `stage_wall_compact_percent`: the same views
+  with the 10 compact stage columns and unchanged `Total (ms)`.
 - `stage_wall_coverage`: expected, present and valid tuple counts, with reasons
   for excluding incomplete resolution/effort groups.
 
@@ -290,9 +313,10 @@ complete profiled time; percentage stage columns sum to 100 before rounding.
 The display distinguishes exact zero from positive values below 0.1.
 
 The cell writes `stage-wall-selected.csv`, `stage-wall-percent.csv`,
-`stage-wall-ms.csv`, `stage-wall-coverage.csv`, `stage-wall-methodology.json`
+`stage-wall-ms.csv`, `stage-wall-compact-ms.csv`, `stage-wall-compact-percent.csv`,
+`stage-wall-coverage.csv`, `stage-wall-methodology.json`
 and an offline `stage-wall-table.html` under `OUTPUT_DIR`. CSVs retain numeric
-precision. The methodology file records the input path/hash, units, stage
-mapping, selected view, and run-metadata identity when available. No benchmark
-collection is invoked. Plotly is a notebook dependency; CSV construction uses
+precision. The methodology file records the input path/hash, units, mappings
+for both groupings, selected view, and run-metadata identity when available.
+No benchmark collection is invoked. Plotly is a notebook dependency; CSV construction uses
 pandas, and the collection CLI keeps its standard-library-only boundary.
