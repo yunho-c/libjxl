@@ -26,6 +26,7 @@
 #   "matplotlib>=3.8,<4",
 #   "numpy>=1.26,<3",
 #   "pandas>=2.2,<3",
+#   "plotly>=6,<7",
 #   "scipy>=1.13,<2",
 # ]
 # ///
@@ -95,6 +96,11 @@ SAVE_FORMATS = ("png", "svg")
 DEBUG_STAGE_BREAKDOWN_BY_QUALITY = False
 # False shows mean milliseconds per image/quality encode instead of percentages.
 NORMALIZE_STAGE_BARS = True
+# Initial table view only; all qualities and resolutions are exported.
+STAGE_TABLE_QUALITY = 80  # None selects the pooled-quality view.
+STAGE_TABLE_RESOLUTION = "clic_1_8_to_3_4mp"
+STAGE_TABLE_UNIT = "ms"  # "ms" or "percent"
+STAGE_TABLE_SHOW_PERCENT = False  # Initial state of the Plotly percentage toggle.
 RATE_QUALITY_SOURCE = "calibrated"  # "sweep" or "calibrated"
 QUALITY_RUN = pathlib.Path(
     os.environ.get(
@@ -726,15 +732,8 @@ def expanded_wall_rows(frame):
     return rows, columns
 
 
-def plot_expanded_wall_breakdown(frame, quality=None, normalize=True):
-    """Stack exclusive stage percentages, or mean milliseconds per encode."""
-    # Check completeness across all qualities before selecting one so the
-    # debug figures retain exactly the same efforts as the pooled figure.
-    rows, columns = expanded_wall_rows(frame)
-    if quality is not None:
-        rows = rows[rows["quality"] == quality]
-    resolutions = resolution_order(frame)
-    figure, axes = subplot_grid(len(resolutions), width=5.4, height=4.1)
+def expanded_wall_stage_groups(columns):
+    """One exclusive partition shared by the expanded chart and paper tables."""
     groups = {
         "Input unpack / color": ("input_unpack", "color_conversion"),
         "Downsampling": ("downsampling",),
@@ -767,11 +766,24 @@ def plot_expanded_wall_breakdown(frame, quality=None, normalize=True):
         "Assembly": ("assembly",),
         "Frame / API remainder": ("frame_setup_other", "encode_api_other"),
     }
-    used = {
+    used = [
         "wall_exclusive_" + name + "_ms" for names in groups.values() for name in names
-    }
-    if used != set(columns):
+    ]
+    if set(used) != set(columns) or len(used) != len(set(used)):
         raise ValueError("Expanded wall plot groups do not cover the schema exactly")
+    return groups
+
+
+def plot_expanded_wall_breakdown(frame, quality=None, normalize=True):
+    """Stack exclusive stage percentages, or mean milliseconds per encode."""
+    # Check completeness across all qualities before selecting one so the
+    # debug figures retain exactly the same efforts as the pooled figure.
+    rows, columns = expanded_wall_rows(frame)
+    if quality is not None:
+        rows = rows[rows["quality"] == quality]
+    resolutions = resolution_order(frame)
+    figure, axes = subplot_grid(len(resolutions), width=5.4, height=4.1)
+    groups = expanded_wall_stage_groups(columns)
     colors = plt.get_cmap("tab20").colors
     for axis, resolution in zip(axes, resolutions):
         subset = rows[rows["resolution_class"] == resolution]
@@ -811,6 +823,224 @@ def plot_expanded_wall_breakdown(frame, quality=None, normalize=True):
         else "Expanded wall-time composition — Q%d (pooled across images)" % quality
     )
     return figure
+
+
+def build_stage_wall_tables(frame):
+    """Return numeric effort-by-stage tables and explicit coverage exclusions.
+
+    Percentages are ratios of summed durations, matching the expanded plot.
+    Milliseconds are arithmetic means of the saved representative samples.
+    Quality and resolution remain separate, with an additional pooled view.
+    """
+    if "encoder" in frame and set(frame["encoder"]) != {"libjxl"}:
+        raise ValueError("The expanded wall table requires libjxl wall-v2 data")
+    keys = ["resolution_class", "image_id", "quality", "effort"]
+    if frame.empty or frame[keys].isna().any().any() or frame.duplicated(keys).any():
+        raise ValueError("Wall table requires nonempty, unique image/quality/effort rows")
+    if "thread_count" in frame and (frame["thread_count"].isna().any()
+                                    or frame["thread_count"].nunique() != 1):
+        raise ValueError("Do not pool different or missing thread counts")
+    columns = [c for c in frame if c.startswith("wall_exclusive_") and c.endswith("_ms")]
+    groups = expanded_wall_stage_groups(columns)
+    measured = frame[columns + ["profiled_complete_wall_ms"]]
+    invalid = measured.notna() & (~np.isfinite(measured) | (measured < 0))
+    if invalid.any().any() or (frame["profiled_complete_wall_ms"] == 0).any():
+        raise ValueError("Wall durations must be finite and nonnegative, with positive totals")
+    valid = measured.notna().all(axis=1)
+    if "wall_profile_version" in frame:
+        valid &= frame["wall_profile_version"].eq(2)
+    if not np.allclose(frame.loc[valid, columns].sum(axis=1),
+                       frame.loc[valid, "profiled_complete_wall_ms"], rtol=1e-9, atol=1e-6):
+        raise ValueError("Expanded exclusive wall columns do not sum to complete encode")
+
+    qualities = sorted(frame["quality"].unique())
+    efforts = sorted(frame["effort"].unique())
+    records, coverage = [], []
+    for resolution in resolution_order(frame):
+        cohort = frame[frame["resolution_class"] == resolution]
+        image_ids = set(cohort["image_id"])
+        expected = {(image, quality) for image in image_ids for quality in qualities}
+        for effort in efforts:
+            subset = cohort[cohort["effort"] == effort]
+            observed = set(zip(subset["image_id"], subset["quality"]))
+            complete = observed == expected and bool(valid.loc[subset.index].all())
+            coverage.append({
+                "resolution_class": resolution, "effort": int(effort),
+                "image_count": len(image_ids), "quality_count": len(qualities),
+                "expected_tuples": len(expected), "present_tuples": len(subset),
+                "valid_stage_tuples": int(valid.loc[subset.index].sum()),
+                "included": complete,
+                "reason": "complete" if complete else (
+                    "missing tuple rows" if observed != expected else "missing wall-v2 measurements"),
+            })
+            if not complete:
+                continue
+            # Gate the entire quality grid first, just like the expanded plot.
+            for quality in [*qualities, None]:
+                selected = subset if quality is None else subset[subset["quality"] == quality]
+                record = {
+                    "resolution_class": resolution,
+                    "quality": "Pooled" if quality is None else f"Q{quality:g}",
+                    "effort": int(effort),
+                }
+                for label, names in groups.items():
+                    record[label] = selected[[f"wall_exclusive_{name}_ms" for name in names]].sum().sum() / len(selected)
+                record["Total (ms)"] = selected["profiled_complete_wall_ms"].mean()
+                records.append(record)
+    if not records:
+        raise ValueError("No complete resolution/effort groups for the wall table")
+    index = ["resolution_class", "quality", "effort"]
+    milliseconds = pd.DataFrame(records).set_index(index).sort_index()
+    percentages = milliseconds[list(groups)].div(milliseconds["Total (ms)"], axis=0) * 100
+    percentages["Total (ms)"] = milliseconds["Total (ms)"]
+    if not np.allclose(percentages[list(groups)].sum(axis=1), 100, rtol=0, atol=1e-6):
+        raise ValueError("Stage percentages do not sum to 100")
+    return {"percent": percentages, "ms": milliseconds,
+            "coverage": pd.DataFrame(coverage), "groups": groups}
+
+
+def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
+                          show_percent=False):
+    """Plotly table with a corpus/quality selector; each view has effort rows."""
+    import textwrap
+    import plotly.graph_objects as go
+
+    if unit not in ("percent", "ms"):
+        raise ValueError("Wall table unit must be 'percent' or 'ms'")
+    data = tables[unit]
+    contexts = list(dict.fromkeys(data.index.droplevel("effort")))
+    resolution = resolution or contexts[0][0]
+    selected = (resolution, "Pooled" if quality is None else f"Q{quality:g}")
+    if selected not in contexts:
+        raise ValueError(f"No complete wall table for {selected}")
+    active = contexts.index(selected)
+    stage_unit = "% of profiled wall time" if unit == "percent" else "ms/encode"
+    headers = ["Effort", *["<br>".join(textwrap.wrap(label, 17, break_long_words=False))
+                           for label in data.columns]]
+    figure = go.Figure()
+    buttons = []
+    plain_values, combined_values = [], []
+    show_percent = show_percent and unit == "ms"
+    row_height = 46 if show_percent else 30
+    max_rows = max(len(data.xs(context)) for context in contexts)
+
+    def format_number(value):
+        return "0" if value == 0 else "<0.1" if value < 0.1 else f"{value:,.1f}"
+
+    for position, (res, q) in enumerate(contexts):
+        table = data.xs((res, q), level=("resolution_class", "quality"))
+        shares = tables["percent"].xs((res, q), level=("resolution_class", "quality"))
+        count = frame.loc[frame["resolution_class"] == res, "image_id"].nunique()
+        excluded = tables["coverage"].query("resolution_class == @res and not included")["effort"].tolist()
+        quality_label = ("Pooled Q" + "/".join(str(q) for q in sorted(frame["quality"].unique()))
+                         if q == "Pooled" else q)
+        title = (f"libjxl encoding stages · {resolution_label(frame, res)} · {quality_label}"
+                 f"<br><sup>{count} images; stages in {stage_unit}; total in ms/encode"
+                 + ("; excluded efforts: " + ", ".join(map(str, excluded)) if excluded else "") + "</sup>")
+        values = [[f"E{effort}" for effort in table.index]]
+        combined = [values[0]]
+        # Keep the DataFrames numeric and unrounded. Only display cells are formatted.
+        for column in table:
+            suffix = " ms" if unit == "ms" or column == "Total (ms)" else "%"
+            cells = [format_number(value) + suffix for value in table[column]]
+            values.append(cells)
+            combined.append(cells if column == "Total (ms)" else [
+                f"{value}<br>({format_number(share)}%)"
+                for value, share in zip(cells, shares[column])
+            ])
+        plain_values.append(values)
+        combined_values.append(combined)
+        stripes = ["#F1F4F7" if row % 2 == 0 else "white" for row in range(len(table))]
+        figure.add_trace(go.Table(
+            visible=position == active,
+            columnwidth=[55, *([105] * (len(table.columns) - 1)), 100],
+            header=dict(values=headers, fill_color="#34495E", align="center",
+                        font=dict(color="white", size=12), height=65, line_color="white"),
+            cells=dict(values=combined if show_percent else values,
+                       fill_color=[stripes] * len(headers),
+                       align=["left"] + ["right"] * len(table.columns),
+                       font=dict(color="#202B33", size=12), height=row_height, line_color="white"),
+        ))
+        buttons.append(dict(label=f"{RESOLUTION_NAMES.get(res, res)} · {quality_label}",
+                            method="update", args=[{"visible": [i == position for i in range(len(contexts))]},
+                                                   {"title.text": title}]))
+    menus = [dict(buttons=buttons, active=active, x=0, xanchor="left",
+                  y=1.08, yanchor="bottom")]
+    if unit == "ms":
+        # Update all traces so changing corpus/quality preserves the toggle state.
+        # Plotly's args2 toggles back without a widget or a live Python kernel.
+        menus.append(dict(
+            type="buttons", active=0 if show_percent else -1,
+            x=1, xanchor="right", y=1.08, yanchor="bottom",
+            buttons=[dict(
+                label="Show percentages", method="update",
+                args=[{"cells.values": combined_values, "cells.height": 46},
+                      {"height": 285 + 46 * max_rows}],
+                args2=[{"cells.values": plain_values, "cells.height": 30},
+                       {"height": 285 + 30 * max_rows}],
+            )],
+        ))
+    figure.update_layout(
+        title=dict(text=buttons[active]["args"][1]["title.text"], x=0.01,
+                   y=0.94, yanchor="top", font_size=18),
+        width=1740, height=285 + row_height * max_rows,
+        margin=dict(l=12, r=12, t=135, b=55), paper_bgcolor="white",
+        font_family="Arial",
+        updatemenus=menus,
+        annotations=[dict(x=0, y=-0.07, xref="paper", yref="paper", showarrow=False,
+                          xanchor="left", yanchor="top", font_size=11,
+                          text="Exclusive stages partition the profiled encode. Percentages use summed durations. "
+                               "0 = measured zero; &lt;0.1 = positive below display precision. Rounding may affect row sums.")],
+    )
+    return figure
+
+
+def generate_stage_wall_tables(input_csv, output_dir, quality=80, resolution=None,
+                               unit="ms", show=False, show_percent=False):
+    """Read a saved snapshot and export numeric CSVs plus an offline Plotly table."""
+    import hashlib
+    import json
+
+    frame = load_image_tuples(input_csv)
+    tables = build_stage_wall_tables(frame)
+    figure = plot_stage_wall_table(tables, frame, quality, resolution, unit, show_percent)
+    selected_resolution = resolution or tables[unit].index.get_level_values("resolution_class")[0]
+    selected_quality = "Pooled" if quality is None else f"Q{quality:g}"
+    tables["selected"] = tables[unit].xs((selected_resolution, selected_quality),
+                                        level=("resolution_class", "quality"))
+    output_dir = pathlib.Path(output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("percent", "ms"):
+        tables[name].to_csv(output_dir / f"stage-wall-{name}.csv", float_format="%.12g")
+    tables["selected"].to_csv(output_dir / "stage-wall-selected.csv", float_format="%.12g")
+    tables["coverage"].to_csv(output_dir / "stage-wall-coverage.csv", index=False)
+    source = pathlib.Path(input_csv).expanduser().resolve()
+    report = {
+        "source_csv": str(source), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "stage_groups": tables["groups"],
+        "units": {"percent": "stage columns: percent; Total (ms): ms/encode",
+                  "ms": "all columns: mean ms/encode"},
+        "aggregation": "Mean representative instrumented sample per image/quality tuple; percentages are ratios of summed durations, not means of image percentages.",
+        "coverage": "Require the full image x quality grid observed in the input CSV for each resolution/effort before any quality selection. Missing groups are excluded, never zero-filled.",
+        "qualities": sorted(int(q) for q in frame["quality"].unique()),
+        "selected_view": {"resolution_class": selected_resolution,
+                          "quality": selected_quality, "unit": unit,
+                          "show_percent": bool(show_percent and unit == "ms")},
+        "thread_count": int(frame["thread_count"].iloc[0]) if "thread_count" in frame else None,
+        "trial_dc_accounting": "DC / metadata / ordering includes trial DC work; Perceptual refinement excludes it.",
+    }
+    metadata_path = source.parent.parent / "metadata.json"
+    if metadata_path.is_file():
+        metadata = json.loads(metadata_path.read_text())
+        report["run_metadata"] = {"path": str(metadata_path),
+                                  "sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
+                                  "methodology": metadata.get("methodology"),
+                                  "host_cpu": metadata.get("host", {}).get("cpu_brand")}
+    (output_dir / "stage-wall-methodology.json").write_text(json.dumps(report, indent=2) + "\n")
+    figure.write_html(output_dir / "stage-wall-table.html", include_plotlyjs=True)
+    if show:
+        figure.show()
+    return tables, figure
 
 
 def plot_refinement_wall(frame):
@@ -1947,6 +2177,70 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
         # )
         plt.show()
         plt.close(debug_figure)
+
+
+# %% [markdown]
+# ### Paper table: encoding wall time by effort and stage
+#
+# The table keeps the expanded plot's 15 mutually exclusive stage categories.
+# AC/CfL remains one combined parallel pass; splitting it would not yield
+# additive elapsed times. Trial DC preparation stays in **DC / metadata /
+# ordering**, so **Perceptual refinement** excludes that DC time. See
+# `doc/runtime-wall-profile.md` for the timer boundaries.
+#
+# Use a **fixed quality and corpus/resolution** for a paper table, with other
+# qualities in supplementary tables. Q10 changes the internal image resolution;
+# feature search and AR selection also depend on quality and effort. A pooled
+# row describes the specified workload mix, not a quality-independent encoder.
+# The initial CLIC/Q80 view is a convenience, not a claim of representativeness.
+# Select any collected quality/corpus using the Plotly dropdown. Set
+# `STAGE_TABLE_QUALITY = None` to start with the pooled view.
+# Milliseconds are the default. **Show percentages** toggles a percentage below
+# each stage's duration in the same cell, and works in the saved HTML too.
+# `STAGE_TABLE_SHOW_PERCENT` sets its initial state; the toggle is independent
+# of the quality/corpus selector. `STAGE_TABLE_UNIT = "percent"` retains the
+# percentage-only view when needed.
+#
+# Each row is one effort. `stage_wall_table` is the selected numeric DataFrame,
+# in milliseconds by default, as is `stage-wall-selected.csv`. CSV values stay
+# numeric; the percentage toggle only changes the Plotly display.
+# `stage_wall_percent` and `stage_wall_ms` contain all views, indexed by
+# `(resolution_class, quality, effort)`. All stage columns in the percentage
+# table are percentages; **Total (ms)** always gives mean profiled milliseconds
+# per encode. Percentages divide summed stage durations by summed total time,
+# matching the expanded plot. They are not the equal-image mean of percentages.
+# Milliseconds average the saved representative instrumented sample per tuple
+# (selected by complete elapsed-time median), not independent stage medians.
+# Instrumented totals are separate from the uninstrumented speed measurements.
+#
+# The complete image × quality grid is required for each resolution/effort
+# before selecting a quality. Incomplete groups are listed in
+# `stage_wall_coverage` and excluded from every view; missing data never becomes
+# zero. The current snapshot supports E1–E9. E10 is incomplete.
+#
+# This cell reads `INPUT_CSV` independently, exports `stage-wall-selected.csv`,
+# `stage-wall-percent.csv`, `stage-wall-ms.csv`, `stage-wall-coverage.csv`, and
+# `stage-wall-methodology.json` under `OUTPUT_DIR`, and saves an offline
+# `stage-wall-table.html`. CSV values retain precision; the Plotly display uses
+# one decimal and distinguishes measured zero from positive values below 0.1.
+# The dropdown only changes the displayed view; rerun this cell with the
+# configuration settings to change `stage_wall_table` and the selected CSV.
+# No encoding, profiling, or scoring is started.
+#
+# Plotly rendering uses [`go.Table`](https://plotly.com/python/table/).
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules:
+    stage_wall_tables, stage_wall_figure = generate_stage_wall_tables(
+        INPUT_CSV, OUTPUT_DIR, quality=STAGE_TABLE_QUALITY,
+        resolution=STAGE_TABLE_RESOLUTION, unit=STAGE_TABLE_UNIT, show=True,
+        show_percent=STAGE_TABLE_SHOW_PERCENT,
+    )
+    stage_wall_table = stage_wall_tables["selected"]
+    stage_wall_percent = stage_wall_tables["percent"]
+    stage_wall_ms = stage_wall_tables["ms"]
+    stage_wall_coverage = stage_wall_tables["coverage"]
+    display(stage_wall_table)
 
 
 # %% [markdown]

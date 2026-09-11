@@ -223,3 +223,68 @@ sidecars separately: the timing/stage verifier does not verify Samply coverage.
 Edit the Jupytext `.py` notebook and regenerate the paired `.ipynb`. The notebook
 supports both legacy and wall-v2 CSVs and chooses the expanded wall figure when
 the new fields are present.
+
+## Effort-by-stage tables for the paper
+
+The notebook's **Paper table: encoding wall time by effort and stage** cell
+reads the same saved CSV independently of the other figure cells. It shares
+the expanded plot's 15 stage groups, including its trial-DC accounting. These
+are useful boundaries to retain: AC/CfL is one enclosing parallel pass, while
+tokenization, entropy-model construction and emission are distinct serializer
+costs. They are accounting categories, not a strictly sequential pipeline.
+The wide table is intended for a full-width layout or supplementary material.
+
+Keep quality and corpus/resolution explicit rather than treating the
+all-quality average as an encoder property. In this study, Q10 enables
+encoder-side downsampling. At effort 7, Q50 (distance 4.6) and Q70 (2.8) straddle
+the distance-3 streaming eligibility condition in `CanDoStreamingEncoding`;
+streaming skips the full-frame patch/spline searches. Q90 (1.0) and Q95 (0.55)
+straddle the 0.7 threshold below which the default EPF iteration count becomes
+zero; AR selection then returns after setting the default field. These source
+conditions explain the observed changes, but other effort/image conditions
+also affect which work executes. Do not present them as universal Q cutoffs.
+
+`STAGE_TABLE_QUALITY`, `STAGE_TABLE_RESOLUTION`, and `STAGE_TABLE_UNIT` select
+the initial view. CLIC/Q80 is only the initial selection. The Plotly dropdown
+also provides every collected quality and an explicitly labeled pooled view
+for each corpus/resolution. For a paper, choose the quality used in the
+corresponding experiment and give quality-specific variants in supplementary
+tables. The dropdown changes only the figure; rerun the cell with changed
+configuration to change the selected DataFrame/CSV.
+
+Milliseconds are the default for the selected DataFrame, CSV and Plotly table.
+The **Show percentages** toggle adds the stage's percentage below its duration
+in the same cell. It works independently of the corpus/quality selector and
+also works in the offline HTML. `STAGE_TABLE_SHOW_PERCENT` controls its initial
+state. The toggle affects presentation only; CSV values remain numeric.
+
+- `stage_wall_table`: selected DataFrame with effort rows and stage columns,
+  in mean ms/encode by default.
+- `stage_wall_percent`: all views indexed by resolution, quality and effort;
+  stage columns are percentages and `Total (ms)` is mean profiled ms/encode.
+- `stage_wall_ms`: the same views with every duration in mean ms/encode.
+- `stage_wall_coverage`: expected, present and valid tuple counts, with reasons
+  for excluding incomplete resolution/effort groups.
+
+Stage milliseconds are arithmetic means of the saved representative
+instrumented samples. Percentages are 100 times summed stage time divided by
+summed complete profiled time, matching the plot. This is a time-weighted
+composition, not an equal-image mean of per-image percentages. The pooled view
+uses one representative sample per image/quality tuple; it does not pool
+corpora/resolutions. Uninstrumented speed measurements remain separate.
+
+The full image-by-quality grid observed in the input CSV is required at an
+effort before any quality-specific table is generated. A missing stage or
+missing tuple excludes that effort for that resolution from every view.
+The current 2026-09-08 partial snapshot supports E1–E9; E10 is incomplete.
+Absent groups are never replaced with zero. Stage sums are checked against
+complete profiled time; percentage stage columns sum to 100 before rounding.
+The display distinguishes exact zero from positive values below 0.1.
+
+The cell writes `stage-wall-selected.csv`, `stage-wall-percent.csv`,
+`stage-wall-ms.csv`, `stage-wall-coverage.csv`, `stage-wall-methodology.json`
+and an offline `stage-wall-table.html` under `OUTPUT_DIR`. CSVs retain numeric
+precision. The methodology file records the input path/hash, units, stage
+mapping, selected view, and run-metadata identity when available. No benchmark
+collection is invoked. Plotly is a notebook dependency; CSV construction uses
+pandas, and the collection CLI keeps its standard-library-only boundary.
