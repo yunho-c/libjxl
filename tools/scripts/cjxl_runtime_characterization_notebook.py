@@ -1684,6 +1684,7 @@ def plot_bd_rate(report, by_resolution=False):
             axis.set(xlim=(1, 10), ylim=(-1, 1))
             axis.text(0.5, 0.5, "No complete points for this interval and cohort",
                       ha="center", transform=axis.transAxes, fontsize=9)
+        axis.invert_yaxis()
         axis.text(0, -0.23, "\n".join(coverage) if coverage else "All selected efforts complete",
                   transform=axis.transAxes, va="top", fontsize=7, color="#60666C", wrap=True)
     handles, legend_labels = axes[0].get_legend_handles_labels()
@@ -1691,8 +1692,7 @@ def plot_bd_rate(report, by_resolution=False):
     low, high = report["quality_range"]
     figure.suptitle(
         f"Speed vs. compression efficiency · SSIMU2 {low:g}–{high:g}\n"
-        "Equal-image mean BD-rate; lower-left is better\n"
-        "PCHIP; vertical spans show Akima sensitivity, not confidence intervals",
+        "Equal-image mean BD-rate; upper-left is better",
         fontsize=12,
     )
     # Resolve label collisions in display coordinates, including across encoders.
@@ -1986,8 +1986,9 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 #
 # Each effort is compared with the baseline on the same raw measured SSIMU2
 # interval (default 75–85), integrating log(bytes) per image with PCHIP and
-# checking Akima sensitivity. Negative BD-rate means fewer bytes. Images
-# receive equal weight; resolution panels keep their own fixed manifest cohort.
+# checking Akima sensitivity. Negative BD-rate means fewer bytes. The y-axis
+# is inverted, so more negative values appear higher and upper-left is better.
+# Images receive equal weight; resolution panels keep their own fixed manifest cohort.
 # Q10's resampled libjxl points are excluded. Reversals, insufficient supporting
 # points, missing quality brackets, and incomplete timing are reported, never
 # extrapolated or silently removed from an effort's cohort.
@@ -2001,8 +2002,11 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 #
 # Outputs: `speed-bd-rate`, `speed-bd-rate-by-resolution` in `SAVE_FORMATS`,
 # plus `speed-bd-rate-report.json` with per-image values, coverage reasons,
-# configuration/ledger identities, and PCHIP–Akima differences. Method
-# sensitivity is not a confidence interval or a bound on interpolation error.
+# configuration/ledger identities, and PCHIP–Akima differences.
+#
+# **Interpolation sensitivity:** markers use PCHIP; vertical spans show the
+# difference between PCHIP and Akima. These spans indicate method sensitivity,
+# not confidence intervals or bounds on interpolation error.
 
 # %%
 if __name__ == "__main__" and "ipykernel" in sys.modules:

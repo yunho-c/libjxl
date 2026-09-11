@@ -40,11 +40,13 @@ the collection CLI retains its standard-library-only dependency boundary.
 For each image, PCHIP interpolates **log(encoded bytes)** against the **raw
 measured fast-ssim2 score**. The difference from the baseline is integrated over
 the explicit interval, divided by the interval width, exponentiated, and
-reported as a percentage. Negative is smaller. Per-image BD percentages are
+reported as a percentage. Negative is smaller; the plot inverts the y-axis so
+negative values appear higher and upper-left is better. Per-image BD percentages are
 averaged with equal image weights; no rate–quality curve is fitted to pooled
 images. Akima is computed over the same interval as a sensitivity diagnostic.
-Vertical spans in the plot show the PCHIP–Akima difference, not a confidence
-interval or an accuracy bound. The score interval is never automatically
+Vertical spans in the plot show the PCHIP–Akima difference, explained in the
+notebook markdown as method sensitivity rather than a confidence interval or
+an accuracy bound. The score interval is never automatically
 shortened or extrapolated to make a curve fit.
 
 Only unresampled points are used, excluding libjxl's Q10 transition. Curves
