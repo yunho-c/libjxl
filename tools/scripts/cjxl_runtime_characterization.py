@@ -10,7 +10,7 @@ The experiment deliberately keeps four measurements separate:
 
 * complete-encode wall time from an uninstrumented API harness;
 * exact wall-clock encoder stages from the opt-in profiler (serializer-only
-  in legacy runs, expanded frontend/refinement stages in wall-v2 runs);
+  in legacy runs, expanded frontend/refinement stages in wall-v2/v3 runs);
 * aggregate worker time from that profiler (not latency);
 * sampled thread-CPU attribution from Samply (not wall time).
 
@@ -837,8 +837,11 @@ def validate_wall_sample(sample, required_version=2):
         if value > inclusive[name] or (counts[name] == 0 and inclusive[name] != 0):
             raise StudyError("Invalid inclusive/exclusive wall stage: %s" % name)
     root = sample["wall_root_nanoseconds"]
-    if sum(exclusive.values()) != root or not 0 < root <= sample["elapsed_nanoseconds"]:
-        raise StudyError("Wall stages do not partition the frame wall time")
+    api = sample.get("wall_api_nanoseconds") if required_version == 3 else 0
+    if (type(root) is not int or root <= 0 or type(api) is not int or api < 0
+            or sum(exclusive.values()) != root + api
+            or root + api > sample["elapsed_nanoseconds"]):
+        raise StudyError("Wall stages do not partition the measured frame and API wall time")
     for name in ("internal_width", "internal_height", "resampling", "frame_invocations"):
         if type(sample[name]) is not int or sample[name] <= 0:
             raise StudyError("Invalid wall profile geometry/count: %s" % name)
@@ -958,6 +961,8 @@ def command_stages(args, images, benchmark, efforts, budget):
                               "wall_root_nanoseconds", "internal_width", "internal_height", "resampling",
                               "frame_invocations", "refinement_iterations"):
                     record["representative_" + field] = representative[field]
+                if record["wall_profile_version"] == 3:
+                    record["representative_wall_api_nanoseconds"] = representative["wall_api_nanoseconds"]
             append_jsonl(records_path, record)
             done.add(identifier)
             budget.completed_one()
@@ -1211,6 +1216,8 @@ def tuple_summary(timing_records, stage_records):
                         row["wall_%s_%s_ms" % (kind, name)] = value / 1_000_000
                 row["wall_exclusive_encode_api_other_ms"] = (
                     representative_elapsed - stage["representative_wall_root_nanoseconds"]
+                    - (stage["representative_wall_api_nanoseconds"]
+                       if stage["wall_profile_version"] == 3 else 0)
                 ) / 1_000_000
                 for name in ("internal_width", "internal_height", "resampling", "frame_invocations", "refinement_iterations"):
                     row[name] = stage["representative_" + name]
@@ -1365,7 +1372,7 @@ minus its complete serializer wall time.
 summed or interpreted as latency. Samply columns are sampled thread-CPU
 attribution and are likewise not wall-clock timings.
 
-For expanded wall-v2 captures, `wall_exclusive_*_ms` columns (including
+For expanded wall-v2/v3 captures, `wall_exclusive_*_ms` columns (including
 `encode_api_other`) partition complete encode wall time. `wall_inclusive_*_ms`
 columns include nested stages and must not be summed as a latency partition.
 Missing stage captures remain blank, not zero. Timing data is read from
@@ -1486,8 +1493,8 @@ def add_run_arguments(parser):
     parser.add_argument("--stage-build-manifest", type=pathlib.Path)
     parser.add_argument("--reference-run", type=pathlib.Path,
                         help="reuse codestreams/timings from this run for a separate stage-only pass")
-    parser.add_argument("--wall-profile-version", type=int, choices=(0, 2), default=0,
-                        help="require the expanded wall profile schema (2) in a new run")
+    parser.add_argument("--wall-profile-version", type=int, choices=(0, 2, 3), default=0,
+                        help="require expanded wall profile schema 2 or 3 in a new run")
     parser.add_argument("--cjxl-cmake-cache", type=pathlib.Path)
     parser.add_argument("--phase", choices=("timing", "stages", "profiles", "all"), default="all")
     parser.add_argument("--qualities", default=",".join(map(str, DEFAULT_QUALITIES)))

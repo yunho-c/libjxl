@@ -699,7 +699,7 @@ def plot_stage_breakdown(frame, cells, normalize=True):
 
 
 # %% [markdown]
-# ### Expanded frontend wall profiles (version 2)
+# ### Expanded frontend wall profiles (versions 2 and 3)
 #
 # Only fully populated resolution/quality/effort cells enter these plots.
 # The exclusive stages, including the outside-frame API remainder, sum to
@@ -711,6 +711,22 @@ def plot_stage_breakdown(frame, cells, normalize=True):
 
 
 # %%
+def wall_profile_version(frame):
+    """Reject mixed measurement boundaries, even across different table views."""
+    if "wall_profile_version" not in frame:
+        raise ValueError("Missing wall profile version")
+    versions = set(frame["wall_profile_version"].dropna())
+    if len(versions) != 1 or not versions <= {2, 3}:
+        raise ValueError("Use one wall profile version (2 or 3); do not mix versions")
+    version = int(next(iter(versions)))
+    additions = {f"wall_exclusive_{name}_ms" for name in (
+        "input_copy", "reference_copy", "chroma_quantization", "output_handling")}
+    present = additions.intersection(frame.columns)
+    if (version == 3 and present != additions) or (version == 2 and present):
+        raise ValueError("Wall stage columns disagree with the profile version")
+    return version
+
+
 def expanded_wall_rows(frame):
     columns = [
         c
@@ -719,7 +735,8 @@ def expanded_wall_rows(frame):
     ]
     if not columns:
         return frame.iloc[:0], columns
-    valid = frame[columns].notna().all(axis=1)
+    version = wall_profile_version(frame)
+    valid = frame[columns].notna().all(axis=1) & frame["wall_profile_version"].eq(version)
     # These figures pool all qualities. Require the whole resolution/effort
     # group so a partially collected effort cannot silently change that mix.
     keys = ["resolution_class", "effort"]
@@ -737,9 +754,9 @@ def expanded_wall_rows(frame):
 def expanded_wall_stage_groups(columns):
     """One exclusive partition shared by the expanded chart and paper tables."""
     groups = {
-        "Input unpack / color": ("input_unpack", "color_conversion"),
+        "Input / color preparation": ("input_unpack", "color_conversion"),
         "Downsampling": ("downsampling",),
-        "Initial AQ": ("initial_aq",),
+        "Initial quantization": ("initial_aq",),
         "Inverse Gaborish": ("inverse_gaborish",),
         "Feature search": ("feature_search",),
         "AC/CfL tile heuristics": (
@@ -766,8 +783,15 @@ def expanded_wall_stage_groups(columns):
         "Entropy model": ("entropy_model",),
         "Model/token emission": ("emission",),
         "Assembly": ("assembly",),
-        "Frame / API remainder": ("frame_setup_other", "encode_api_other"),
+        "Other encoder / API work": ("frame_setup_other", "encode_api_other"),
     }
+    for label, names in {
+        "Input / color preparation": ("input_copy", "reference_copy"),
+        "Initial quantization": ("chroma_quantization",),
+        "Assembly": ("output_handling",),
+    }.items():
+        groups[label] += tuple(name for name in names
+                               if f"wall_exclusive_{name}_ms" in columns)
     used = [
         "wall_exclusive_" + name + "_ms" for names in groups.values() for name in names
     ]
@@ -812,7 +836,7 @@ def plot_expanded_wall_breakdown(frame, quality=None, normalize=True):
             axis.text(
                 0.5,
                 0.5,
-                "No complete wall-v2 efforts yet",
+                "No complete wall-profile efforts yet",
                 ha="center",
                 transform=axis.transAxes,
             )
@@ -830,16 +854,16 @@ def plot_expanded_wall_breakdown(frame, quality=None, normalize=True):
 def compact_wall_stage_groups():
     """Fold the expanded partition without hiding quality-dependent stages."""
     return {
-        "Preprocessing": ("Input unpack / color", "Inverse Gaborish"),
+        "Preprocessing": ("Input / color preparation", "Inverse Gaborish"),
         "Downsampling": ("Downsampling",),
-        "AQ / AC / CfL heuristics": ("Initial AQ", "AC/CfL tile heuristics"),
+        "AQ / AC / CfL heuristics": ("Initial quantization", "AC/CfL tile heuristics"),
         "Feature search": ("Feature search",),
         "Perceptual refinement": ("Perceptual refinement",),
         "Coefficients / metadata": ("Final coefficients", "DC / metadata / ordering"),
         "AR filter selection": ("AR filter selection",),
         "Entropy model": ("Entropy model",),
         "Tokenization / output": ("Tokenization", "Model/token emission", "Assembly"),
-        "Frame / API remainder": ("Frame / API remainder",),
+        "Other encoder / API work": ("Other encoder / API work",),
     }
 
 
@@ -851,13 +875,14 @@ def build_stage_wall_tables(frame):
     Quality and resolution remain separate, with an additional pooled view.
     """
     if "encoder" in frame and set(frame["encoder"]) != {"libjxl"}:
-        raise ValueError("The expanded wall table requires libjxl wall-v2 data")
+        raise ValueError("The expanded wall table requires libjxl wall-profile data")
     keys = ["resolution_class", "image_id", "quality", "effort"]
     if frame.empty or frame[keys].isna().any().any() or frame.duplicated(keys).any():
         raise ValueError("Wall table requires nonempty, unique image/quality/effort rows")
     if "thread_count" in frame and (frame["thread_count"].isna().any()
                                     or frame["thread_count"].nunique() != 1):
         raise ValueError("Do not pool different or missing thread counts")
+    version = wall_profile_version(frame)
     columns = [c for c in frame if c.startswith("wall_exclusive_") and c.endswith("_ms")]
     groups = expanded_wall_stage_groups(columns)
     measured = frame[columns + ["profiled_complete_wall_ms"]]
@@ -865,8 +890,7 @@ def build_stage_wall_tables(frame):
     if invalid.any().any() or (frame["profiled_complete_wall_ms"] == 0).any():
         raise ValueError("Wall durations must be finite and nonnegative, with positive totals")
     valid = measured.notna().all(axis=1)
-    if "wall_profile_version" in frame:
-        valid &= frame["wall_profile_version"].eq(2)
+    valid &= frame["wall_profile_version"].eq(version)
     if not np.allclose(frame.loc[valid, columns].sum(axis=1),
                        frame.loc[valid, "profiled_complete_wall_ms"], rtol=1e-9, atol=1e-6):
         raise ValueError("Expanded exclusive wall columns do not sum to complete encode")
@@ -889,7 +913,7 @@ def build_stage_wall_tables(frame):
                 "valid_stage_tuples": int(valid.loc[subset.index].sum()),
                 "included": complete,
                 "reason": "complete" if complete else (
-                    "missing tuple rows" if observed != expected else "missing wall-v2 measurements"),
+                    "missing tuple rows" if observed != expected else "missing wall-profile measurements"),
             })
             if not complete:
                 continue
@@ -925,7 +949,7 @@ def build_stage_wall_tables(frame):
     return {"percent": percentages, "ms": milliseconds,
             "compact_ms": compact_ms, "compact_percent": compact_percent,
             "coverage": pd.DataFrame(coverage), "groups": groups,
-            "compact_groups": compact_groups}
+            "compact_groups": compact_groups, "wall_profile_version": version}
 
 
 def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
@@ -963,7 +987,7 @@ def plot_stage_wall_table(tables, frame, quality=80, resolution=None, unit="ms",
         quality_label = ("Pooled Q" + "/".join(str(q) for q in sorted(frame["quality"].unique()))
                          if q == "Pooled" else q)
         title = (f"libjxl encoding stages · {resolution_label(frame, res)} · {quality_label}"
-                 f"<br><sup>{count} images; stages in {stage_unit}; total in ms/encode"
+                 f"<br><sup>wall-v{tables['wall_profile_version']}; {count} images; stages in {stage_unit}; total in ms/encode"
                  + ("; excluded efforts: " + ", ".join(map(str, excluded)) if excluded else "") + "</sup>")
         for folded in (False, True):
             prefix = "compact_" if folded else ""
@@ -1083,6 +1107,7 @@ def generate_stage_wall_tables(input_csv, output_dir, quality=80, resolution=Non
     report = {
         "source_csv": str(source), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "stage_groups": tables["groups"],
+        "wall_profile_version": tables["wall_profile_version"],
         "compact_stage_groups": tables["compact_groups"],
         "units": {"percent": "stage columns: percent; Total (ms): ms/encode",
                   "ms": "all columns: mean ms/encode"},
@@ -2255,17 +2280,24 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
 # additive elapsed times. Trial DC preparation stays in **DC / metadata /
 # ordering**, so **Perceptual refinement** excludes that DC time. See
 # `doc/runtime-wall-profile.md` for the timer boundaries.
+# Wall-v3 assigns input/reference copying to Input / color preparation,
+# chroma quantization adjustment to Initial quantization, and output-buffer
+# handling to Assembly. These fold into Preprocessing, AQ / AC / CfL heuristics,
+# and Tokenization / output. Other encoder / API work remains a mixed residual;
+# it must not be classified wholesale as entropy/codestream work.
+# Wall-v2 remains supported with its original measured boundaries and values.
+# Versions cannot be mixed; the title and methodology export identify the version.
 # **Compact stages** folds these into 10 columns using the following sums:
 #
 # | Compact column | Expanded columns |
 # | --- | --- |
-# | Preprocessing | Input unpack / color + Inverse Gaborish |
-# | AQ / AC / CfL heuristics | Initial AQ + AC/CfL tile heuristics |
+# | Preprocessing | Input / color preparation + Inverse Gaborish |
+# | AQ / AC / CfL heuristics | Initial quantization + AC/CfL tile heuristics |
 # | Coefficients / metadata | Final coefficients + DC / metadata / ordering |
 # | Tokenization / output | Tokenization + Model/token emission + Assembly |
 #
 # Downsampling, Feature search, Perceptual refinement, AR filter selection,
-# Entropy model, and Frame / API remainder stay separate. Totals and accounting
+# Entropy model, and Other encoder / API work stay separate. Totals and accounting
 # are unchanged; compact Coefficients / metadata still includes trial DC work.
 # `STAGE_TABLE_COMPACT` sets the initial grouping and the selected DataFrame/CSV.
 # All three buttons work independently and retain their state across the dropdown.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and fingerprint the expanded profiler without committing its worktree.
 
-The source must already contain the wall-v2 patch. Uses a separate build tree
+The source must already contain the expanded wall profiler. Uses a separate build tree
 so old stage runs retain their original binaries. Rebuilding a tree already
 used by a measurement run is intentionally refused.
 """
@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import subprocess
 
 
@@ -22,6 +23,10 @@ def main():
     source = args.source.resolve()
     comparison = args.comparison_repo.resolve()
     root = args.build_root.resolve()
+    header = (source / "lib/jxl/enc_stage_profile.h").read_text()
+    version = re.search(r"kEncoderWallProfileVersion\s*=\s*(\d+)", header)
+    if version is None or int(version[1]) not in (2, 3):
+        parser.error("Source must declare a supported wall profile version (2 or 3)")
     if (root / "build-manifest.json").exists():
         parser.error("Build manifest already exists; choose a new build root")
     root.mkdir(parents=True, exist_ok=True)
@@ -103,7 +108,7 @@ def main():
     }
     manifest = {
         "schema_version": 3,
-        "wall_profile_version": 2,
+        "wall_profile_version": int(version[1]),
         "libjxl_revision": revision,
         "source": str(source),
         "commands": commands,

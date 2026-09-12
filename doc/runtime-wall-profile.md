@@ -1,6 +1,6 @@
 # Expanded encoder wall profiles
 
-The wall-v2 profiler is implemented in the sibling `libjxl-gjxl-stage-profile`
+The wall-v3 profiler is implemented in the sibling `libjxl-gjxl-stage-profile`
 checkout. Its comparison harness lives in `gjxl-libjxl-comparison`. Ordinary
 encoding and existing stage/Samply artifacts are retained unchanged. No encoder
 scheduling barriers are added.
@@ -8,11 +8,13 @@ scheduling barriers are added.
 ## Measurements
 
 Harness schema 3 preserves the legacy serializer `phase_nanoseconds` and
-aggregate-worker `work_nanoseconds` fields and adds `wall_profile_version: 2`
-to every sample. New maps are:
+aggregate-worker `work_nanoseconds` fields. Each sample declares
+`wall_profile_version`: 2 for the original expanded boundaries, 3 for the
+additional remainder attribution described below. The wall fields are:
 
 - `wall_exclusive_nanoseconds`: nonoverlapping caller-thread intervals, summed
-  across invocations. Their sum equals `wall_root_nanoseconds` exactly.
+  across invocations. In v2 their sum equals `wall_root_nanoseconds`; in v3
+  it equals `wall_root_nanoseconds + wall_api_nanoseconds`, exactly.
 - `wall_inclusive_nanoseconds`: each scope including its nested scopes; these
   values must not be summed as an encode-time partition.
 - `wall_invocations`: number of measured calls, including cheap early returns.
@@ -20,9 +22,10 @@ to every sample. New maps are:
   `internal_height`, and `resampling`: explanatory counters and main-frame
   logical encoding geometry. Internal dimensions exclude block padding.
 
-The root encloses the outermost instrumented `EncodeFrame` dispatch. Public API
-setup, teardown and work outside that interval are reported as the difference
-between complete encode elapsed time and root time. Nested internal frames are
+The root encloses the outermost instrumented `EncodeFrame` dispatch. Version 3
+also measures selected API work outside that root, recorded separately as
+`wall_api_nanoseconds`. The API residual is complete encode elapsed time minus
+both root and measured API time (v2 subtracts only the root). Nested internal frames are
 accounted using a caller-thread scope stack, rather than counting their full
 duration again. Worker callbacks do not enter that scope stack. Timers enclose
 pool dispatch through completion, including worker imbalance and waits.
@@ -47,6 +50,43 @@ AC selection, CfL and quant-field adjustment remain interleaved within each
 parallel tile. The additive wall stage is their combined enclosing pool pass.
 Separating them into additive wall bars would require changing the schedule.
 
+### Version 3: measured remainder attribution
+
+Four additional exclusive timers feed the existing 15 expanded / 10 compact
+groups; they do not add paper-table columns:
+
+| Raw timer | Measured boundary | Expanded group | Compact group |
+| --- | --- | --- | --- |
+| `input_copy` | `JxlEncoderChunkedFrameAdapter::CopyBuffers` during nonstreaming input submission | Input / color preparation | Preprocessing |
+| `reference_copy` | Allocation, copy and logical resize of pre-Gaborish `orig_opsin` for AR heuristics | Input / color preparation | Preprocessing |
+| `chroma_quantization` | `ComputeChromacityAdjustments`, including pixel statistics when enabled | Initial quantization | AQ / AC / CfL heuristics |
+| `output_handling` | Output-processor flushing and the harness output vector's initial allocation and growth | Assembly | Tokenization / output |
+
+These scopes time only identified work. `output_handling` does not enclose all
+of `JxlEncoderProcessOutput`, which also performs perceptual analysis and
+encoding. A flush nested inside a frame subtracts from its enclosing wall
+scope; only a scope outside the frame contributes to `wall_api_nanoseconds`.
+Its exclusive duration appears once in the stage map in either case. Explicit
+API scopes do not create additional frame invocations or propagate to workers.
+
+The private benchmark hook attaches a sink to both frame settings and that
+encoder's output wrapper. It is intended for this harness's single-frame,
+buffer-output lifecycle; the sink must outlive output processing. General
+multi-frame or externally replaced output processors are outside this study.
+
+Unclassified frame/API setup and shared allocation/destruction remain **Other
+encoder / API work**, formerly **Frame / API remainder**. This mixed residual
+must not be classified wholesale as entropy/codestream work. No sampled CPU
+percentages are redistributed into wall-time columns. The expanded labels
+**Input unpack / color** and **Initial AQ** become **Input / color preparation**
+and **Initial quantization** to accommodate the added scopes.
+
+Version-2 CSVs retain their original values and attribution; only display labels
+change. The notebook rejects mixed versions and inconsistent version/stage
+schemas, and records the version in the Plotly title and methodology JSON.
+The default paper table still uses the saved v2 cohort. Producing v3 paper
+numbers requires a separately collected, complete v3 stage ledger.
+
 ### Stage hierarchy and overlap
 
 The notebook's 15 plotted categories do not overlap: they sum exclusive wall
@@ -58,9 +98,9 @@ recursively and are omitted here.
 
 ```text
 Complete encode
-├── Input unpack / color
+├── Input / color preparation
 ├── Downsampling
-├── Initial AQ
+├── Initial quantization
 ├── Inverse Gaborish
 ├── Feature search
 ├── AC/CfL tile heuristics
@@ -89,7 +129,7 @@ Complete encode
 ├── Entropy model
 ├── Model/token emission
 ├── Assembly
-└── Frame / API remainder
+└── Other encoder / API work
 ```
 
 The starred trial DC work is inside the inclusive refinement and roundtrip
@@ -111,7 +151,7 @@ parents and children.
 Samply operation percentages use sampled thread-CPU time, not elapsed encode
 time. A worker reconstruction stack may not contain its coordinating caller,
 so the sample label need not identify the enclosing AR or quantizer-refinement
-wall stage. Use the wall-v2 fields for those latency boundaries.
+wall stage. Use the expanded wall fields for those latency boundaries.
 
 The Samply parser now matches `ModularFrameEncoder::` methods rather than the
 bare type name. The bare name also appears in unrelated function arguments
@@ -129,7 +169,7 @@ frozen manifest. Uncommitted source changes therefore remain reproducible.
 python3 tools/scripts/cjxl_wall_profile_build.py \
   --source ../libjxl-gjxl-stage-profile \
   --comparison-repo ../gjxl-libjxl-comparison \
-  --build-root ../gjxl-libjxl-comparison/build/libjxl-wall-v2
+  --build-root ../gjxl-libjxl-comparison/build/libjxl-wall-v3-NEW
 ```
 
 `cjxl_wall_profile_validate.py --help` describes the ordinary/instrumented
@@ -139,9 +179,57 @@ every wall partition, and retains balanced six-pair perturbation results. Its
 5% sink-overhead threshold triggers review, not a claim of statistical
 equivalence. Do not run other benchmarks or builds during perturbation checks.
 
+Use `--wall-profile-version 3` for v3 validation. `--case-set remainder-pilot`
+selects 12 identity cases: Kodak 01 and one CLIC image at E1/3/7/8 Q80, Kodak
+E7 Q10 and E8 Q95, Kodak E7 Q80 without workers, and one 12 MP E5 Q90 input.
+It screens overhead at Kodak E1/7/8 Q80 with eight workers and E7 Q80 without
+workers, retaining six alternating process triplets per configuration. This
+bounded pilot excludes E9–10 and does not require `--pilot-corpus`; the default
+`full` case set retains the original wider qualification and requires that
+manifest. Neither validation mode runs implicitly from building or plotting.
+
 The standalone `tools/encoder_wall_timer_test.cc` in the profiling checkout
-tests nested frames, exclusive/inclusive accounting, disabled sinks and worker
-isolation. Main-checkout Python tests exercise the schema invariants.
+tests nested frames, exclusive/inclusive accounting, API roots and nested API
+scopes, idempotent early stop, disabled sinks and worker isolation. Main-checkout
+Python tests exercise both schema versions and table grouping invariants.
+
+### Version-3 validation status (2026-09-11)
+
+The Release build and standalone timer checks passed, along with 37 focused
+Python tests. The first 12-case pilot completed before the user's instruction
+to defer it arrived. All outputs were byte-identical and decoded, and measured
+partitions passed, but a concurrent performance-sensitive measurement was
+reported. Its timing results are excluded from overhead qualification; no
+overhead conclusion or broad remeasurement is authorized by that run.
+The retained run contains a `QUALIFICATION_STATUS.json` marking this exclusion.
+
+The fresh [pilot summary](../../libjxl-runtime-study-2026-09-03/wall-v3-validation-20260911T211101Z/summary.json)
+passes the bounded overhead screen: all 12 identity cases are byte-identical
+across ordinary, sink-off and sink-on variants and decode successfully. All
+96 instrumented samples (24 identity plus 72 perturbation) satisfy the v3
+frame/API partition. Frozen build hashes match before and after the run, and
+the live profiling source and harness match the frozen build inputs.
+
+Each Q80 configuration uses Kodak 01, six alternating process triplets, one
+warmup and three timed samples per process. Values are medians of paired
+percentage differences:
+
+| Effort | Workers | Sink-on vs sink-off | Sink-on vs ordinary |
+| --- | --- | --- | --- |
+| 1 | 8 | +2.06% | +0.38% |
+| 7 | 8 | -0.91% | -0.08% |
+| 8 | 8 | -0.17% | -0.63% |
+| 7 | 0 | -0.02% | +0.10% |
+
+No configuration crosses the 5% median sink-overhead review threshold. The
+largest median increase is approximately 0.10 ms at E1. Individual pairs
+still fluctuate (E1: -5.56% to +7.57%; E7 with workers: -2.35% to +10.97%),
+and Spotlight indexing was visible before the run. This is a successful
+bounded perturbation screen, not proof of zero overhead or full-sweep
+qualification; negative differences do not indicate an encoding speedup.
+Raw results, commands, build verification and process snapshots are retained
+in the new directory. The earlier excluded pilot remains unchanged. Complete
+v3 stage remeasurement and regeneration of paper values remain separate work.
 
 ### Recorded qualification (2026-09-07)
 
@@ -175,8 +263,8 @@ Use `cjxl_runtime_characterization.py run --phase stages`, supply the new
 
 ```text
 --reference-run ../libjxl-runtime-study-2026-09-03/run-e8ff0976
---output ../libjxl-runtime-study-2026-09-03/run-e8ff0976-wall-v2
---wall-profile-version 2
+--output ../libjxl-runtime-study-2026-09-03/run-e8ff0976-wall-v3
+--wall-profile-version 3
 ```
 
 Supply the ordinary benchmark, cjxl and corpus arguments as in the original
@@ -184,7 +272,7 @@ run. Reference corpus hash, quality/effort grid and thread count must match.
 The reference codestream is hash-compared against every new instrumented
 encode. Existing outputs and timing records are read, not copied or replaced.
 New profiles and execution events use the new output directory. Resume with
-the identical arguments; persisted version-2 jobs are skipped, while an
+the identical arguments; persisted jobs of the requested version are skipped, while an
 interrupted unrecorded job is retried. Build and configuration changes reject
 resume instead of mixing measurements.
 
@@ -221,7 +309,7 @@ codestreams. Audit the reference run's requested Samply captures and symbol
 sidecars separately: the timing/stage verifier does not verify Samply coverage.
 
 Edit the Jupytext `.py` notebook and regenerate the paired `.ipynb`. The notebook
-supports both legacy and wall-v2 CSVs and chooses the expanded wall figure when
+supports legacy, wall-v2 and wall-v3 CSVs and chooses the expanded wall figure when
 the new fields are present.
 
 ## Effort-by-stage tables for the paper
@@ -238,13 +326,13 @@ The wide table is intended for a full-width layout or supplementary material.
 
 | Compact column | Expanded columns summed |
 | --- | --- |
-| Preprocessing | Input unpack / color + Inverse Gaborish |
-| AQ / AC / CfL heuristics | Initial AQ + AC/CfL tile heuristics |
+| Preprocessing | Input / color preparation + Inverse Gaborish |
+| AQ / AC / CfL heuristics | Initial quantization + AC/CfL tile heuristics |
 | Coefficients / metadata | Final coefficients + DC / metadata / ordering |
 | Tokenization / output | Tokenization + Model/token emission + Assembly |
 
 Downsampling, Feature search, Perceptual refinement, AR filter selection,
-Entropy model, and Frame / API remainder remain separate. Grouping sums the
+Entropy model, and Other encoder / API work remain separate. Grouping sums the
 unrounded exclusive durations and preserves totals and percentage denominators.
 Coefficients / metadata includes trial DC preparation; Perceptual refinement
 continues to exclude it. `STAGE_TABLE_COMPACT` defaults to `False` and sets the
