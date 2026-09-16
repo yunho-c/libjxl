@@ -94,6 +94,8 @@ OUTPUT_DIR = pathlib.Path(
 EXPECTED_TIMING_SAMPLES = 5
 SAVE_FORMATS = ("png", "svg")
 DEBUG_STAGE_BREAKDOWN_BY_QUALITY = False
+# Also export the original multi-effort, per-quality throughput diagnostic.
+DEBUG_THROUGHPUT_BY_QUALITY = False
 # False shows mean milliseconds per image/quality encode instead of percentages.
 NORMALIZE_STAGE_BARS = True
 # Initial table view only; all qualities and resolutions are exported.
@@ -542,6 +544,28 @@ def plot_quality_effort_heatmaps(frame, cells):
 # The default panels use efforts 1, 5, and the highest effort with complete
 # timing coverage. Values are the average per-image runtime within each
 # resolution class, shown on log–log axes.
+#
+# The companion `throughput-vs-resolution` figure defaults to one effort-7
+# curve, excluding Q10. For each resolution and nominal quality, throughput is
+# `1000 * sum(megapixels) / sum(complete_encode_median_ms)`. The plotted value
+# is the arithmetic mean of these six throughputs at Q30, Q50, Q70, Q80, Q90,
+# and Q95, with equal weight per quality. These are requested encoder quality
+# settings, not matched perceptual-quality targets. Every quality must have
+# complete timings for the same full image cohort; incomplete points stay gaps.
+#
+# The compact figure uses serif typography, a monochrome curve, a linear
+# MP/s y-axis, and a log-base-2 x-axis. Tick labels mark measured group means
+# (approximately 0.39, 2.77, 12, 24, and 48 MP in the default saved study).
+# Megapixels already measure area; doubling both dimensions quadruples MP.
+# The resolution groups contain different images, so these are corpus
+# comparisons, not a controlled resize experiment. Connecting lines guide the
+# eye. The SVG export is vector artwork suitable for placing in a paper.
+#
+# Set `DEBUG_THROUGHPUT_BY_QUALITY = True` (CLI:
+# `--debug-throughput-by-quality`) to additionally generate
+# `debug-throughput-vs-resolution`: the original per-quality curves including
+# Q10, with panels for efforts 1, 5, and the highest complete effort. Q10 may
+# downsample internally; all throughput values count original input pixels.
 
 
 # %%
@@ -584,6 +608,137 @@ def plot_resolution_scaling(frame, cells):
     handles, labels = axes[0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="outside lower center", ncols=7)
     figure.suptitle(encoder_label(frame) + " runtime scaling with resolution")
+    return figure
+
+
+def resolution_throughput_rows(frame, cells, effort=7,
+                               qualities=(30, 50, 70, 80, 90, 95)):
+    """Average quality-specific MP/s equally, requiring a fixed complete cohort."""
+    records = []
+    for resolution, images in frame.groupby("resolution_class", observed=True):
+        image_ids = set(images["image_id"])
+        selected = images[(images["effort"] == effort) & images["quality"].isin(qualities)]
+        group = cells[(cells["resolution_class"] == resolution)
+                      & (cells["effort"] == effort) & cells["quality"].isin(qualities)]
+        complete = (
+            len(group) == len(qualities)
+            and set(group["quality"]) == set(qualities)
+            and group["timing_complete"].all()
+            and all(set(selected.loc[selected["quality"] == q, "image_id"]) == image_ids
+                    for q in qualities)
+        )
+        records.append({
+            "resolution_class": resolution,
+            "mean_megapixels": images.drop_duplicates("image_id")["megapixels"].mean(),
+            "throughput_mp_s": (1000.0 / group["runtime_ms_per_mp"]).mean()
+                               if complete else math.nan,
+            "image_count": len(image_ids),
+            "quality_count": len(qualities),
+            "timing_complete": bool(complete),
+        })
+    return pd.DataFrame.from_records(records).sort_values("mean_megapixels")
+
+
+def plot_throughput_vs_resolution(frame, cells):
+    """Paper view: effort 7, equal mean over nominal Q30/Q50/Q70/Q80/Q90/Q95."""
+    rows = resolution_throughput_rows(frame, cells)
+    style = {
+        "font.family": "serif",
+        "font.serif": ["DejaVu Serif"],
+        "font.size": 9,
+        "axes.labelsize": 9,
+        "axes.titlesize": 9,
+        "axes.titleweight": "normal",
+        "axes.edgecolor": "0.2",
+        "axes.labelcolor": "0.1",
+        "axes.linewidth": 0.7,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": False,
+        "axes.facecolor": "white",
+        "figure.facecolor": "white",
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "xtick.color": "0.2",
+        "ytick.color": "0.2",
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "legend.fontsize": 8,
+        "text.color": "0.1",
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
+    }
+    with matplotlib.rc_context(style):
+        figure, axis = plt.subplots(figsize=(3.5, 2.45), layout="constrained")
+        axis.plot(
+            rows["mean_megapixels"], rows["throughput_mp_s"],
+            color="0.15", linewidth=1.25, marker="o", markersize=4.2,
+            markerfacecolor="white", markeredgewidth=1.0,
+            label=encoder_label(frame) + ", effort 7",
+        )
+        axis.set_xlabel("Input image resolution (MP)")
+        axis.set_ylabel("Encoding throughput (MP/s)")
+        axis.set_xscale("log", base=2)
+        axis.set_xticks(rows["mean_megapixels"], [
+            ("%.2f" if value < 1 else "%.3g") % value
+            for value in rows["mean_megapixels"]
+        ])
+        axis.minorticks_off()
+        axis.tick_params(axis="both", which="major", length=3, width=0.7)
+        axis.set_ylim(bottom=0)
+        axis.margins(x=0.07, y=0.15)
+        axis.set_axisbelow(True)
+        axis.grid(axis="y", color="0.88", linewidth=0.5)
+        axis.legend(loc="lower right", frameon=False, handlelength=2)
+    return figure
+
+
+def plot_throughput_vs_resolution_debug(frame, cells):
+    """Diagnostic: separate qualities, including Q10, across selected efforts."""
+    efforts = select_scaling_efforts(cells)
+    figure, axes = subplot_grid(
+        len(efforts), columns=len(efforts), width=5.1, height=4.2
+    )
+    resolutions = (
+        cells.groupby("resolution_class", observed=True)["mean_megapixels"]
+        .mean()
+        .sort_values()
+        .to_numpy()
+    )
+    tick_labels = [
+        ("%.2f MP" if value < 1 else "%.3g MP") % value
+        for value in resolutions
+    ]
+    for axis, effort in zip(axes, efforts):
+        subset = cells[(cells["effort"] == effort) & cells["timing_complete"]]
+        for quality in sorted(subset["quality"].unique()):
+            line = subset[subset["quality"] == quality].sort_values("mean_megapixels")
+            axis.plot(
+                line["mean_megapixels"],
+                1000.0 / line["runtime_ms_per_mp"],
+                color=QUALITY_COLORS.get(quality, "#555555"),
+                marker="o",
+                linewidth=1.4,
+                markersize=4,
+                label="Q%d" % quality,
+            )
+        axis.set_title("Effort %d" % effort)
+        axis.set_xlabel("Mean input image resolution (MP; log$_2$ scale)")
+        axis.set_ylabel("Complete encode throughput (MP/s)")
+        axis.set_xscale("log", base=2)
+        axis.set_xticks(resolutions, tick_labels)
+        axis.minorticks_off()
+        axis.set_ylim(bottom=0)
+        axis.grid(True, alpha=0.3)
+    handles, labels = axes[0].get_legend_handles_labels()
+    figure.legend(handles, labels, loc="outside lower center", ncols=7)
+    notes = "Input MP/s \u00b7 higher is faster \u00b7 different images across resolution groups"
+    if encoder_label(frame) == "libjxl" and (cells["quality"] == 10).any():
+        notes += "\nQ10 may downsample internally; throughput counts original input pixels"
+    figure.suptitle(
+        encoder_label(frame) + " encoding throughput versus resolution\n" + notes,
+        fontsize=12,
+    )
     return figure
 
 
@@ -1240,6 +1395,7 @@ def generate_characterization(
     formats=("png", "svg"),
     show=False,
     normalize_stage_bars=True,
+    debug_throughput_by_quality=False,
 ):
     configure_style()
     frame = load_image_tuples(input_csv)
@@ -1248,9 +1404,14 @@ def generate_characterization(
         "runtime-vs-effort": plot_runtime_vs_effort(frame, cells),
         "quality-effort-heatmaps": plot_quality_effort_heatmaps(frame, cells),
         "resolution-scaling": plot_resolution_scaling(frame, cells),
+        "throughput-vs-resolution": plot_throughput_vs_resolution(frame, cells),
         "rate-runtime-tradeoff": plot_rate_runtime_tradeoff(frame, cells),
         "timing-variability": plot_timing_variability(frame, expected_timing_samples),
     }
+    if debug_throughput_by_quality:
+        figures["debug-throughput-vs-resolution"] = plot_throughput_vs_resolution_debug(
+            frame, cells
+        )
     if cells["stage_complete"].any():
         figures["stage-wall-breakdown"] = plot_stage_breakdown(
             frame, cells, normalize=normalize_stage_bars
@@ -1294,6 +1455,8 @@ def parse_args(argv=None):
         help="comma-separated output formats: png, svg, and/or pdf",
     )
     parser.add_argument("--show", action="store_true")
+    parser.add_argument("--debug-throughput-by-quality", action="store_true",
+                        help="also plot per-quality throughput at multiple efforts")
     parser.add_argument("--quality-run", type=pathlib.Path,
                         help="optional saved quality study; never starts collection")
     parser.add_argument("--butteraugli-run", type=pathlib.Path,
@@ -1323,6 +1486,7 @@ def main(argv=None):
         args.expected_timing_samples,
         args.formats,
         args.show,
+        debug_throughput_by_quality=args.debug_throughput_by_quality,
     )
     if args.quality_run:
         generate_quality_figures(args.quality_run, args.output_dir, args.formats, args.show)
@@ -2238,6 +2402,7 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         SAVE_FORMATS,
         show=True,
         normalize_stage_bars=NORMALIZE_STAGE_BARS,
+        debug_throughput_by_quality=DEBUG_THROUGHPUT_BY_QUALITY,
     )
 
 
@@ -2595,7 +2760,8 @@ if __name__ == "__main__" and "ipykernel" in sys.modules and GJXL_FIXED_RUN is n
     if fixed_csv.is_file() and fixed_csv.stat().st_size:
         fixed_output = OUTPUT_DIR / "gjxl-fixed"
         fixed_results = generate_characterization(
-            fixed_csv, fixed_output, EXPECTED_TIMING_SAMPLES, SAVE_FORMATS, show=True)
+            fixed_csv, fixed_output, EXPECTED_TIMING_SAMPLES, SAVE_FORMATS, show=True,
+            debug_throughput_by_quality=DEBUG_THROUGHPUT_BY_QUALITY)
         fixed_quality_figures = generate_quality_figures(
             GJXL_FIXED_RUN, fixed_output, SAVE_FORMATS, show=True)
         fixed_rate_figures = generate_rate_quality_figures(
