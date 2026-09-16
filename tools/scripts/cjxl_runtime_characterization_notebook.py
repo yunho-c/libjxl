@@ -94,7 +94,7 @@ OUTPUT_DIR = pathlib.Path(
 EXPECTED_TIMING_SAMPLES = 5
 SAVE_FORMATS = ("png", "svg")
 DEBUG_STAGE_BREAKDOWN_BY_QUALITY = False
-# Also export the original multi-effort, per-quality throughput diagnostic.
+# Also export per-quality resolution curves and the quality plot including Q10.
 DEBUG_THROUGHPUT_BY_QUALITY = False
 # False shows mean milliseconds per image/quality encode instead of percentages.
 NORMALIZE_STAGE_BARS = True
@@ -500,6 +500,28 @@ def plot_runtime_vs_effort(frame, cells):
 
 # %% [markdown]
 # ## 2. Quality–effort runtime surfaces
+#
+# The paper companion `throughput-vs-quality` fixes effort at 7 and pools all
+# images into a single curve at requested qualities Q30, Q50, Q70, Q80, Q90,
+# and Q95. Q10 remains excluded. At each quality, throughput is
+# `1000 * sum(megapixels) / sum(complete_encode_median_ms)` over the full image
+# cohort. A point requires complete timing coverage in every resolution group;
+# missing points remain gaps. Both axes are linear, with quality labels at
+# their actual numeric positions. Typography matches the other paper figures.
+#
+# The six saved settings support a plot of measured throughput versus requested
+# encoder quality. They do not establish the behavior between settings, and
+# requested Q is not a measured perceptual-quality score. Markers are measured
+# points; connecting segments only guide the eye. No smoothing, fitted curve,
+# or new timing collection is used. A denser sweep would be needed to study
+# fine changes between these settings.
+#
+# Set `DEBUG_THROUGHPUT_BY_QUALITY = True` to also generate
+# `debug-throughput-vs-quality`. It includes Q10 as a separate diamond marker;
+# the legend reports its internal downsampling factor when available in the
+# saved data. Throughput still counts original input pixels. The Q30–Q95
+# paper figure remains unchanged. This diagnostic can be rendered directly
+# with `plot_throughput_vs_quality(frame, cells, include_q10=True)`.
 
 
 # %%
@@ -758,6 +780,72 @@ def plot_throughput_vs_effort(frame, cells):
         axis.minorticks_off()
         axis.tick_params(axis="both", which="major", length=3, width=0.7)
         axis.margins(x=0.04, y=0.12)
+        axis.set_axisbelow(True)
+        axis.grid(axis="y", color="0.88", linewidth=0.5)
+        axis.legend(loc="lower left", frameon=False, handlelength=2)
+    return figure
+
+
+def quality_throughput_rows(frame, cells, effort=7,
+                            qualities=(30, 50, 70, 80, 90, 95)):
+    """Pool all image work at each requested quality, keeping effort fixed."""
+    records = []
+    for quality in qualities:
+        cohorts = resolution_throughput_rows(frame, cells, effort=effort,
+                                             qualities=(quality,))
+        complete = bool(cohorts["timing_complete"].all())
+        group = cells[(cells["effort"] == effort) & (cells["quality"] == quality)]
+        total_ms = (group["runtime_ms_per_mp"] * group["total_megapixels"]).sum()
+        records.append({
+            "quality": int(quality),
+            "effort": int(effort),
+            "throughput_mp_s": 1000.0 * group["total_megapixels"].sum() / total_ms
+                               if complete else math.nan,
+            "image_count": int(cohorts["image_count"].sum()),
+            "timing_complete": complete,
+        })
+    return pd.DataFrame.from_records(records).sort_values("quality")
+
+
+def plot_throughput_vs_quality(frame, cells, include_q10=False):
+    """Paper view at effort 7, with an optional separately marked Q10 diagnostic."""
+    qualities = (10, 30, 50, 70, 80, 90, 95) if include_q10 else (30, 50, 70, 80, 90, 95)
+    rows = quality_throughput_rows(frame, cells, qualities=qualities)
+    main = rows[rows["quality"] != 10]
+    with matplotlib.rc_context(paper_plot_style()):
+        figure, axis = plt.subplots(figsize=(3.5, 2.45), layout="constrained")
+        axis.plot(
+            main["quality"], main["throughput_mp_s"],
+            color="0.15", linewidth=1.25, marker="o", markersize=4.2,
+            markerfacecolor="white", markeredgewidth=1.0,
+            label=encoder_label(frame) + ", effort 7",
+        )
+        if include_q10:
+            q10 = rows[rows["quality"] == 10]
+            label = "Q10"
+            if "resampling" in frame:
+                factors = pd.to_numeric(
+                    frame.loc[(frame["effort"] == 7) & (frame["quality"] == 10),
+                              "resampling"], errors="coerce"
+                )
+                if not factors.empty and factors.notna().all():
+                    if factors.nunique() == 1 and factors.iloc[0] > 1:
+                        label += " (%g\u00d7 downsampling)" % factors.iloc[0]
+                    elif factors.nunique() > 1:
+                        label += " (mixed resampling)"
+            axis.plot(
+                q10["quality"], q10["throughput_mp_s"], linestyle="none",
+                color="#A4492F", marker="D", markersize=4.8,
+                markerfacecolor="white", markeredgewidth=1.1, label=label,
+            )
+            axis.set_title("Debug: quality including Q10")
+        axis.set_xlabel("Requested quality (Q)")
+        axis.set_ylabel("Encoding throughput (MP/s)")
+        axis.set_xticks(rows["quality"])
+        axis.minorticks_off()
+        axis.tick_params(axis="both", which="major", length=3, width=0.7)
+        axis.margins(x=0.05, y=0.12)
+        axis.set_ylim(bottom=0)
         axis.set_axisbelow(True)
         axis.grid(axis="y", color="0.88", linewidth=0.5)
         axis.legend(loc="lower left", frameon=False, handlelength=2)
@@ -1474,6 +1562,7 @@ def generate_characterization(
     figures = {
         "runtime-vs-effort": plot_runtime_vs_effort(frame, cells),
         "throughput-vs-effort": plot_throughput_vs_effort(frame, cells),
+        "throughput-vs-quality": plot_throughput_vs_quality(frame, cells),
         "quality-effort-heatmaps": plot_quality_effort_heatmaps(frame, cells),
         "resolution-scaling": plot_resolution_scaling(frame, cells),
         "throughput-vs-resolution": plot_throughput_vs_resolution(frame, cells),
@@ -1483,6 +1572,9 @@ def generate_characterization(
     if debug_throughput_by_quality:
         figures["debug-throughput-vs-resolution"] = plot_throughput_vs_resolution_debug(
             frame, cells
+        )
+        figures["debug-throughput-vs-quality"] = plot_throughput_vs_quality(
+            frame, cells, include_q10=True
         )
     if cells["stage_complete"].any():
         figures["stage-wall-breakdown"] = plot_stage_breakdown(
@@ -1528,7 +1620,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--debug-throughput-by-quality", action="store_true",
-                        help="also plot per-quality throughput at multiple efforts")
+                        help="also plot per-quality throughput diagnostics, including Q10")
     parser.add_argument("--quality-run", type=pathlib.Path,
                         help="optional saved quality study; never starts collection")
     parser.add_argument("--butteraugli-run", type=pathlib.Path,
