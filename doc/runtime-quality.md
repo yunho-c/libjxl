@@ -74,6 +74,57 @@ BD values, aggregate coverage/reasons, interpolation differences, the explicit
 cohort and interval, and configuration/ledger identities. Rate-only results
 remain in the report when timing is incomplete, but do not become plot markers.
 
+## Paper throughput table at matched nominal settings
+
+The runtime notebook's **Paper table: encoding throughput at matched nominal
+settings** section exports `encoding-throughput.csv`, a booktabs `.tex` table,
+an `.html` preview, and supporting `-by-quality.csv`, `-by-resolution.csv`,
+`-coverage.csv`, `-image-tuples.csv`, and `-methodology.json` files. The numeric
+DataFrame is available as `encoding_throughput_table`.
+
+Defaults retain images with at least 1 MP and nominal Q30/50/70/80/90/95.
+At each effort and quality, divide total original megapixels by the sum of
+per-image median complete-call seconds. Average those six quality-specific
+rates equally, then divide GJXL's aggregate by libjxl's for the speedup. This
+is not an average of individual-image rates or speedup ratios, nor a rate
+pooled across all qualities. The methodology export records resolution pixel
+shares so that the contribution of large images is explicit.
+
+`THROUGHPUT_LIBJXL_RUN` uses the libjxl quality manifest to locate the original
+fixed-sweep timing ledger. `THROUGHPUT_GJXL_RUN` selects a GJXL fixed sweep;
+setting it to `None` skips the section. Neither calibrated measurements nor
+the older summary CSVs supply timing samples. Current ledgers are read without
+starting collection or refreshing source studies. `THROUGHPUT_MIN_MEGAPIXELS`,
+`THROUGHPUT_QUALITIES`, `THROUGHPUT_EFFORTS`, and `THROUGHPUT_IMAGE_IDS` make the
+cohort and settings explicit. Every selected image and quality must have all
+configured repetitions before an encoder's effort row has a throughput value.
+Missing repetitions leave dashes and are listed in the coverage CSV; cohorts
+are never reduced to the available images.
+
+The loader checks input hashes/geometry, requested distances, timing protocol,
+revision/configuration identities, repetitions, and codestream consistency.
+Distances at or above 10 are rejected because the retained libjxl protocol
+automatically downsamples there. Exact analyzed ledger hashes and build
+identities are exported. Warm timings include the complete CPU/GPU encoding
+call and synchronization, excluding startup, input preparation, file I/O and
+quality scoring. Numeric thread settings match, but libjxl workers and GJXL
+CPU participants have different semantics; GJXL additionally uses Metal.
+
+This is a comparison of nominal effort presets, not equal decoded quality or
+identical algorithms. Keep rate-quality evidence alongside it. Historical
+batch results remain separate because their workload, revisions, and resource
+settings differ; they do not supply batch columns or multiplicative gains for
+this table.
+
+The export can also run independently of all notebook plots:
+
+```python
+tables = generate_encoding_throughput_tables(
+    QUALITY_RUN, GJXL_FIXED_RUN, OUTPUT_DIR,
+    min_megapixels=1.0, qualities=(30, 50, 70, 80, 90, 95), show=True,
+)
+```
+
 ## GJXL matched-quality comparison
 
 The collector also supports `--encoder gjxl`. It uses a separate run directory

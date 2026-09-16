@@ -123,7 +123,7 @@ GJXL_RUN = pathlib.Path(
 GJXL_FIXED_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_GJXL_FIXED_RUN",
-        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/fixed-gjxl-full-20260910",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/fixed-gjxl-full-20260915",
     )
 ).expanduser()
 BUTTERAUGLI_RUN = pathlib.Path(
@@ -157,6 +157,15 @@ BATCH_BENCHMARK_RUN = pathlib.Path(
 ).expanduser()
 BATCH_BENCHMARK_SIZES = None  # None shows every collected batch size.
 BATCH_SHOW_ROUND_RANGE = True
+
+# Paper table: matched nominal settings, read directly from saved timing ledgers.
+# The libjxl quality manifest identifies its original fixed-sweep source ledger.
+THROUGHPUT_LIBJXL_RUN = QUALITY_RUN
+THROUGHPUT_GJXL_RUN = GJXL_FIXED_RUN  # None skips the table; batch data is separate.
+THROUGHPUT_MIN_MEGAPIXELS = 1.0
+THROUGHPUT_QUALITIES = (30, 50, 70, 80, 90, 95)
+THROUGHPUT_EFFORTS = None  # None retains every configured libjxl effort, including gaps.
+THROUGHPUT_IMAGE_IDS = None  # None uses the manifest cohort above the resolution threshold.
 
 
 # %% [markdown]
@@ -2413,6 +2422,37 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
 
 
 # %%
+def generate_encoding_throughput_tables(libjxl_run, gjxl_run, output_dir, *,
+                                        min_megapixels=1.0,
+                                        qualities=(30, 50, 70, 80, 90, 95),
+                                        efforts=None, image_ids=None, show=False):
+    """Independent saved-ledger table export; no encoders, scoring or profiling."""
+    import importlib
+
+    source = pathlib.Path(load_quality_helpers().__file__).resolve().parent
+    sys.path.insert(0, str(source))
+    try:
+        helper = importlib.import_module("cjxl_throughput_table")
+    finally:
+        sys.path.pop(0)
+    tables = helper.build_tables(
+        libjxl_run, gjxl_run, min_megapixels=min_megapixels,
+        qualities=qualities, efforts=efforts, image_ids=image_ids,
+    )
+    tables["written"] = helper.write_tables(tables, output_dir)
+    if show:
+        from IPython.display import HTML, display
+
+        display(HTML(helper.table_html(tables)))
+        incomplete = tables["coverage"].query("status != 'complete'")
+        if not incomplete.empty:
+            display(incomplete.drop(columns="missing_image_ids"))
+        print("Saved encoding-throughput.csv, .tex, .html and coverage/methodology exports in",
+              pathlib.Path(output_dir).resolve())
+    return tables
+
+
+# %%
 def load_batch_benchmark(run):
     """Read saved summaries; never import the bundle's collection/analysis scripts."""
     import json
@@ -2932,6 +2972,66 @@ if __name__ == "__main__" and "ipykernel" in sys.modules and GJXL_FIXED_RUN is n
             GJXL_FIXED_RUN, fixed_output, SAVE_FORMATS, show=True, source="sweep")
     else:
         print("No fixed-sweep timing summary yet; collection is never started here.")
+
+
+# %% [markdown]
+# ### Paper table: encoding throughput at matched nominal settings
+#
+# This section compares libjxl and fully-resident Metal GJXL at the same requested
+# distance and numbered effort. It complements the rate-quality figures; it does
+# not establish equal decoded quality or identical algorithms at each effort.
+#
+# `THROUGHPUT_MIN_MEGAPIXELS = 1.0` excludes the sub-megapixel Kodak images.
+# `THROUGHPUT_QUALITIES` selects Q30/50/70/80/90/95, whose distance mappings must
+# agree between the studies. Q10 is excluded because libjxl automatically
+# downsamples at that setting. Each encoder must retain the same fixed image
+# cohort and every selected quality at each effort. Missing repetitions leave
+# that encoder's cell and the speedup blank; an effort is never silently dropped.
+# Use `THROUGHPUT_EFFORTS` and `THROUGHPUT_IMAGE_IDS` for explicit subsets.
+#
+# For each effort and quality, throughput is total **original input MP** divided
+# by the sum of per-image median complete-encode seconds. The table takes the
+# arithmetic mean of those quality-specific rates, matching the existing effort
+# plot's quality weighting. It is neither the mean of individual-image MP/s nor
+# one rate pooled over all qualities. Speedup divides the two displayed rates.
+# Resolution groups contribute according to their pixel counts; the methodology
+# JSON records those weights, and the per-resolution CSV supports sensitivity
+# checks. The table summarizes this workload, not resolution-independent speed.
+#
+# Timings are warm, uninstrumented complete calls, including CPU/GPU work,
+# transfers and synchronization; startup, input preparation, file I/O and scoring
+# are excluded. The metadata records CPU settings and their distinct semantics:
+# libjxl worker threads versus GJXL participating CPU threads plus Metal. Source
+# revisions, manifest identities and hashes of the exact analyzed timing ledgers
+# are retained. Five repetitions are required by the default study protocol.
+#
+# `THROUGHPUT_LIBJXL_RUN` identifies the libjxl quality-study manifest, but this
+# section reads its **original fixed-sweep timing ledger**, not calibrated times.
+# `THROUGHPUT_GJXL_RUN` selects the GJXL fixed study. Reading current ledgers picks
+# up completed timing repetitions even when summary CSVs have not been refreshed.
+# This section is independent of `INPUT_CSV` and starts no collection jobs.
+#
+# Outputs under `OUTPUT_DIR` are `encoding-throughput.csv`, `.tex` (booktabs),
+# `.html`, `-by-quality.csv`, `-by-resolution.csv`, `-coverage.csv`,
+# `-image-tuples.csv`, and `-methodology.json`. CSVs retain numeric precision;
+# display rounding never enters speedup calculations. The JSON contains a draft
+# caption; add machine/build details from its provenance to the paper's methods.
+# `encoding_throughput_table` is the numeric DataFrame for further formatting.
+#
+# The separate historical batch bundle below uses different inputs, revisions,
+# quality and CPU settings, so it is not used to fill additional columns here.
+
+# %%
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and THROUGHPUT_GJXL_RUN is not None):
+    encoding_throughput_tables = generate_encoding_throughput_tables(
+        THROUGHPUT_LIBJXL_RUN, THROUGHPUT_GJXL_RUN, OUTPUT_DIR,
+        min_megapixels=THROUGHPUT_MIN_MEGAPIXELS,
+        qualities=THROUGHPUT_QUALITIES, efforts=THROUGHPUT_EFFORTS,
+        image_ids=THROUGHPUT_IMAGE_IDS, show=True,
+    )
+    encoding_throughput_table = encoding_throughput_tables["table"]
+    encoding_throughput_coverage = encoding_throughput_tables["coverage"]
 
 
 # %% [markdown]
