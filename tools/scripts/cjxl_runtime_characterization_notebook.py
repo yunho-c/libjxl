@@ -432,6 +432,20 @@ def incomplete_marker_legend():
 # Each resolution class is aggregated by summing image runtimes and pixels,
 # then dividing the sums. This avoids giving a small image the same pixel
 # weight as a large image.
+#
+# The paper companion `throughput-vs-effort` uses effort on the x-axis and
+# encoding throughput in MP/s on a logarithmic y-axis. Its single curve
+# combines all images and resolutions. Each point is the equal-weight
+# arithmetic mean of the full corpus's six throughputs at nominal
+# Q30, Q50, Q70, Q80, Q90, and Q95; Q10 is excluded. For each quality,
+# throughput is `1000 * sum(megapixels) / sum(complete_encode_median_ms)`.
+# Thus image work is pooled before averaging across quality; resolution
+# groups are not given equal weight. All six qualities must have complete
+# timings for the same full image cohort. Missing interior efforts remain
+# gaps; incomplete efforts at either end are omitted from the displayed range.
+# The default saved fixed sweep therefore shows efforts 1–8; incomplete
+# efforts 9–10 are not filled from the separate matched-quality study.
+# The monochrome line and serif typography match the resolution paper figure.
 
 
 # %%
@@ -639,10 +653,9 @@ def resolution_throughput_rows(frame, cells, effort=7,
     return pd.DataFrame.from_records(records).sort_values("mean_megapixels")
 
 
-def plot_throughput_vs_resolution(frame, cells):
-    """Paper view: effort 7, equal mean over nominal Q30/Q50/Q70/Q80/Q90/Q95."""
-    rows = resolution_throughput_rows(frame, cells)
-    style = {
+def paper_plot_style():
+    """Shared, locally scoped typography and axes for compact paper figures."""
+    return {
         "font.family": "serif",
         "font.serif": ["DejaVu Serif"],
         "font.size": 9,
@@ -668,7 +681,12 @@ def plot_throughput_vs_resolution(frame, cells):
         "svg.fonttype": "none",
         "pdf.fonttype": 42,
     }
-    with matplotlib.rc_context(style):
+
+
+def plot_throughput_vs_resolution(frame, cells):
+    """Paper view: effort 7, equal mean over nominal Q30/Q50/Q70/Q80/Q90/Q95."""
+    rows = resolution_throughput_rows(frame, cells)
+    with matplotlib.rc_context(paper_plot_style()):
         figure, axis = plt.subplots(figsize=(3.5, 2.45), layout="constrained")
         axis.plot(
             rows["mean_megapixels"], rows["throughput_mp_s"],
@@ -690,6 +708,59 @@ def plot_throughput_vs_resolution(frame, cells):
         axis.set_axisbelow(True)
         axis.grid(axis="y", color="0.88", linewidth=0.5)
         axis.legend(loc="lower right", frameon=False, handlelength=2)
+    return figure
+
+
+def effort_throughput_rows(frame, cells):
+    """Pool all image work per quality, then average quality-specific MP/s equally."""
+    qualities = (30, 50, 70, 80, 90, 95)
+    records = []
+    for effort in sorted(cells["effort"].unique()):
+        cohorts = resolution_throughput_rows(frame, cells, effort=int(effort),
+                                             qualities=qualities)
+        complete = bool(cohorts["timing_complete"].all())
+        rates = []
+        if complete:
+            selected = cells[(cells["effort"] == effort) & cells["quality"].isin(qualities)]
+            for _, group in selected.groupby("quality", observed=True):
+                total_ms = (group["runtime_ms_per_mp"] * group["total_megapixels"]).sum()
+                rates.append(1000.0 * group["total_megapixels"].sum() / total_ms)
+        records.append({
+            "effort": int(effort),
+            "throughput_mp_s": float(np.mean(rates)) if complete else math.nan,
+            "image_count": int(cohorts["image_count"].sum()),
+            "quality_count": len(qualities),
+            "timing_complete": complete,
+        })
+    return pd.DataFrame.from_records(records)
+
+
+def plot_throughput_vs_effort(frame, cells):
+    """Paper view: all images in one effort curve, averaged over nominal Q30–Q95."""
+    rows = effort_throughput_rows(frame, cells)
+    complete = rows[rows["timing_complete"]]
+    # Keep interior missing efforts as NaNs so lines never bridge a timing gap.
+    limits = complete["effort"] if not complete.empty else rows["effort"]
+    efforts = list(range(int(limits.min()), int(limits.max()) + 1))
+    line = rows.set_index("effort").reindex(efforts)
+    with matplotlib.rc_context(paper_plot_style()):
+        figure, axis = plt.subplots(figsize=(3.5, 2.45), layout="constrained")
+        axis.plot(
+            efforts, line["throughput_mp_s"],
+            color="0.15", linewidth=1.25, marker="o", markersize=4.2,
+            markerfacecolor="white", markeredgewidth=1.0,
+            label=encoder_label(frame) + ", all images",
+        )
+        axis.set_xlabel("Encoding effort")
+        axis.set_ylabel("Encoding throughput (MP/s)")
+        axis.set_xticks(efforts)
+        axis.set_yscale("log")
+        axis.minorticks_off()
+        axis.tick_params(axis="both", which="major", length=3, width=0.7)
+        axis.margins(x=0.04, y=0.12)
+        axis.set_axisbelow(True)
+        axis.grid(axis="y", color="0.88", linewidth=0.5)
+        axis.legend(loc="lower left", frameon=False, handlelength=2)
     return figure
 
 
@@ -1402,6 +1473,7 @@ def generate_characterization(
     cells = aggregate_cells(frame, expected_timing_samples)
     figures = {
         "runtime-vs-effort": plot_runtime_vs_effort(frame, cells),
+        "throughput-vs-effort": plot_throughput_vs_effort(frame, cells),
         "quality-effort-heatmaps": plot_quality_effort_heatmaps(frame, cells),
         "resolution-scaling": plot_resolution_scaling(frame, cells),
         "throughput-vs-resolution": plot_throughput_vs_resolution(frame, cells),
