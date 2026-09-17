@@ -149,6 +149,7 @@ BD_RATE_COMPARE_RUN = GJXL_FIXED_RUN  # Set to None for libjxl only.
 # Presentation controls for both saved figures and their inline previews.
 BD_RATE_SHOW_HEADERS = False
 BD_RATE_SHOW_MISSING_DATA = False
+BD_RATE_SHOW_EFFORT_LINKS = True
 
 # Independent saved batch benchmark; set to None to skip its section.
 BATCH_BENCHMARK_RUN = pathlib.Path(
@@ -2264,6 +2265,8 @@ def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
 # Subplot headers and missing-data notes are hidden by default. Set
 # `show_headers=True` or `show_missing_data=True` to include them; the saved
 # JSON report and notebook console retain cohort, interval, and coverage details.
+# `show_effort_links=True` adds light dotted connections between matching
+# libjxl/GJXL effort numbers, only when both points have complete coverage.
 # These drawing functions can consume an existing `speed-bd-rate-report.json`
 # directly; styling does not require recomputing the report or running Jupyter.
 
@@ -2280,18 +2283,18 @@ def load_bd_rate_helpers():
 
 
 def plot_bd_rate(report, by_resolution=False, *, show_headers=False,
-                 show_missing_data=False):
+                 show_missing_data=False, show_effort_links=False):
     """Paper-style BD-rate figure; consumes an already computed report only."""
     style = {**paper_plot_style(), "mathtext.fontset": "dejavuserif"}
     with matplotlib.rc_context(style):
         return _plot_bd_rate_paper(
             report, by_resolution=by_resolution, show_headers=show_headers,
-            show_missing_data=show_missing_data,
+            show_missing_data=show_missing_data, show_effort_links=show_effort_links,
         )
 
 
 def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
-                        show_missing_data=False):
+                        show_missing_data=False, show_effort_links=False):
     """Draw complete fixed-cohort points, preserving effort order and omissions."""
     points = report["points"]
     low, high = report["quality_range"]
@@ -2314,6 +2317,21 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
     annotations = []
     for axis, scope in zip(axes, scopes):
         group = [point for point in points if point["scope"] == scope]
+        if show_effort_links:
+            paired = {
+                encoder: {point["effort"]: point for point in group
+                          if point["encoder"] == encoder and point["status"] == "ready"}
+                for encoder in ("libjxl", "gjxl")
+            }
+            for effort in sorted(paired["libjxl"].keys() & paired["gjxl"].keys()):
+                pair = [paired[encoder][effort] for encoder in ("libjxl", "gjxl")]
+                axis.plot(
+                    [point["mean_encode_ms"] for point in pair],
+                    [point["bd_rate_pchip"] for point in pair],
+                    linestyle=":", color="0.65", alpha=0.7, lw=0.6,
+                    marker="None", zorder=1.5, label="_nolegend_",
+                    gid=f"bd-rate-effort-link-{scope}-e{effort}",
+                )
         coverage = []
         for encoder in dict.fromkeys(source["encoder"] for source in report["sources"]):
             selected = sorted((point for point in group if point["encoder"] == encoder),
@@ -2461,7 +2479,8 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
 def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
                              compare_run=None, baseline_encoder="libjxl", baseline_effort=7,
                              quality_range=(75, 85), efforts=None, image_ids=None, *,
-                             show_headers=False, show_missing_data=False):
+                             show_headers=False, show_missing_data=False,
+                             show_effort_links=False):
     """Generate independent saved-sweep plots and a per-image JSON coverage report."""
     import json
 
@@ -2472,7 +2491,8 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
         quality_range, efforts, image_ids,
     )
     configure_style()
-    plot_options = {"show_headers": show_headers, "show_missing_data": show_missing_data}
+    plot_options = {"show_headers": show_headers, "show_missing_data": show_missing_data,
+                    "show_effort_links": show_effort_links}
     figures = {
         "speed-bd-rate": plot_bd_rate(report, **plot_options),
         "speed-bd-rate-by-resolution": plot_bd_rate(report, by_resolution=True, **plot_options),
@@ -2877,6 +2897,9 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # Set `BD_RATE_SHOW_HEADERS` and `BD_RATE_SHOW_MISSING_DATA` to show subplot
 # headers and omitted-effort notes. Both default to False for saved files and
 # inline previews; full coverage remains in the report and printed output.
+# `BD_RATE_SHOW_EFFORT_LINKS = True` connects matching libjxl/GJXL effort numbers
+# with light dotted lines behind the curves. Set it to False to hide these links.
+# A link requires complete points from both encoders within the same panel.
 #
 # **Interpolation sensitivity:** markers use PCHIP; vertical spans show the
 # difference between PCHIP and Akima. These spans indicate method sensitivity,
@@ -2892,6 +2915,7 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         image_ids=BD_RATE_IMAGE_IDS,
         show_headers=BD_RATE_SHOW_HEADERS,
         show_missing_data=BD_RATE_SHOW_MISSING_DATA,
+        show_effort_links=BD_RATE_SHOW_EFFORT_LINKS,
     )
 
 
