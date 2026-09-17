@@ -2252,6 +2252,15 @@ def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
 # BD-rate is calculated per image before averaging. The x-axis averages
 # complete-call times interpolated on a common score grid. It is an estimate
 # from the saved fixed sweep, not an additional matched-quality measurement.
+#
+# The pooled figure uses a compact 6.8-inch-wide paper layout; resolution
+# panels use two columns at the same total width. Serif text, open markers,
+# distinct solid/dashed encoder lines, and light horizontal guides remain
+# legible in grayscale. Effort labels use short ranges for coincident points.
+# Small vertical spans retain PCHIP–Akima sensitivity, not confidence intervals.
+# The score interval, cohort size, and any omitted efforts remain on the figure.
+# These drawing functions can consume an existing `speed-bd-rate-report.json`
+# directly; styling does not require recomputing the report or running Jupyter.
 
 # %%
 def load_bd_rate_helpers():
@@ -2266,19 +2275,29 @@ def load_bd_rate_helpers():
 
 
 def plot_bd_rate(report, by_resolution=False):
-    """Draw only complete fixed-cohort points, in effort order, with coverage."""
+    """Paper-style BD-rate figure; consumes an already computed report only."""
+    style = {**paper_plot_style(), "mathtext.fontset": "dejavuserif"}
+    with matplotlib.rc_context(style):
+        return _plot_bd_rate_paper(report, by_resolution=by_resolution)
+
+
+def _plot_bd_rate_paper(report, by_resolution=False):
+    """Draw complete fixed-cohort points, preserving effort order and omissions."""
     points = report["points"]
+    low, high = report["quality_range"]
     if by_resolution:
         available = {point["scope"] for point in points} - {"all"}
         scopes = ([scope for scope in RESOLUTION_NAMES if scope in available]
                   + sorted(available - RESOLUTION_NAMES.keys()))
-        figure, axes = subplot_grid(len(scopes), columns=min(3, len(scopes)),
-                                    width=5.5, height=4.4)
+        figure, axes = subplot_grid(len(scopes), columns=min(2, len(scopes)),
+                                    width=3.4, height=2.8)
     else:
         scopes = ["all"]
-        figure, axis = plt.subplots(figsize=(10, 6.4), layout="constrained")
+        figure, axis = plt.subplots(figsize=(6.8, 3.35), layout="constrained")
         axes = [axis]
-    colors = {"libjxl": "#4477AA", "gjxl": "#CC6677"}
+    colors = {"libjxl": "#333333", "gjxl": "#0072B2"}
+    markers = {"libjxl": "o", "gjxl": "s"}
+    linestyles = {"libjxl": "-", "gjxl": "--"}
     labels = {"libjxl": "libjxl", "gjxl": "GJXL (Metal)"}
     baseline = report["baseline"]
     annotations = []
@@ -2295,14 +2314,17 @@ def plot_bd_rate(report, by_resolution=False):
                  else math.nan for point in selected],
                 [point.get("bd_rate_pchip", math.nan) if point["status"] == "ready"
                  else math.nan for point in selected],
-                "o-", color=colors[encoder], label=labels[encoder], lw=1.6, ms=5,
+                color=colors[encoder], label=labels[encoder],
+                linestyle=linestyles[encoder], marker=markers[encoder],
+                lw=1.15, ms=4, markerfacecolor="white", markeredgewidth=0.9,
+                zorder=3,
             )
             if complete:
                 axis.vlines(
                     [point["mean_encode_ms"] for point in complete],
                     [min(point["bd_rate_pchip"], point["bd_rate_akima"]) for point in complete],
                     [max(point["bd_rate_pchip"], point["bd_rate_akima"]) for point in complete],
-                    color=colors[encoder], alpha=0.4, lw=5,
+                    color=colors[encoder], alpha=0.3, lw=2.4, zorder=2,
                 )
             # Identical encoder policies can make adjacent effort labels coincide.
             clusters = []
@@ -2316,12 +2338,19 @@ def plot_bd_rate(report, by_resolution=False):
             for cluster in clusters:
                 x = math.exp(np.mean([math.log(point["mean_encode_ms"]) for point in cluster]))
                 y = np.mean([point["bd_rate_pchip"] for point in cluster])
+                efforts = [point["effort"] for point in cluster]
+                effort_label = (
+                    f"e{efforts[0]}–{efforts[-1]}"
+                    if len(efforts) > 1 and efforts == list(range(efforts[0], efforts[-1] + 1))
+                    else "e" + ",".join(str(effort) for effort in efforts)
+                )
                 label = axis.annotate(
-                    "e" + ",".join(str(point["effort"]) for point in cluster),
-                    (x, y), xytext=(0, 9 if encoder == "libjxl" else -16),
-                    textcoords="offset points", ha="center", color=colors[encoder], fontsize=8,
+                    effort_label, (x, y), xytext=(0, 7 if encoder == "libjxl" else -12),
+                    textcoords="offset points", ha="center", color=colors[encoder], fontsize=7,
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
+                          "boxstyle": "square,pad=0.1"},
                     arrowprops={"arrowstyle": "-", "color": colors[encoder],
-                                "lw": 0.5, "alpha": 0.5},
+                                "lw": 0.45, "alpha": 0.65},
                 )
                 label.set_in_layout(False)
                 annotations.append((label, 1 if encoder == "libjxl" else -1))
@@ -2334,47 +2363,84 @@ def plot_bd_rate(report, by_resolution=False):
                     f"{labels[encoder]}: {len(complete)}/{len(selected)} efforts complete (see report)"
                 )
         title = "All images" if scope == "all" else RESOLUTION_NAMES.get(scope, scope)
-        axis.set_title(f"{title} · {group[0]['image_count']} images", fontsize=11)
-        axis.axhline(0, color="#60666C", lw=0.8, zorder=0)
-        axis.set(xscale="log", xlabel="Mean encode time (ms, interpolated)",
-                 ylabel=f"BD-rate vs {baseline['encoder']} e{baseline['effort']} (%)")
-        axis.margins(x=0.14, y=0.23)
-        axis.grid(True, alpha=0.25)
+        axis.set_title(f"{title} · {group[0]['image_count']} images · SSIMU2 {low:g}–{high:g}",
+                       fontsize=8, loc="left", pad=7)
+        axis.axhline(0, color="0.45", lw=0.65, zorder=1)
+        axis.set(xscale="log", xlabel="Mean encode time (ms)",
+                 ylabel=f"BD-rate vs. {baseline['encoder']} e{baseline['effort']} (%)")
+        axis.margins(x=0.2, y=0.28)
+        axis.minorticks_off()
+        axis.tick_params(axis="both", which="major", length=3, width=0.7)
+        axis.set_axisbelow(True)
+        axis.grid(axis="y", color="0.88", linewidth=0.5)
         if not any(point["status"] == "ready" for point in group):
             axis.set(xlim=(1, 10), ylim=(-1, 1))
-            axis.text(0.5, 0.5, "No complete points for this interval and cohort",
-                      ha="center", transform=axis.transAxes, fontsize=9)
+            axis.text(0.5, 0.5, "No complete points\nfor this interval and cohort",
+                      ha="center", transform=axis.transAxes, fontsize=8)
         axis.invert_yaxis()
-        axis.text(0, -0.23, "\n".join(coverage) if coverage else "All selected efforts complete",
-                  transform=axis.transAxes, va="top", fontsize=7, color="#60666C", wrap=True)
+        axis.text(0.02, 0.97, "Upper left is better", transform=axis.transAxes,
+                  va="top", fontsize=6.5, color="0.4")
+        if coverage:
+            from textwrap import fill
+
+            axis.text(0.98, 0.03, "\n".join(fill(line, 48 if by_resolution else 95)
+                                          for line in coverage),
+                      transform=axis.transAxes, ha="right", va="bottom",
+                      fontsize=6.5, color="0.4",
+                      bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
+                            "boxstyle": "square,pad=0.2"})
     handles, legend_labels = axes[0].get_legend_handles_labels()
-    figure.legend(handles, legend_labels, loc="outside lower center", ncols=2)
-    low, high = report["quality_range"]
-    figure.suptitle(
-        f"Speed vs. compression efficiency · SSIMU2 {low:g}–{high:g}\n"
-        "Equal-image mean BD-rate; upper-left is better",
-        fontsize=12,
-    )
+    from textwrap import fill
+
+    # Preserve composite-build provenance labels while allowing them to wrap.
+    figure.legend(handles, [fill(label, 46) for label in legend_labels],
+                  loc="outside lower center", ncols=min(2, len(handles)),
+                  handlelength=2.4, columnspacing=2.0, fontsize=8)
     # Resolve label collisions in display coordinates, including across encoders.
     # Keep leaders for displaced labels so tightly spaced efforts remain readable.
     figure.canvas.draw()
     renderer = figure.canvas.get_renderer()
-    occupied = {axis: [] for axis in axes}
+    annotation_labels = {label for label, _ in annotations}
+    occupied = {
+        axis: [text.get_window_extent(renderer).padded(2) for text in axis.texts
+               if text not in annotation_labels]
+        for axis in axes
+    }
+    for axis in axes:
+        for line in axis.lines:
+            if line.get_marker() not in (None, "", "None"):
+                for x, y in zip(line.get_xdata(), line.get_ydata()):
+                    if math.isfinite(x) and math.isfinite(y):
+                        px, py = axis.transData.transform((x, y))
+                        radius = 0.5 * (line.get_markersize() + 2) * figure.dpi / 72
+                        occupied[axis].append(matplotlib.transforms.Bbox.from_bounds(
+                            px - radius, py - radius, 2 * radius, 2 * radius))
     for label, direction in annotations:
         original = label.get_position()
-        for level in range(6):
+        best = None
+        inside = label.axes.get_window_extent(renderer)
+        # Try both vertical directions; narrow panels can exhaust one side.
+        offsets = [original[1] + sign * direction * 9 * level
+                   for level in range(7) for sign in (1, -1)]
+        for vertical in dict.fromkeys(offsets):
             placed = False
-            for horizontal in (0, -14, 14, -28, 28):
-                label.set_position((horizontal, original[1] + direction * 12 * level))
+            for horizontal in (0, -12, 12, -24, 24, -36, 36):
+                label.set_position((horizontal, vertical))
                 # Text extent excludes the leader line when checking collisions.
-                box = matplotlib.text.Text.get_window_extent(label, renderer).padded(2)
-                inside = label.axes.get_window_extent(renderer)
-                if (inside.contains(box.x0, box.y0) and inside.contains(box.x1, box.y1)
-                        and not any(box.overlaps(other) for other in occupied[label.axes])):
+                box = matplotlib.text.Text.get_window_extent(label, renderer).padded(1.5)
+                contained = inside.contains(box.x0, box.y0) and inside.contains(box.x1, box.y1)
+                overlaps = sum(box.overlaps(other) for other in occupied[label.axes])
+                score = (not contained, overlaps, abs(horizontal) + abs(vertical - original[1]))
+                if best is None or score < best[0]:
+                    best = (score, (horizontal, vertical), box)
+                if contained and not overlaps:
                     placed = True
                     break
             if placed:
                 break
+        if not placed:
+            _, position, box = best
+            label.set_position(position)
         occupied[label.axes].append(box)
         label.arrow_patch.set_visible(label.get_position() != original)
     return figure
