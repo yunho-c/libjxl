@@ -146,6 +146,9 @@ BD_RATE_BASELINE = ("libjxl", 7)
 BD_RATE_EFFORTS = None  # None reads every configured effort; incomplete points are omitted.
 BD_RATE_IMAGE_IDS = None  # None preserves the baseline study's full image cohort.
 BD_RATE_COMPARE_RUN = GJXL_FIXED_RUN  # Set to None for libjxl only.
+# Presentation controls for both saved figures and their inline previews.
+BD_RATE_SHOW_HEADERS = False
+BD_RATE_SHOW_MISSING_DATA = False
 
 # Independent saved batch benchmark; set to None to skip its section.
 BATCH_BENCHMARK_RUN = pathlib.Path(
@@ -2253,12 +2256,14 @@ def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
 # complete-call times interpolated on a common score grid. It is an estimate
 # from the saved fixed sweep, not an additional matched-quality measurement.
 #
-# The pooled figure uses a compact 6.8-inch-wide paper layout; resolution
-# panels use two columns at the same total width. Serif text, open markers,
+# The pooled figure uses the same 3.4 × 2.8-inch size as one resolution panel;
+# resolution panels use two columns. Serif text, open markers,
 # distinct solid/dashed encoder lines, and light horizontal guides remain
 # legible in grayscale. Effort labels use short ranges for coincident points.
 # Small vertical spans retain PCHIP–Akima sensitivity, not confidence intervals.
-# The score interval, cohort size, and any omitted efforts remain on the figure.
+# Subplot headers and missing-data notes are hidden by default. Set
+# `show_headers=True` or `show_missing_data=True` to include them; the saved
+# JSON report and notebook console retain cohort, interval, and coverage details.
 # These drawing functions can consume an existing `speed-bd-rate-report.json`
 # directly; styling does not require recomputing the report or running Jupyter.
 
@@ -2274,26 +2279,32 @@ def load_bd_rate_helpers():
         sys.path.pop(0)
 
 
-def plot_bd_rate(report, by_resolution=False):
+def plot_bd_rate(report, by_resolution=False, *, show_headers=False,
+                 show_missing_data=False):
     """Paper-style BD-rate figure; consumes an already computed report only."""
     style = {**paper_plot_style(), "mathtext.fontset": "dejavuserif"}
     with matplotlib.rc_context(style):
-        return _plot_bd_rate_paper(report, by_resolution=by_resolution)
+        return _plot_bd_rate_paper(
+            report, by_resolution=by_resolution, show_headers=show_headers,
+            show_missing_data=show_missing_data,
+        )
 
 
-def _plot_bd_rate_paper(report, by_resolution=False):
+def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
+                        show_missing_data=False):
     """Draw complete fixed-cohort points, preserving effort order and omissions."""
     points = report["points"]
     low, high = report["quality_range"]
+    panel_width, panel_height = 3.4, 2.8
     if by_resolution:
         available = {point["scope"] for point in points} - {"all"}
         scopes = ([scope for scope in RESOLUTION_NAMES if scope in available]
                   + sorted(available - RESOLUTION_NAMES.keys()))
         figure, axes = subplot_grid(len(scopes), columns=min(2, len(scopes)),
-                                    width=3.4, height=2.8)
+                                    width=panel_width, height=panel_height)
     else:
         scopes = ["all"]
-        figure, axis = plt.subplots(figsize=(6.8, 3.35), layout="constrained")
+        figure, axis = plt.subplots(figsize=(panel_width, panel_height), layout="constrained")
         axes = [axis]
     colors = {"libjxl": "#333333", "gjxl": "#0072B2"}
     markers = {"libjxl": "o", "gjxl": "s"}
@@ -2362,9 +2373,10 @@ def _plot_bd_rate_paper(report, by_resolution=False):
                     if len(missing) <= 3 else
                     f"{labels[encoder]}: {len(complete)}/{len(selected)} efforts complete (see report)"
                 )
-        title = "All images" if scope == "all" else RESOLUTION_NAMES.get(scope, scope)
-        axis.set_title(f"{title} · {group[0]['image_count']} images · SSIMU2 {low:g}–{high:g}",
-                       fontsize=8, loc="left", pad=7)
+        if show_headers:
+            title = "All images" if scope == "all" else RESOLUTION_NAMES.get(scope, scope)
+            axis.set_title(f"{title} · {group[0]['image_count']} images · SSIMU2 {low:g}–{high:g}",
+                           fontsize=8, loc="left", pad=7)
         axis.axhline(0, color="0.45", lw=0.65, zorder=1)
         axis.set(xscale="log", xlabel="Mean encode time (ms)",
                  ylabel=f"BD-rate vs. {baseline['encoder']} e{baseline['effort']} (%)")
@@ -2380,7 +2392,7 @@ def _plot_bd_rate_paper(report, by_resolution=False):
         axis.invert_yaxis()
         axis.text(0.02, 0.97, "Upper left is better", transform=axis.transAxes,
                   va="top", fontsize=6.5, color="0.4")
-        if coverage:
+        if show_missing_data and coverage:
             from textwrap import fill
 
             axis.text(0.98, 0.03, "\n".join(fill(line, 48 if by_resolution else 95)
@@ -2448,7 +2460,8 @@ def _plot_bd_rate_paper(report, by_resolution=False):
 
 def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
                              compare_run=None, baseline_encoder="libjxl", baseline_effort=7,
-                             quality_range=(75, 85), efforts=None, image_ids=None):
+                             quality_range=(75, 85), efforts=None, image_ids=None, *,
+                             show_headers=False, show_missing_data=False):
     """Generate independent saved-sweep plots and a per-image JSON coverage report."""
     import json
 
@@ -2459,9 +2472,10 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
         quality_range, efforts, image_ids,
     )
     configure_style()
+    plot_options = {"show_headers": show_headers, "show_missing_data": show_missing_data}
     figures = {
-        "speed-bd-rate": plot_bd_rate(report),
-        "speed-bd-rate-by-resolution": plot_bd_rate(report, by_resolution=True),
+        "speed-bd-rate": plot_bd_rate(report, **plot_options),
+        "speed-bd-rate-by-resolution": plot_bd_rate(report, by_resolution=True, **plot_options),
     }
     for name, figure in figures.items():
         save_figure(figure, output_dir, name, formats)
@@ -2860,6 +2874,9 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # Outputs: `speed-bd-rate`, `speed-bd-rate-by-resolution` in `SAVE_FORMATS`,
 # plus `speed-bd-rate-report.json` with per-image values, coverage reasons,
 # configuration/ledger identities, and PCHIP–Akima differences.
+# Set `BD_RATE_SHOW_HEADERS` and `BD_RATE_SHOW_MISSING_DATA` to show subplot
+# headers and omitted-effort notes. Both default to False for saved files and
+# inline previews; full coverage remains in the report and printed output.
 #
 # **Interpolation sensitivity:** markers use PCHIP; vertical spans show the
 # difference between PCHIP and Akima. These spans indicate method sensitivity,
@@ -2873,6 +2890,8 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         baseline_encoder=BD_RATE_BASELINE[0], baseline_effort=BD_RATE_BASELINE[1],
         quality_range=BD_RATE_QUALITY_RANGE, efforts=BD_RATE_EFFORTS,
         image_ids=BD_RATE_IMAGE_IDS,
+        show_headers=BD_RATE_SHOW_HEADERS,
+        show_missing_data=BD_RATE_SHOW_MISSING_DATA,
     )
 
 
