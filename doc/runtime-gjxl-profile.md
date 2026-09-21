@@ -122,17 +122,41 @@ sweeps cannot supply stage attribution retrospectively.
 
 ## Paper figure
 
-`tools/scripts/cjxl_gjxl_paper_breakdown.py` exports a compact, two-panel
-publication figure from the saved paired Q80 captures: the two CLIC test
-images (3.09 and 3.36 MP), and the 48 MP forest-stream image, each at efforts
-1-10. It reads saved data only and uses the same validated complete-call
-partition as the notebook.
+`tools/scripts/cjxl_gjxl_paper_breakdown.py` exports a publication figure
+from the saved paired Q80 captures, at efforts 1-10. It defaults to a single
+12 MP panel with subplot titles and subtitles hidden. It reads saved data
+only and uses the same validated complete-call partition as the notebook.
 
 ```sh
 uv run tools/scripts/cjxl_gjxl_paper_breakdown.py \
   --config /Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/gjxl-stages-q80-20260921/config.json \
-  --output-dir /Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/gjxl-runtime-paper-20260921/output/pdf
+  --output-dir /Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/gjxl-runtime-paper-configurable-20260921/output/pdf/default-12mp
 ```
+
+Use `--panels` to select one or more datasets/size classes in display order:
+
+| Alias | Capture resolution class |
+| --- | --- |
+| `kodak` | `kodak_0_4mp` |
+| `clic` | `clic_1_8_to_3_4mp` |
+| `12mp` | `12mp` |
+| `24mp` | `24mp` |
+| `48mp` | `48mp` |
+
+Canonical class names also work, and names are case-insensitive. For example,
+append `--panels kodak 48mp --show-panel-titles` to show Kodak and Unsplash
+48 MP with both title and subtitle lines. Use `--panels clic 48mp
+--show-panel-titles` to reproduce the original panel selection and headings.
+Use a separate output directory for each figure variant. The layout uses
+one full-width panel for a single selection and at most two panels per row
+for multiple selections. Hiding the headings also removes their reserved
+vertical space; the timing annotations and axis labels remain visible.
+
+The Python entry points accept the same options, e.g.
+`export(config_path, output_dir, panels=["kodak", "48mp"], show_panel_titles=True)`.
+Captions, selected-image metadata, CSVs and reproduction commands follow the
+chosen panels. An unknown, duplicate or unavailable class is an error;
+incomplete selected cohorts cannot silently produce a bar.
 
 The figure has nine stage groups, 100% stacked bars, and mean profiled
 milliseconds above each bar. Exact GPU stages are regrouped, including

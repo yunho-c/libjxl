@@ -8,6 +8,7 @@
 import argparse
 import json
 from pathlib import Path
+import shlex
 import shutil
 import sys
 
@@ -21,7 +22,11 @@ import pandas as pd
 import cjxl_gjxl_paired_breakdown as paired
 
 
-PANELS = ("clic_1_8_to_3_4mp", "48mp")
+DEFAULT_PANELS = ("12mp",)
+PANEL_ALIASES = {
+    "kodak": "kodak_0_4mp", "clic": "clic_1_8_to_3_4mp",
+    "unsplash12mp": "12mp", "unsplash24mp": "24mp", "unsplash48mp": "48mp",
+}
 GROUPS = {
     "input": ("Input preparation", "#DDCC77"),
     "search": ("GPU: AC search", "#4477AA"),
@@ -34,6 +39,44 @@ GROUPS = {
     "remaining": ("Remaining elapsed time", "#D5D7DA"),
 }
 KEYS = ["resolution_class", "image_id", "setting", "effort", "sample_index"]
+
+
+def resolve_panels(manifest, panels=None):
+    """Resolve aliases to declared resolution classes, preserving caller order."""
+    available = {i["resolution_class"].lower(): i["resolution_class"]
+                 for i in manifest["images"]}
+    requested = DEFAULT_PANELS if panels is None else panels
+    if isinstance(requested, str):
+        requested = (requested,)
+    resolved = []
+    for panel in requested:
+        key = panel.strip().lower()
+        key = PANEL_ALIASES.get(key, key)
+        if key not in available:
+            raise ValueError(f"Unknown or unavailable panel {panel!r}; available classes: "
+                             + ", ".join(available.values()))
+        resolution = available[key]
+        if resolution in resolved:
+            raise ValueError("Duplicate panel: " + resolution)
+        resolved.append(resolution)
+    if not resolved:
+        raise ValueError("Select at least one panel")
+    return tuple(resolved)
+
+
+def panel_description(manifest, resolution):
+    images = [i for i in manifest["images"] if i["resolution_class"] == resolution]
+    title = paired.legacy.RESOLUTION_LABELS.get(resolution, resolution)
+    if title.startswith("Unsplash "):
+        title = title.replace("Unsplash ", "Unsplash, ", 1)
+    count = f"{len(images)} image" + ("s" if len(images) != 1 else "")
+    mps = sorted({i["width"] * i["height"] / 1e6 for i in images})
+    sizes = " / ".join(f"{mp:.2f}" for mp in mps) + " MP"
+    subtitle = f"{count}, {sizes}"
+    if len(images) == 1 and images[0]["image_id"].startswith("unsplash/"):
+        content = images[0]["image_id"].split("/")[1].replace("_", " ")
+        subtitle = f"{count}, {content}"
+    return title, subtitle, f"{title} ({count}, {sizes})"
 
 
 def host_group(stage):
@@ -67,15 +110,16 @@ def gpu_group(stage):
     raise ValueError("Unmapped GPU stage: " + stage)
 
 
-def paper_data(report):
-    coverage = report["coverage"].query("kind == 'flat' and resolution_class in @PANELS")
-    expected = {(res, e) for res in PANELS for e in report["manifest"]["efforts"]}
+def paper_data(report, panels=None):
+    panels = resolve_panels(report["manifest"], panels)
+    coverage = report["coverage"].query("kind == 'flat' and resolution_class in @panels")
+    expected = {(res, e) for res in panels for e in report["manifest"]["efforts"]}
     actual = set(zip(coverage.resolution_class, coverage.effort))
     if actual != expected or not coverage.status.eq("complete").all():
         raise ValueError("Paper panels require complete image/effort coverage")
-    flat = report["samples"].query("kind == 'flat' and resolution_class in @PANELS").copy()
+    flat = report["samples"].query("kind == 'flat' and resolution_class in @panels").copy()
     host = flat[~flat.stage.str.startswith("GPU: ")].copy()
-    gpu = report["gpu_stages"].query("resolution_class in @PANELS").copy()
+    gpu = report["gpu_stages"].query("resolution_class in @panels").copy()
     host["group"] = host.stage.map(host_group)
     gpu["group"] = gpu.stage.map(gpu_group)
     mapped = pd.concat([host, gpu], ignore_index=True)
@@ -98,7 +142,8 @@ def paper_data(report):
     return samples, means, mapping
 
 
-def make_figure(means, manifest):
+def make_figure(means, manifest, panels=None, *, show_panel_titles=False):
+    panels = resolve_panels(manifest, panels)
     style = {
         "font.family": "serif", "font.serif": ["DejaVu Serif"], "font.size": 9,
         "axes.labelsize": 9, "axes.linewidth": .6, "axes.edgecolor": ".25",
@@ -109,9 +154,19 @@ def make_figure(means, manifest):
         "hatch.linewidth": .32, "figure.facecolor": "white", "savefig.facecolor": "white",
     }
     with plt.rc_context(style):
-        fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.65), sharey=True)
-        fig.subplots_adjust(left=.078, right=.993, top=.84, bottom=.285, wspace=.10)
-        for index, (ax, res) in enumerate(zip(axes, PANELS)):
+        columns = min(2, len(panels))
+        rows = (len(panels) + columns - 1) // columns
+        plot_height, bottom_margin = 2.03, 1.04
+        top_margin = .58 if show_panel_titles else .22
+        row_gap = .88 if show_panel_titles else .5
+        height = rows * plot_height + (rows - 1) * row_gap + top_margin + bottom_margin
+        fig, axes = plt.subplots(rows, columns, figsize=(7.0, height),
+                                 sharey=True, squeeze=False)
+        fig.subplots_adjust(left=.078, right=.993, top=1-top_margin/height,
+                            bottom=bottom_margin/height, wspace=.10,
+                            hspace=row_gap/plot_height)
+        for index, (ax, res) in enumerate(zip(axes.flat, panels)):
+            ax.set_label(res)
             part = means[means.resolution_class == res]
             efforts = manifest["efforts"]
             values = part.pivot(index="effort", columns="group", values="percent").reindex(
@@ -140,39 +195,63 @@ def make_figure(means, manifest):
             ax.grid(axis="y", color=".90", linewidth=.45, zorder=0)
             ax.text(0, 1.0, "Mean profiled time (ms)", transform=ax.transAxes,
                     fontsize=7.2, color=".35")
-            if index == 0:
+            if index % columns == 0:
                 ax.set_ylabel("Profiled encode time (%)", labelpad=6)
             else:
                 ax.tick_params(axis="y", left=False)
                 ax.spines["left"].set_visible(False)
-            bounds = ax.get_position()
-            title = "(a)  CLIC test" if index == 0 else "(b)  Unsplash, 48 MP"
-            images = [i for i in manifest["images"] if i["resolution_class"] == res]
-            mps = [i["width"] * i["height"] / 1e6 for i in images]
-            subtitle = (f"{len(images)} images, " + " / ".join(f"{m:.2f}" for m in mps) + " MP"
-                        if index == 0 else f"{len(images)} image, forest stream")
-            fig.text(bounds.x0, .960, title, fontsize=10.2, fontweight="bold", va="top")
-            fig.text(bounds.x0, .909, subtitle, fontsize=8.0, color=".35", va="top")
+            if show_panel_titles:
+                bounds = ax.get_position()
+                title, subtitle, _ = panel_description(manifest, res)
+                fig.text(bounds.x0, bounds.y1 + .44/height,
+                         f"({chr(ord('a') + index)})  {title}",
+                         fontsize=10.2, fontweight="bold", va="top")
+                fig.text(bounds.x0, bounds.y1 + .25/height, subtitle,
+                         fontsize=8.0, color=".35", va="top")
+        for ax in list(axes.flat)[len(panels):]:
+            fig.delaxes(ax)
         # Legend order follows the bottom-to-top stack, left-to-right by row.
         handles = [Patch(facecolor=color, edgecolor="#8A8D91" if k == "remaining" else "white",
                          linewidth=.35, hatch="///" if k == "remaining" else None, label=label)
                    for k, (label, color) in GROUPS.items()]
         order = [0, 3, 6, 1, 4, 7, 2, 5, 8]
         fig.legend(handles=[handles[i] for i in order], ncols=3, loc="lower center",
-                   bbox_to_anchor=(.52, .018), frameon=False, handlelength=1.65,
+                   bbox_to_anchor=(.52, .065/height), frameon=False, handlelength=1.65,
                    handleheight=.85, columnspacing=1.55, handletextpad=.55, labelspacing=.7)
         return fig
 
 
-def export(config_path, output_dir):
+def make_caption(manifest, panels=None):
+    c = manifest
+    panels = resolve_panels(c, panels)
+    selection = "; ".join(panel_description(c, res)[2] for res in panels)
+    return (
+        "Runtime composition of the fully resident Metal GJXL encoder at nominal Q80 "
+        f"(distance 1.9), for {selection}. Each bar partitions the complete profiled "
+        "encode-call time; numbers above bars give mean milliseconds per encode. "
+        f"{c['samples']} repetitions are averaged per image, then images receive equal "
+        "weight. GPU intervals and host phases come from the same encode, with "
+        "nonoverlapping attribution and explicit elapsed-time residuals. Perceptual "
+        "evaluation includes Butteraugli reference features and comparisons. Hatched "
+        "remaining time includes pipeline orchestration, gaps and outer workflow work; "
+        "it is not attributed wholly to CPU or GPU execution. Measurements use Apple "
+        f"M4 Pro (20 GPU cores), {c['cpu_threads']} CPU participants and GJXL revision "
+        f"{c['source_revision'][:7]}. Profiling perturbs execution; no scaling to "
+        "ordinary-run timings is applied. Input loading and backend creation are excluded."
+    )
+
+
+def export(config_path, output_dir, panels=None, *, show_panel_titles=False):
     report = paired.load_profiles(config_path)
-    samples, means, mapping = paper_data(report)
-    out = Path(output_dir).expanduser().resolve()
-    out.mkdir(parents=True, exist_ok=True)
     c = report["manifest"]
+    panels = resolve_panels(c, panels)
+    samples, means, mapping = paper_data(report, panels)
     if c["quality"] != 80 or c["distance"] != 1.9 or c["efforts"] != list(range(1, 11)):
         raise ValueError("This paper caption/layout expects nominal Q80 and efforts 1-10")
-    figure = make_figure(means, c)
+    out = Path(output_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    figure = make_figure(means, c, panels, show_panel_titles=show_panel_titles)
+    size_inches = figure.get_size_inches().tolist()
     stem = "gjxl-runtime-breakdown-paper"
     # The PDF/SVG backends read these settings when saving, after make_figure's
     # styling context has ended. Keep vector text editable and fonts embedded.
@@ -185,20 +264,7 @@ def export(config_path, output_dir):
     samples.to_csv(out/f"{stem}-samples.csv", index=False)
     means.to_csv(out/f"{stem}-means.csv", index=False)
     mapping.to_csv(out/f"{stem}-stage-map.csv", index=False)
-    caption = (
-        "Runtime composition of the fully resident Metal GJXL encoder at nominal Q80 "
-        "(distance 1.9), for two CLIC test images (3.09 and 3.36 MP) and one Unsplash "
-        "image (48.0 MP). Each bar partitions the complete profiled encode-call time; "
-        "numbers above bars give mean milliseconds per encode. Six repetitions are "
-        "averaged per image, then images receive equal weight. GPU intervals and host "
-        "phases come from the same encode, with nonoverlapping attribution and explicit "
-        "elapsed-time residuals. Perceptual evaluation includes Butteraugli reference "
-        "features and comparisons. Hatched remaining time includes pipeline orchestration, "
-        "gaps and outer workflow work; it is not attributed wholly to CPU or GPU execution. "
-        "Measurements use Apple M4 Pro (20 GPU cores), eight CPU participants and GJXL "
-        f"revision {c['source_revision'][:7]}. Profiling perturbs execution; no scaling to "
-        "ordinary-run timings is applied. Input loading and backend creation are excluded."
-    )
+    caption = make_caption(c, panels)
     (out/f"{stem}-caption.md").write_text(caption + "\n")
     (out/f"{stem}.tex").write_text(
         "\\begin{figure*}[t]\n  \\centering\n"
@@ -209,9 +275,11 @@ def export(config_path, output_dir):
     (out/f"{stem}-methodology.json").write_text(json.dumps({
         "config": str(Path(config_path).resolve()), "config_sha256": paired.digest(config_path),
         "encoder_revision": c["source_revision"], "nominal_quality": c["quality"],
-        "distance": c["distance"], "panels": PANELS, "groups": GROUPS,
+        "distance": c["distance"], "panels": panels, "groups": GROUPS,
+        "show_panel_titles": show_panel_titles,
+        "selected_images": [i for i in c["images"] if i["resolution_class"] in panels],
         "boundary": paired.SEMANTICS["flat"], "aggregation": paired.SEMANTICS["aggregation"],
-        "size_inches": [7.0, 3.65], "dpi": 600, "scaling": "none",
+        "size_inches": size_inches, "dpi": 600, "scaling": "none",
         "grouping": "Exact GPU stages remapped; sample complete-call totals unchanged.",
         "sample_partitions_checked": samples[KEYS].drop_duplicates().shape[0],
         "bar_count": means[["resolution_class", "effort"]].drop_duplicates().shape[0],
@@ -233,12 +301,20 @@ def export(config_path, output_dir):
         "## Reproduce\n\n"
         "Run from this directory, using the archived scripts and original saved captures:\n\n"
         "```sh\nuv run cjxl_gjxl_paper_breakdown.py \\\n"
-        f"  --config '{Path(config_path).resolve()}' \\\n"
+        f"  --config {shlex.quote(str(Path(config_path).resolve()))} \\\n"
+        f"  --panels {shlex.join(panels)} \\\n"
+        + ("  --show-panel-titles \\\n" if show_panel_titles else "") +
         "  --output-dir .\n```\n\n"
         "This command only reads saved measurements; it never runs the encoder. "
         "The loader verifies the input and capture hashes, settings, complete cohort "
         "coverage, and nonoverlapping timing intervals. Regrouping must preserve "
         "each complete-call total.\n\n"
+        "Panel titles and subtitles are hidden by default; enable both with "
+        "`--show-panel-titles`. Use `--panels 12mp` (the default), or choose "
+        "multiple panels in display order, e.g. `--panels kodak 48mp`. "
+        "Available aliases include `kodak`, `clic`, `12mp`, `24mp`, and `48mp`; "
+        "canonical resolution-class names from the capture config also work. "
+        "The layout uses at most two panels per row.\n\n"
         "## Reading the figure\n\n"
         "Bars show raw profiled runtime shares, without ordinary-run scaling. "
         "Repetitions are averaged within each image, then images are weighted equally. "
@@ -262,9 +338,20 @@ def export(config_path, output_dir):
     return out/f"{stem}.pdf"
 
 
-if __name__ == "__main__":
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--panels", nargs="+", default=DEFAULT_PANELS, metavar="CLASS",
+                        help="Panels in display order (default: 12mp). Use kodak, clic, "
+                             "12mp, 24mp, 48mp, or resolution classes from the config.")
+    parser.add_argument("--show-panel-titles", action="store_true",
+                        help="Show subplot titles and subtitles (hidden by default).")
+    return parser
+
+
+if __name__ == "__main__":
+    parser = argument_parser()
     args = parser.parse_args()
-    print(export(args.config, args.output_dir))
+    print(export(args.config, args.output_dir, args.panels,
+                 show_panel_titles=args.show_panel_titles))
