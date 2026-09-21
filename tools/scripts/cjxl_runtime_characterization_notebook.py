@@ -132,14 +132,15 @@ BUTTERAUGLI_RUN = pathlib.Path(
         "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-butteraugli-pilot-20260908",
     )
 ).expanduser()
-# Separate saved stage captures; the default is a historical E4 preview only.
-# E1-E10 stay visible, with missing efforts explicitly marked. No collection.
+# Fresh paired, same-call host/GPU captures: six images, nominal Q80, E1-E10.
+# Reading these saved profiles never starts collection.
 GJXL_STAGE_MANIFEST = pathlib.Path(os.environ.get(
     "CJXL_GJXL_STAGE_MANIFEST",
-    "/Users/yunhocho/GitHub/gjxl/reports/runtime-breakdown-preview-20260920/notebook-manifest-v2.json",
+    "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/gjxl-stages-q80-20260921/config.json",
 )).expanduser()  # None skips the GJXL breakdown section.
 GJXL_STAGE_RESOLUTION = STAGE_TABLE_RESOLUTION  # None renders every saved resolution.
-GJXL_STAGE_GPU_DIAGNOSTICS = False  # Optional separate GPU plot; never blended into wall time.
+GJXL_STAGE_GPU_DIAGNOSTICS = False  # Optional additional GPU-only diagnostic.
+GJXL_STAGE_SCALE_TO_ORDINARY = False  # Estimated attribution; raw measurements are the default.
 # Keep the two-metric comparison on the same three-image pilot cohort.
 BUTTERAUGLI_COMPARE_RUN = pathlib.Path(
     os.environ.get(
@@ -2998,58 +2999,73 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
 # shows all); `NORMALIZE_STAGE_BARS` switches percentages versus milliseconds.
 # Every declared effort is shown, but a bar requires the complete declared
 # image/setting cohort and every requested repetition. Missing data stays
-# marked **missing**, never zero. Each effort now has one stacked bar and one
-# denominator: the internal profiled workflow wall time, just as the libjxl
-# plot uses a single wall-time denominator for all its exclusive stages.
+# marked **missing**, never zero. Each effort has one stacked bar and one
+# denominator: the externally measured complete profiled encode call.
 #
-# **Available now:** the historical E4 zero-AQ candidate (`b1fbfc1` + patch),
-# six images, three samples each, image-specific distances near fast-ssim2 85.
-# This is a preview, not current-main results or the notebook's full sweep.
-# E1-E3 and E5-E10 require new captures; the saved full-effort quality studies
-# contain uninstrumented totals and cannot supply missing stage measurements.
+# **Available now:** production-aligned resident Metal at `4f3e414`, six images
+# (0.39–48 MP), nominal Q80 / distance 1.9, all efforts 1–10, eight CPU threads,
+# two warmups per mode and six paired repetitions. Ordinary and profiled calls
+# alternate order. The default CLIC view gives its two images equal weight.
+# This is a selected-image study at nominal settings, not matched quality or
+# a full-corpus sweep. The source revision is on the profiling worktree branch.
 #
 # Input preparation and serializer parents are replaced by their measured
 # children: input geometry/storage, color transform, matrix-scale statistics,
 # resident preparation, quantization setup, validation, DC/AC tokenization,
 # entropy optimization, section writing, and assembly. Residuals retain all
 # remaining time. The chart does not stack parents on top of their children.
-# Flattening happens per sample before averaging; every bar sums to the same
-# measured workflow total. Outer teardown/publication remains excluded.
+# Fine GPU counters are captured **in the same profiled encode** as the host
+# timers. Their nonoverlapping intervals replace the quantization parent;
+# the rest remains **Pipeline orchestration / gaps**, which can include host
+# work, waits and uninstrumented GPU activity. Outer publication / teardown
+# is the complete-call time minus the internal workflow total. Flattening
+# happens per sample before averaging; every bar closes to its measured total.
 #
-# **Quantization is still unresolved** in saved host data and is hatched.
-# Its finer GPU counters were collected in separate invocations. Profiling
-# disables combined deferred ACS/AQ, changes encoder boundaries, and omits
-# resident input preparation. Those counters cannot safely split or be added
-# to the wall-time bar. A fully detailed production-path chart requires new
-# instrumentation and captures; this presentation change cannot recover them.
+# The profiler retains combined deferred ACS/AQ and production submission
+# boundaries, but timestamp encoder boundaries and counter recording still
+# perturb execution. Hollow diamonds show paired ordinary complete-call means.
+# Set `GJXL_STAGE_SCALE_TO_ORDINARY = True` for an **estimated** allocation:
+# multiply each sample's segments by its paired ordinary/profiled time ratio
+# before averaging. This preserves ordinary totals without claiming that the
+# individual stage timings have been corrected. Raw attribution is the default.
 #
 # Set `GJXL_STAGE_GPU_DIAGNOSTICS = True` to also render the finer GPU counters
 # as a separate diagnostic figure, with its own measured-stage denominator.
-# The default displays only the flat wall-time chart. Aggregate worker times
-# never enter it. Percentages use summed durations, not per-stage medians.
+# Aggregate worker times never enter the wall-time chart. Percentages use
+# summed durations, not per-stage medians. Legacy schema-2 manifests remain
+# supported with their historical unresolved pipeline and internal-time boundary.
 #
 # This cell only reads saved profiles and exports `gjxl-stage-breakdown-*.png/svg`,
-# `gjxl-stage-{means,samples,coverage,gpu-stages,rejected}.csv`, and methodology.
-# The means/samples exports include `kind=flat`; `gjxl_stage_means` below is
-# this flat view. Optional GPU figures use `gjxl-gpu-stage-diagnostic-*`.
-# It never builds, profiles, encodes, or scores. See
-# `doc/runtime-gjxl-profile.md` for the input format and new-data requirements.
+# `gjxl-stage-{means,samples,coverage,gpu-stages,rejected,overhead}.csv`, and
+# methodology. Estimated figures use `gjxl-stage-scaled-*`; GPU diagnostics
+# use `gjxl-gpu-stage-diagnostic-*`. It never builds, profiles, encodes, or
+# scores. See `doc/runtime-gjxl-profile.md` for boundaries and capture formats.
 
 # %%
 def generate_gjxl_stage_breakdowns(manifest_path, output_dir, *, resolution=None,
                                    normalize=True, formats=SAVE_FORMATS, show=False,
-                                   gpu_diagnostics=False):
+                                   gpu_diagnostics=False, scaled=False):
     import importlib
+    import json
 
+    manifest_path = pathlib.Path(manifest_path).expanduser()
+    if not manifest_path.is_file():
+        print(f"GJXL stage profiles are missing: {manifest_path}; collection is required.")
+        return None
+    paired = json.loads(manifest_path.read_text()).get("capture_kind") == "paired-same-call-v1"
+    if scaled and not paired:
+        raise ValueError("Estimated scaling requires paired same-call profiles")
     source = pathlib.Path(load_quality_helpers().__file__).resolve().parent
     sys.path.insert(0, str(source))
     try:
-        helper = importlib.import_module("cjxl_gjxl_stage_breakdown")
+        helper = importlib.import_module(
+            "cjxl_gjxl_paired_breakdown" if paired else "cjxl_gjxl_stage_breakdown")
     finally:
         sys.path.pop(0)
     return helper.generate_breakdowns(
         manifest_path, output_dir, resolution=resolution, normalize=normalize,
         formats=formats, show=show, gpu_diagnostics=gpu_diagnostics,
+        **({"scaled": scaled} if paired else {}),
     )
 
 
@@ -3059,11 +3075,13 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
         GJXL_STAGE_MANIFEST, OUTPUT_DIR, resolution=GJXL_STAGE_RESOLUTION,
         normalize=NORMALIZE_STAGE_BARS, show=True,
         gpu_diagnostics=GJXL_STAGE_GPU_DIAGNOSTICS,
+        scaled=GJXL_STAGE_SCALE_TO_ORDINARY,
     )
     if gjxl_stage_report is not None:
         gjxl_stage_coverage = gjxl_stage_report["coverage"]
-        gjxl_stage_means = gjxl_stage_report["means"].query("kind == 'flat'")
-        display(gjxl_stage_coverage.query("kind == 'flat'").drop(columns="missing_tuples"))
+        gjxl_stage_kind = "scaled" if GJXL_STAGE_SCALE_TO_ORDINARY else "flat"
+        gjxl_stage_means = gjxl_stage_report["means"].query("kind == @gjxl_stage_kind")
+        display(gjxl_stage_coverage.query("kind == @gjxl_stage_kind").drop(columns="missing_tuples"))
 
 
 # %% [markdown]

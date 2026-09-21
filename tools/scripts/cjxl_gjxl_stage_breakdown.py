@@ -77,7 +77,7 @@ SEMANTICS = {
     "aggregation": "Average repetitions within each image/setting tuple, then average tuples. "
                    "Percentages are ratios of summed tuple means, not mean percentages. "
                    "Require the entire declared image/setting cohort per resolution/effort/kind.",
-    "instrumentation": "Current stage profiling changes encoder boundaries and disables combined "
+    "instrumentation": "The historical preview profiler changes encoder boundaries and disables combined "
                        "deferred ACS/AQ. It is diagnostic, not production-path attribution.",
 }
 
@@ -160,6 +160,15 @@ def gpu_stages(sample):
         for stage in submission["stages"]:
             begin, end = stage["begin_timestamp"], stage["end_timestamp"]
             elapsed = duration(stage["gpu_nanoseconds"])
+            if stage.get("timestamp_valid") is False:
+                dispatches = stage.get("dispatches", [])
+                if (begin != 0 or end != 0 or elapsed != 0 or not dispatches
+                        or not all(d.get("kind") == "indirect_threadgroups"
+                                   and len(d.get("grid", [])) == 3 and 0 in d["grid"]
+                                   for d in dispatches)):
+                    raise ValueError("Unexplained missing GPU timestamp")
+                stages[stage["stage_id"]] += 0
+                continue
             if (not math.isfinite(begin) or not math.isfinite(end) or begin <= 0
                     or end < begin or abs(end - begin - elapsed) > 1):
                 raise ValueError("Invalid GPU counter interval")
