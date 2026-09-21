@@ -115,7 +115,7 @@ QUALITY_RUN = pathlib.Path(
 GJXL_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_GJXL_RUN",
-        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-full-20260910",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-full-20260915",
     )
 ).expanduser()
 # Saved fixed-Q study; a composite selection labels its source revisions in the BD-rate legend.
@@ -150,6 +150,9 @@ BD_RATE_COMPARE_RUN = GJXL_FIXED_RUN  # Set to None for libjxl only.
 BD_RATE_SHOW_HEADERS = False
 BD_RATE_SHOW_MISSING_DATA = False
 BD_RATE_SHOW_EFFORT_LINKS = True
+# Independent sparse-curve diagnostic; both sources use this same interval.
+DEBUG_BD_RATE_SOURCE_COMPARISON = True
+DEBUG_BD_RATE_QUALITY_RANGE = (75.0, 84.5)  # Inside accepted target 85 +/- 0.5.
 
 # Independent saved batch benchmark; set to None to skip its section.
 BATCH_BENCHMARK_RUN = pathlib.Path(
@@ -2531,6 +2534,160 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
 
 
 # %%
+def plot_bd_rate_source_comparison(comparison, by_resolution=False):
+    """Overlay independently computed fixed/calibrated estimates without re-cohorting."""
+    reports = comparison["reports"]
+    encoders = [source["encoder"] for source in reports["fixed"]["sources"]]
+    available = {p["scope"] for p in reports["fixed"]["points"]} - {"all"}
+    scopes = (([s for s in RESOLUTION_NAMES if s in available]
+               + sorted(available - RESOLUTION_NAMES.keys())) if by_resolution else ["all"])
+    figure, axes = plt.subplots(len(scopes), len(encoders), squeeze=False,
+                               figsize=(7.4 * len(encoders), 4.9 * len(scopes) + 2),
+                               layout="constrained")
+    styles = {"fixed": ("#4477AA", "o", "-", "Fixed sweep"),
+              "calibrated": ("#CC6677", "D", "--", "Calibrated (sparse debug fit)")}
+    baseline = comparison["baseline"]
+    labels_to_place = []
+    for row_index, scope in enumerate(scopes):
+        for col_index, encoder in enumerate(encoders):
+            axis = axes[row_index, col_index]
+            groups = {name: sorted((p for p in report["points"]
+                                   if p["scope"] == scope and p["encoder"] == encoder),
+                                  key=lambda p: p["effort"])
+                      for name, report in reports.items()}
+            lookups = {name: {p["effort"]: p for p in group if p["status"] == "ready"}
+                       for name, group in groups.items()}
+            # Connect the same effort across sources, only when both complete.
+            for effort in lookups["fixed"].keys() & lookups["calibrated"].keys():
+                pair = [lookups[name][effort] for name in styles]
+                axis.plot([p["mean_encode_ms"] for p in pair],
+                          [p["bd_rate_pchip"] for p in pair], ":", color="#9A9FA5",
+                          lw=1, zorder=0)
+            coverage = []
+            for name, (color, marker, linestyle, label) in styles.items():
+                group = groups[name]
+                ready = list(lookups[name].values())
+                axis.plot([p.get("mean_encode_ms", math.nan) if p["status"] == "ready"
+                           else math.nan for p in group],
+                          [p.get("bd_rate_pchip", math.nan) if p["status"] == "ready"
+                           else math.nan for p in group],
+                          color=color, marker=marker, linestyle=linestyle,
+                          mfc=color if name == "fixed" else "white", ms=6, lw=1.4, label=label)
+                axis.vlines([p["mean_encode_ms"] for p in ready],
+                            [min(p["bd_rate_pchip"], p["bd_rate_akima"]) for p in ready],
+                            [max(p["bd_rate_pchip"], p["bd_rate_akima"]) for p in ready],
+                            color=color, alpha=.3, lw=5)
+                clusters = []
+                for point in ready:
+                    if (clusters and abs(math.log(point["mean_encode_ms"]
+                                                   / clusters[-1][0]["mean_encode_ms"])) < .06
+                            and abs(point["bd_rate_pchip"] - clusters[-1][0]["bd_rate_pchip"]) < .04):
+                        clusters[-1].append(point)
+                    else:
+                        clusters.append([point])
+                direction = 1 if name == "fixed" else -1
+                for cluster in clusters:
+                    text = axis.annotate(
+                        "e" + ",".join(str(p["effort"]) for p in cluster),
+                        (math.exp(np.mean([math.log(p["mean_encode_ms"]) for p in cluster])),
+                         np.mean([p["bd_rate_pchip"] for p in cluster])),
+                        xytext=(0, 10 if direction == 1 else -17), textcoords="offset points",
+                        ha="center", color=color, fontsize=8,
+                        arrowprops={"arrowstyle": "-", "color": color, "lw": .5})
+                    text.set_in_layout(False)
+                    labels_to_place.append((text, direction))
+                missing = [f"e{p['effort']} ({p['ready_count']}/{p['image_count']})"
+                           for p in group if p["status"] != "ready"]
+                coverage.append(label.split(" (")[0] + ": "
+                                + ("omitted " + ", ".join(missing) if missing else "all efforts complete"))
+            count = groups["fixed"][0]["image_count"]
+            title = "All images" if scope == "all" else RESOLUTION_NAMES.get(scope, scope)
+            axis.set_title(f"{'GJXL (Metal)' if encoder == 'gjxl' else encoder} · {title} · {count} images",
+                           fontsize=11)
+            axis.set(xscale="log", xlabel="Mean encode time over quality interval (ms)",
+                     ylabel=f"BD-rate vs {baseline['encoder']} e{baseline['effort']} (%)")
+            axis.axhline(0, color="#60666C", lw=.8, zorder=0)
+            axis.margins(x=.18, y=.25)
+            if not any(lookups.values()):
+                axis.set(xlim=(1, 10), ylim=(-1, 1))
+                axis.text(.5, .5, "No complete curves for this interval", ha="center",
+                          transform=axis.transAxes)
+            axis.invert_yaxis()
+            axis.grid(True, alpha=.2)
+            from textwrap import fill
+            axis.text(0, -.22, "\n".join(fill(line, 85) for line in coverage),
+                      transform=axis.transAxes, va="top", fontsize=7, color="#60666C")
+    low, high = comparison["quality_range"]
+    figure.suptitle(
+        f"DEBUG · Speed vs. compression efficiency · SSIMU2 {low:g}–{high:g}\n"
+        "Fixed sweep and calibrated runs · identical image cohort · upper-left is better\n"
+        f"Each series uses its own {baseline['encoder']} e{baseline['effort']} reference; "
+        "calibrated fits use 2–3 achieved-score samples\n"
+        "Dotted links pair efforts; vertical spans are PCHIP–Akima sensitivity, not error bounds",
+        fontsize=11)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, loc="outside lower center", ncols=2)
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    occupied = {axis: [] for axis in axes.flat}
+    for label, direction in labels_to_place:
+        original = label.get_position()
+        for level in range(7):
+            placed = False
+            for horizontal in (0, -14, 14, -28, 28):
+                label.set_position((horizontal, original[1] + direction * 11 * level))
+                box = matplotlib.text.Text.get_window_extent(label, renderer).padded(2)
+                inside = label.axes.get_window_extent(renderer)
+                if (inside.contains(box.x0, box.y0) and inside.contains(box.x1, box.y1)
+                        and not any(box.overlaps(other) for other in occupied[label.axes])):
+                    placed = True
+                    break
+            if placed:
+                break
+        occupied[label.axes].append(box)
+        label.arrow_patch.set_visible(label.get_position() != original)
+    return figure
+
+
+def generate_bd_rate_source_comparison(run, output_dir, formats=SAVE_FORMATS, show=False,
+                                      gjxl_fixed_run=None, gjxl_calibrated_run=None,
+                                      baseline_encoder="libjxl", baseline_effort=7,
+                                      quality_range=(75, 84.5), efforts=None, image_ids=None):
+    """Saved-data-only debug overlay with separate provenance and paired deltas."""
+    import json
+
+    if (gjxl_fixed_run is None) != (gjxl_calibrated_run is None):
+        raise ValueError("Select both fixed and calibrated GJXL studies, or neither")
+    helper = load_bd_rate_helpers()
+    fixed_runs = [run] + ([gjxl_fixed_run] if gjxl_fixed_run is not None else [])
+    calibrated_runs = [run] + ([gjxl_calibrated_run] if gjxl_calibrated_run is not None else [])
+    comparison = helper.analyze_source_comparison(
+        helper.load_studies(fixed_runs), helper.load_calibrated_studies(calibrated_runs),
+        baseline_encoder, baseline_effort, quality_range, efforts, image_ids)
+    configure_style()
+    figures = {"debug-speed-bd-rate-sources": plot_bd_rate_source_comparison(comparison),
+               "debug-speed-bd-rate-sources-by-resolution":
+                   plot_bd_rate_source_comparison(comparison, by_resolution=True)}
+    for name, figure in figures.items():
+        save_figure(figure, pathlib.Path(output_dir), name, formats)
+    report_path = pathlib.Path(output_dir).resolve() / "debug-speed-bd-rate-sources-report.json"
+    report_path.write_text(json.dumps(comparison, indent=2, allow_nan=False) + "\n")
+    for name, report in comparison["reports"].items():
+        for source in report["sources"]:
+            points = [p for p in report["points"]
+                      if p["scope"] == "all" and p["encoder"] == source["encoder"]]
+            ready = [str(p["effort"]) for p in points if p["status"] == "ready"]
+            print(f"DEBUG {name} {source['encoder']}: complete efforts {', '.join(ready) or 'none'}")
+    print(f"Debug comparison, coverage, provenance, and paired differences: {report_path}")
+    if show:
+        plt.show()
+    else:
+        for figure in figures.values():
+            plt.close(figure)
+    return figures
+
+
+# %%
 def generate_encoding_throughput_tables(libjxl_run, gjxl_run, output_dir, *,
                                         min_megapixels=1.0,
                                         qualities=(30, 50, 70, 80, 90, 95),
@@ -2865,11 +3022,11 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # scores, calibrates, or encodes. Missing measured data is shown explicitly.
 # See doc/runtime-quality.md for opt-in collection and resume commands.
 #
-# The default now reads the paused full 65-image study (2026-09-09).
-# Efforts 1–8 have completed timing rounds, with some unresolved quality targets.
-# Effort 9 calibration is complete, but its timing rounds are only partial;
-# effort 10 has not started. Incomplete efforts are not plotted as measured
-# points, and unresolved images are never silently dropped from a cohort.
+# The default reads the full 65-image study, refreshed 2026-09-16.
+# Efforts 9 and 10 each have all 195 accepted calibrations and 975 timing
+# samples, so both are available in every measured resolution/target panel.
+# Twelve earlier-effort targets remain unresolved. Incomplete points are not
+# plotted as measured, and unresolved images are never dropped from a cohort.
 
 # %%
 if __name__ == "__main__" and "ipykernel" in sys.modules:
@@ -2886,6 +3043,9 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # GJXL_FIXED_RUN selects the saved fixed study, including explicitly labeled
 # composites that use different source builds by effort. Its separate calibrated
 # run is not used for this plot.
+# The completed libjxl e9/e10 calibrated timings likewise do not fill gaps in
+# the fixed sweep. Coverage is read from the current fixed-quality timing ledger;
+# an effort appears once its required timing repetitions are complete.
 #
 # Each effort is compared with the baseline on the same raw measured SSIMU2
 # interval (default 75–85), integrating log(bytes) per image with PCHIP and
@@ -2928,6 +3088,43 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         show_headers=BD_RATE_SHOW_HEADERS,
         show_missing_data=BD_RATE_SHOW_MISSING_DATA,
         show_effort_links=BD_RATE_SHOW_EFFORT_LINKS,
+    )
+
+
+# %% [markdown]
+# ### Debug: fixed sweep versus calibrated BD-rate and speed
+#
+# This independent overlay uses saved fixed-sweep observations and accepted
+# calibrated outputs with their own five-repetition timings. It computes both
+# axes separately for each source; calibrated results are not mixed into the
+# main fixed-sweep plot. Both series use the same 65-image manifest cohort and
+# quality interval. Each source supplies its own libjxl e7 reference curve.
+#
+# `DEBUG_BD_RATE_QUALITY_RANGE = (75, 84.5)` stays inside target 85 +/- 0.5;
+# neither source extrapolates to 85 when an achieved score falls below it.
+# Actual measured SSIMU2 scores, not target labels, are the coordinates.
+# Calibrated curves have only two or three unresampled accepted supports:
+# PCHIP/Akima BD-rate and log-linear timing interpolation are sparse debug
+# estimates. Their agreement does not establish accuracy. Unresolved targets
+# cannot supply observations, and incomplete effort/cohort points remain absent.
+# The same source builds, metric, references, and timing protocol are checked.
+#
+# Solid circles show fixed-sweep results; dashed open diamonds show calibrated
+# results. Dotted links connect the same effort when both sources have complete
+# coverage. Vertical spans show PCHIP-Akima sensitivity. Resolution panels and
+# `debug-speed-bd-rate-sources-report.json` retain coverage and paired numerical
+# differences. No encoding, decoding, scoring, or study-ledger writes occur.
+
+# %%
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and DEBUG_BD_RATE_SOURCE_COMPARISON):
+    bd_rate_source_comparison_figures = generate_bd_rate_source_comparison(
+        QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        gjxl_fixed_run=BD_RATE_COMPARE_RUN,
+        gjxl_calibrated_run=GJXL_RUN if BD_RATE_COMPARE_RUN is not None else None,
+        baseline_encoder=BD_RATE_BASELINE[0], baseline_effort=BD_RATE_BASELINE[1],
+        quality_range=DEBUG_BD_RATE_QUALITY_RANGE, efforts=BD_RATE_EFFORTS,
+        image_ids=BD_RATE_IMAGE_IDS,
     )
 
 
@@ -3038,7 +3235,7 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 #
 # These views use GJXL_RUN independently of the paused libjxl baseline. They
 # show accepted measured speed–compression points, per-image calibrated
-# rate–quality curves, and score error relative to each target. The three
+# rate–quality curves, and score error relative to each target. The two
 # unresolved outcomes remain in coverage counts even though they have no
 # selected calibration score to draw. These are measured plots, unlike the
 # fixed-sweep interpolation below. Files use a `gjxl-` prefix.

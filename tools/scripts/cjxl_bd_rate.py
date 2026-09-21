@@ -29,19 +29,21 @@ def _interval(quality_range):
 
 
 def bd_rate(anchor_scores, anchor_rates, test_scores, test_rates,
-            quality_range=(75, 85), method="pchip"):
+            quality_range=(75, 85), method="pchip", *, minimum_points=4):
     """BD-rate percent on a fixed interval; reject extrapolation and reversals."""
     low, high = _interval(quality_range)
+    if minimum_points not in (2, 3, 4):
+        raise ValueError("minimum_points must be 2, 3, or 4")
     if method not in ("pchip", "akima"):
         raise ValueError("method must be pchip or akima")
     interpolator = PchipInterpolator if method == "pchip" else Akima1DInterpolator
     integrals = []
     for scores, rates in ((anchor_scores, anchor_rates), (test_scores, test_rates)):
         scores, rates = np.asarray(scores, dtype=float), np.asarray(rates, dtype=float)
-        if (scores.ndim != 1 or rates.shape != scores.shape or len(scores) < 4
+        if (scores.ndim != 1 or rates.shape != scores.shape or len(scores) < minimum_points
                 or not np.isfinite(scores).all() or not np.isfinite(rates).all()
                 or (rates <= 0).any()):
-            raise ValueError("Need at least four finite score/rate pairs with positive rates")
+            raise ValueError(f"Need at least {minimum_points} finite score/rate pairs with positive rates")
         if (np.diff(scores) <= 0).any() or (np.diff(rates) <= 0).any():
             raise ValueError("Scores and rates must increase in encoder setting order")
         if scores[0] > low or scores[-1] < high:
@@ -118,6 +120,71 @@ def load_studies(runs):
     return result
 
 
+def load_calibrated_studies(runs):
+    """Read accepted calibrated outputs and their own independent timing samples.
+
+    Achieved scores, not requested targets, are the interpolation coordinates.
+    Unresolved targets are retained in coverage metadata, never used as samples.
+    """
+    result = []
+    for path in runs:
+        run = Path(path).expanduser().resolve()
+        config = study.load_config(run)
+        if study.is_fixed(config):
+            raise ValueError("Select a calibrated run for calibrated BD-rate")
+        outcomes = {row["match_id"]: row
+                    for row in study.read_records(run, "calibration", config)}
+        measurements = study.read_records(run, "measurements", config)
+        grouped = defaultdict(list)
+        for row in measurements:
+            match = outcomes.get(row["match_id"])
+            if match is None or match["status"] != "matched":
+                raise ValueError("Timing has no accepted calibration")
+            for key in ("image_id", "effort", "target", "distance", "score",
+                        "encoded_bytes", "output_sha256", "reference_sha256",
+                        "encoder", "metric", "resampling", "width", "height", "pixels"):
+                if row[key] != match[key]:
+                    raise ValueError("Calibrated timing identity mismatch: " + key)
+            if (row["repetition"] not in range(config["repetitions"])
+                    or not math.isfinite(row["elapsed_ms"]) or row["elapsed_ms"] <= 0):
+                raise ValueError("Invalid calibrated timing repetition or duration")
+            grouped[row["match_id"]].append(row)
+        scores = []
+        expected = {study.match_key(image["image_id"], effort, target)
+                    for image in config["images"] for effort in config["measurement_efforts"]
+                    for target in config["targets"]}
+        if not set(outcomes) <= expected:
+            raise ValueError("Calibration is outside its study manifest")
+        for key, match in outcomes.items():
+            if key != study.match_key(match["image_id"], match["effort"], match["target"]):
+                raise ValueError("Calibration key identity mismatch")
+            if match["status"] != "matched":
+                continue
+            if (not math.isfinite(match["score"])
+                    or abs(match["score"] - match["target"]) > config["tolerance"]):
+                raise ValueError("Accepted calibration lies outside its score tolerance")
+            samples = grouped[key]
+            if len({row["repetition"] for row in samples}) != len(samples):
+                raise ValueError("Duplicate calibrated timing repetition")
+            scores.append({
+                **match, "timing_sample_count": len(samples),
+                "elapsed_ms": statistics.median(row["elapsed_ms"] for row in samples)
+                if samples else None,
+            })
+        result.append({
+            "run": str(run), "config": config, "scores": scores,
+            "observation_source": "calibrated",
+            "scores_sha256": study.digest(run / "calibration.jsonl"),
+            "timing_source": {"path": str(run / "measurements.jsonl"),
+                              "sha256": study.digest(run / "measurements.jsonl")},
+            "calibration_coverage": {
+                "expected": len(expected), "pending": len(expected - outcomes.keys()),
+                "outcomes": dict(Counter(row["status"] for row in outcomes.values())),
+            },
+        })
+    return result
+
+
 def _validate_studies(studies, baseline_encoder, baseline_effort, image_ids):
     if not studies:
         raise ValueError("Select at least one saved study")
@@ -167,7 +234,7 @@ def _validate_studies(studies, baseline_encoder, baseline_effort, image_ids):
     return [images[name] for name in selected]
 
 
-def _curve(rows, quality_range, repetitions, grid):
+def _curve(rows, quality_range, repetitions, grid, minimum_points=4):
     detail = {"sample_count": len(rows), "excluded_resampled_count": 0}
     if not rows:
         return {**detail, "status": "missing-scores"}
@@ -180,7 +247,7 @@ def _curve(rows, quality_range, repetitions, grid):
            for row in rows for key in ("distance", "score", "encoded_bytes")):
         return {**detail, "status": "invalid-score-or-rate"}
     rows = sorted(rows, key=lambda row: row["distance"], reverse=True)
-    if len(rows) < 4:
+    if len(rows) < minimum_points:
         return {**detail, "status": "insufficient-samples"}
     if len({row["distance"] for row in rows}) != len(rows):
         return {**detail, "status": "duplicate-distance"}
@@ -203,9 +270,12 @@ def _curve(rows, quality_range, repetitions, grid):
 
 
 def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
-            quality_range=(75, 85), efforts=None, image_ids=None, grid_size=101):
+            quality_range=(75, 85), efforts=None, image_ids=None, grid_size=101,
+            *, minimum_points=4):
     """Return JSON-ready per-image results and fixed-cohort coverage diagnostics."""
     quality_range = _interval(quality_range)
+    if minimum_points not in (2, 3, 4):
+        raise ValueError("minimum_points must be 2, 3, or 4")
     if not isinstance(grid_size, int) or grid_size < 2:
         raise ValueError("grid_size must be an integer >= 2")
     images = _validate_studies(studies, baseline_encoder, baseline_effort, image_ids)
@@ -228,7 +298,7 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
             for effort in set(selected_efforts + [baseline_effort]):
                 curves[encoder, image["image_id"], effort] = _curve(
                     grouped[image["image_id"], effort], quality_range,
-                    item["config"]["repetitions"], grid,
+                    item["config"]["repetitions"], grid, minimum_points,
                 )
     rows = []
     for item in studies:
@@ -252,6 +322,7 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
                         row["bd_rate_" + method] = bd_rate(
                             anchor["scores"], anchor["rates"], test["scores"],
                             test["rates"], quality_range, method,
+                            minimum_points=minimum_points,
                         )
                     row["interpolation_delta_pp"] = row["bd_rate_akima"] - row["bd_rate_pchip"]
                 rows.append(row)
@@ -291,7 +362,8 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
         "aggregation": "arithmetic mean of per-image BD-rate percentages; fixed cohort",
         "timing_method": "log-linear interpolation on a uniform score grid; arithmetic mean ms",
         "timing_boundary": "warm complete encode call; excludes startup, file I/O, decode and scoring",
-        "resampling": "only resampling=1; at least four monotone measured points per curve",
+        "resampling": f"only resampling=1; at least {minimum_points} monotone measured points per curve",
+        "minimum_curve_points": minimum_points,
         "timing_coverage": "all retained unresampled curve points require the configured repetitions",
         "efforts": selected_efforts,
         "sources": [{
@@ -305,6 +377,96 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
             "num_threads": item["config"]["num_threads"],
             "scores_sha256": item.get("scores_sha256"),
             "timing_source": item.get("timing_source"),
+            "observation_source": item.get("observation_source", "fixed"),
+            "calibration_coverage": item.get("calibration_coverage"),
         } for item in studies],
         "points": points, "images": rows,
+    }
+
+
+def _encoder_build_identity(config, effort):
+    """Compare the actual build selected for an effort, including composites."""
+    if config.get("composite_sources"):
+        selected = [source for source in config["composite_sources"]
+                    if effort in source["efforts"]]
+        if len(selected) != 1:
+            raise ValueError("Ambiguous composite effort routing")
+        config = study.load_config(Path(selected[0]["run"]))
+    return {
+        "revision": config.get("encoder_revision", config.get("libjxl_revision")),
+        "benchmark_sha256": config["tool_hashes"][config["benchmark"]],
+        "libraries": sorted(sha for path, sha in config["tool_hashes"].items()
+                            if path.endswith(".dylib")),
+    }
+
+
+def analyze_source_comparison(fixed_studies, calibrated_studies,
+                              baseline_encoder="libjxl", baseline_effort=7,
+                              quality_range=(75, 84.5), efforts=None, image_ids=None):
+    """Independent fixed/calibrated BD-rate estimates on one explicit cohort.
+
+    Two or three calibrated supports are a debug estimate, not a relaxation of
+    the ordinary fixed-sweep plot's four-support requirement. Both series use
+    their own source's baseline curve, with identical metric interval/weighting.
+    """
+    fixed = {study.encoder_name(item["config"]): item for item in fixed_studies}
+    calibrated = {study.encoder_name(item["config"]): item for item in calibrated_studies}
+    if (len(fixed) != len(fixed_studies) or len(calibrated) != len(calibrated_studies)
+            or fixed.keys() != calibrated.keys()):
+        raise ValueError("Select one fixed and one calibrated study per encoder")
+    identities = {}
+    for encoder, item in fixed.items():
+        a, b = item["config"], calibrated[encoder]["config"]
+        for key in ("metric_version", "intensity_target", "num_threads", "repetitions",
+                    "warmups", "backend", "metal_aq_mode", "density", "compression",
+                    "collect_final_score", "thread_semantics"):
+            if a.get(key) != b.get(key):
+                raise ValueError("Fixed/calibrated protocol mismatch: " + key)
+        for key in ("djxl", "scorer"):
+            if a["tool_hashes"][a[key]] != b["tool_hashes"][b[key]]:
+                raise ValueError("Fixed/calibrated tool mismatch: " + key)
+        references = [{image["image_id"]: tuple(image[k] for k in
+                       (*study.SOURCE_FIELDS, "pfm_sha256")) for image in c["images"]}
+                      for c in (a, b)]
+        if references[0] != references[1]:
+            raise ValueError("Fixed/calibrated reference cohorts differ")
+        selected = set(efforts if efforts is not None else a["efforts"])
+        if encoder == baseline_encoder:
+            selected.add(baseline_effort)
+        if not selected <= set(a["efforts"]) & set(b["efforts"]):
+            raise ValueError("Fixed/calibrated effort selections differ")
+        identities[encoder] = {}
+        for effort in sorted(selected):
+            identity = _encoder_build_identity(a, effort)
+            if identity != _encoder_build_identity(b, effort):
+                raise ValueError(f"Fixed/calibrated encoder build mismatch: {encoder} e{effort}")
+            identities[encoder][str(effort)] = identity
+    reports = {
+        name: analyze(items, baseline_encoder, baseline_effort, quality_range,
+                      efforts, image_ids, minimum_points=minimum)
+        for name, items, minimum in (("fixed", fixed_studies, 4),
+                                      ("calibrated", calibrated_studies, 2))
+    }
+    fixed_points = {(p["scope"], p["encoder"], p["effort"]): p
+                    for p in reports["fixed"]["points"]}
+    pairs = []
+    for point in reports["calibrated"]["points"]:
+        other = fixed_points[point["scope"], point["encoder"], point["effort"]]
+        if point["cohort"] != other["cohort"]:
+            raise ValueError("Comparison points have different image cohorts")
+        if point["status"] == other["status"] == "ready":
+            pairs.append({
+                "scope": point["scope"], "encoder": point["encoder"],
+                "effort": point["effort"], "image_count": point["image_count"],
+                "bd_rate_difference_pp": point["bd_rate_pchip"] - other["bd_rate_pchip"],
+                "encode_time_difference_percent": 100 * (point["mean_encode_ms"]
+                                                          / other["mean_encode_ms"] - 1),
+            })
+    return {
+        "schema_version": 1, "debug_only": True, "quality_range": list(quality_range),
+        "baseline": {"encoder": baseline_encoder, "effort": baseline_effort},
+        "baseline_policy": "Each series uses its own source's baseline rate curve",
+        "cohort_policy": "Identical fixed manifest cohort; incomplete points omitted, no intersection",
+        "calibrated_method": "PCHIP with Akima sensitivity, 2+ achieved-score supports; sparse debug estimate",
+        "build_identities_by_effort": identities, "reports": reports, "paired_differences": pairs,
     }
