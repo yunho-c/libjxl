@@ -75,7 +75,10 @@ import pandas as pd
 #
 # Edit these paths when opening this file as a Jupytext notebook. When invoked
 # as a script, use `--input` and `--output-dir` instead.
-# The default input points at the refreshed, paused wall-v2 partial snapshot:
+# When the local CUDA study is present and the historical input is absent, the
+# notebook selects the saved CUDA fixed sweep and exports to its plots directory.
+# Section 12 plots both CUDA sweeps and their complete requested-grid coverage.
+# Otherwise the default input points at the paused wall-v2 partial snapshot:
 # expanded stage wall times joined to the original uninstrumented timings.
 # Refreshed 2026-09-08: 4,469/4,550 stage tuples; efforts 1-9 complete.
 # Missing stage captures stay empty; pooled stage bars omit incomplete efforts.
@@ -126,6 +129,35 @@ GJXL_FIXED_RUN = pathlib.Path(
         "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/fixed-gjxl-full-20260915",
     )
 ).expanduser()
+# CUDA studies are kept separate from the historical Metal/CPU comparisons.
+_cuda_workspace = (pathlib.Path(__file__).resolve().parents[3] if "__file__" in globals()
+                   else next((p for p in (pathlib.Path.cwd(), *pathlib.Path.cwd().parents)
+                              if (p / "tools/scripts/cjxl_quality_characterization.py").is_file()),
+                             pathlib.Path.cwd()).parent)
+
+
+def discover_cuda_study(workspace):
+    """Find the newest initialized sibling study without depending on its date."""
+    candidates = [path for path in workspace.glob("gjxl-cuda*-study-*")
+                  if (path / "fixed/metadata.json").is_file()]
+    return max(candidates, key=lambda path: (path / "fixed/metadata.json").stat().st_mtime,
+               default=workspace / "gjxl-cuda-study")
+
+
+CUDA_STUDY_ROOT = pathlib.Path(os.environ.get(
+    "CJXL_CUDA_STUDY_ROOT", discover_cuda_study(_cuda_workspace),
+)).expanduser()
+CUDA_FIXED_RUN = pathlib.Path(os.environ.get("CJXL_CUDA_FIXED_RUN", CUDA_STUDY_ROOT / "fixed")).expanduser()
+CUDA_RUN = pathlib.Path(os.environ.get("CJXL_CUDA_RUN", CUDA_STUDY_ROOT / "calibrated")).expanduser()
+# Opening this checkout on the CUDA machine selects its saved runtime CSV when
+# the historical Mac path is absent; explicit environment settings take priority.
+if ("CJXL_IMAGE_TUPLES_CSV" not in os.environ
+        and ("CJXL_CUDA_STUDY_ROOT" in os.environ or "CJXL_CUDA_FIXED_RUN" in os.environ
+             or not INPUT_CSV.is_file())
+        and (CUDA_FIXED_RUN / "summary/image-tuples.csv").is_file()):
+    INPUT_CSV = CUDA_FIXED_RUN / "summary/image-tuples.csv"
+    if "CJXL_CHARACTERIZATION_PLOT_DIR" not in os.environ:
+        OUTPUT_DIR = CUDA_STUDY_ROOT / "plots"
 BUTTERAUGLI_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_BUTTERAUGLI_RUN",
@@ -309,6 +341,12 @@ def load_image_tuples(path):
     frame["effort"] = frame["effort"].astype(int)
     frame["timing_sample_count"] = frame["timing_sample_count"].astype(int)
     frame.attrs["source_path"] = path
+    metadata_path = path.parent.parent / "metadata.json"
+    if metadata_path.is_file():
+        import json
+        metadata = json.loads(metadata_path.read_text())
+        if isinstance(metadata.get("images"), list):
+            frame.attrs["expected_images"] = metadata["images"]
     return frame
 
 
@@ -322,8 +360,16 @@ def resolution_order(frame):
 
 
 def encoder_label(frame):
+    if "encoder" in frame and frame["encoder"].nunique() != 1:
+        raise ValueError("A runtime figure must contain exactly one encoder")
     name = frame["encoder"].iloc[0] if "encoder" in frame else "libjxl"
-    return "gjxl (fully-resident Metal)" if name == "gjxl" else str(name)
+    if name != "gjxl":
+        return str(name)
+    backends = frame["backend"].dropna().unique() if "backend" in frame else ["metal"]
+    if len(backends) != 1:
+        raise ValueError("A runtime figure must contain exactly one GJXL backend")
+    backend = "CUDA" if backends[0] == "cuda" else str(backends[0]).capitalize()
+    return f"gjxl (fully-resident {backend})"
 
 
 def resolution_label(frame, resolution_class):
@@ -337,6 +383,7 @@ def resolution_label(frame, resolution_class):
 
 def aggregate_cells(frame, expected_timing_samples=5):
     """Aggregate image rows without averaging already-normalized ms/MP values."""
+    encoder_label(frame)  # Refuse accidental pooling across GPU backends.
     records = []
     keys = ("corpus", "resolution_class", "quality", "effort")
     for key, group in frame.groupby(list(keys), observed=True, sort=True):
@@ -680,8 +727,12 @@ def resolution_throughput_rows(frame, cells, effort=7,
                                qualities=(30, 50, 70, 80, 90, 95)):
     """Average quality-specific MP/s equally, requiring a fixed complete cohort."""
     records = []
+    expected = {}
+    for image in frame.attrs.get("expected_images", []):
+        expected.setdefault(image["resolution_class"], []).append(image)
     for resolution, images in frame.groupby("resolution_class", observed=True):
-        image_ids = set(images["image_id"])
+        image_ids = ({image["image_id"] for image in expected[resolution]}
+                     if resolution in expected else set(images["image_id"]))
         selected = images[(images["effort"] == effort) & images["quality"].isin(qualities)]
         group = cells[(cells["resolution_class"] == resolution)
                       & (cells["effort"] == effort) & cells["quality"].isin(qualities)]
@@ -694,13 +745,20 @@ def resolution_throughput_rows(frame, cells, effort=7,
         )
         records.append({
             "resolution_class": resolution,
-            "mean_megapixels": images.drop_duplicates("image_id")["megapixels"].mean(),
+            "mean_megapixels": (np.mean([i["width"] * i["height"] / 1e6 for i in expected[resolution]])
+                                if resolution in expected else images.drop_duplicates("image_id")["megapixels"].mean()),
             "throughput_mp_s": (1000.0 / group["runtime_ms_per_mp"]).mean()
                                if complete else math.nan,
             "image_count": len(image_ids),
             "quality_count": len(qualities),
             "timing_complete": bool(complete),
         })
+    for resolution in expected.keys() - {row["resolution_class"] for row in records}:
+        cohort = expected[resolution]
+        records.append({"resolution_class": resolution,
+                        "mean_megapixels": np.mean([i["width"] * i["height"] / 1e6 for i in cohort]),
+                        "throughput_mp_s": math.nan, "image_count": len(cohort),
+                        "quality_count": len(qualities), "timing_complete": False})
     return pd.DataFrame.from_records(records).sort_values("mean_megapixels")
 
 
@@ -755,6 +813,9 @@ def plot_throughput_vs_resolution(frame, cells):
         axis.minorticks_off()
         axis.tick_params(axis="both", which="major", length=3, width=0.7)
         axis.set_ylim(bottom=0)
+        for row in rows.loc[~rows["timing_complete"]].itertuples():
+            axis.text(row.mean_megapixels, 0.04, "missing", rotation=90,
+                      transform=axis.get_xaxis_transform(), ha="center", va="bottom", fontsize=7)
         axis.margins(x=0.07, y=0.15)
         axis.set_axisbelow(True)
         axis.grid(axis="y", color="0.88", linewidth=0.5)
@@ -805,7 +866,13 @@ def plot_throughput_vs_effort(frame, cells):
         axis.set_xlabel("Encoding effort")
         axis.set_ylabel("Encoding throughput (MP/s)")
         axis.set_xticks(efforts)
-        axis.set_yscale("log")
+        if not complete.empty:
+            axis.set_yscale("log")
+        else:
+            axis.set_ylim(0, 1)
+            axis.set_yticks([])
+            axis.text(0.5, 0.5, "Full image/quality cohort unavailable\nSee measurement coverage",
+                      transform=axis.transAxes, ha="center", va="center", fontsize=8)
         axis.minorticks_off()
         axis.tick_params(axis="both", which="major", length=3, width=0.7)
         axis.margins(x=0.04, y=0.12)
@@ -871,6 +938,11 @@ def plot_throughput_vs_quality(frame, cells, include_q10=False):
         axis.set_xlabel("Requested quality (Q)")
         axis.set_ylabel("Encoding throughput (MP/s)")
         axis.set_xticks(rows["quality"])
+        if not rows["timing_complete"].any():
+            axis.set_ylim(0, 1)
+            axis.set_yticks([])
+            axis.text(0.5, 0.5, "Full image cohort unavailable\nSee measurement coverage",
+                      transform=axis.transAxes, ha="center", va="center", fontsize=8)
         axis.minorticks_off()
         axis.tick_params(axis="both", which="major", length=3, width=0.7)
         axis.margins(x=0.05, y=0.12)
@@ -939,6 +1011,8 @@ def plot_throughput_vs_resolution_debug(frame, cells):
 
 # %%
 def plot_rate_runtime_tradeoff(frame, cells):
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+
     resolutions = resolution_order(frame)
     figure, axes = subplot_grid(len(resolutions), width=5.1, height=3.9)
     efforts = sorted(cells["effort"].unique())
@@ -981,6 +1055,9 @@ def plot_rate_runtime_tradeoff(frame, cells):
         axis.set_xlabel("Bits per pixel")
         axis.set_ylabel("Complete encode (ms/MP)")
         axis.set_xscale("log")
+        axis.xaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+        axis.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+        axis.xaxis.set_minor_formatter(NullFormatter())
         axis.set_yscale("log")
     handles = [
         mlines.Line2D([], [], color=effort_colors[e], marker="o", label="E%d" % e)
@@ -1790,10 +1867,10 @@ def plot_pareto(points, mode):
                     lw=1,
                 )
                 offsets = [
-                    (6, 10),
+                    (-20, 10),
                     (6, -15),
-                    (6, 10),
-                    (6, -15),
+                    (6, 16),
+                    (-22, -15),
                     (6, 10),
                     (12, -18),
                     (-22, 14),
@@ -1900,7 +1977,7 @@ def plot_pareto(points, mode):
         handles=[
             *[Line2D([], [], color="#2065ac" if name == "libjxl" else "#d55e00",
                      label=("libjxl: effort order" if name == "libjxl" else
-                            "gjxl (fully-resident Metal): effort order"))
+                            encoder_label(pd.DataFrame([r for r in points if r["encoder"] == name])) + ": effort order"))
               for name in (encoders or ["libjxl"])],
             Line2D(
                 [], [], color="#333333", linestyle="--", label="Nondominated frontier"
@@ -3166,7 +3243,8 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
 # Plotly rendering uses [`go.Table`](https://plotly.com/python/table/).
 
 # %%
-if __name__ == "__main__" and "ipykernel" in sys.modules:
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and frame["profiled_complete_wall_ms"].notna().any()):
     stage_wall_tables, stage_wall_figure = generate_stage_wall_tables(
         INPUT_CSV, OUTPUT_DIR, quality=STAGE_TABLE_QUALITY,
         resolution=STAGE_TABLE_RESOLUTION, unit=STAGE_TABLE_UNIT, show=True,
@@ -3255,7 +3333,9 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # not confidence intervals or bounds on interpolation error.
 
 # %%
-if __name__ == "__main__" and "ipykernel" in sys.modules:
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and (QUALITY_RUN / "metadata.json").is_file()
+        and (BD_RATE_COMPARE_RUN is None or (BD_RATE_COMPARE_RUN / "metadata.json").is_file())):
     bd_rate_figures = generate_bd_rate_figures(
         QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
         compare_run=BD_RATE_COMPARE_RUN,
@@ -3294,7 +3374,10 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 
 # %%
 if (__name__ == "__main__" and "ipykernel" in sys.modules
-        and DEBUG_BD_RATE_SOURCE_COMPARISON):
+        and DEBUG_BD_RATE_SOURCE_COMPARISON
+        and (QUALITY_RUN / "metadata.json").is_file()
+        and (BD_RATE_COMPARE_RUN is None or (BD_RATE_COMPARE_RUN / "metadata.json").is_file())
+        and (BD_RATE_COMPARE_RUN is None or (GJXL_RUN / "metadata.json").is_file())):
     bd_rate_source_comparison_figures = generate_bd_rate_source_comparison(
         QUALITY_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
         gjxl_fixed_run=BD_RATE_COMPARE_RUN,
@@ -3521,7 +3604,9 @@ if __name__ == "__main__" and "ipykernel" in sys.modules and GJXL_FIXED_RUN is n
 
 # %%
 if (__name__ == "__main__" and "ipykernel" in sys.modules
-        and THROUGHPUT_GJXL_RUN is not None):
+        and THROUGHPUT_GJXL_RUN is not None
+        and (THROUGHPUT_LIBJXL_RUN / "metadata.json").is_file()
+        and (THROUGHPUT_GJXL_RUN / "metadata.json").is_file()):
     encoding_throughput_tables = generate_encoding_throughput_tables(
         THROUGHPUT_LIBJXL_RUN, THROUGHPUT_GJXL_RUN, OUTPUT_DIR,
         min_megapixels=THROUGHPUT_MIN_MEGAPIXELS,
@@ -3598,3 +3683,178 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
         BATCH_BENCHMARK_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
         batch_sizes=BATCH_BENCHMARK_SIZES, show_round_range=BATCH_SHOW_ROUND_RANGE,
     )
+
+
+# %% [markdown]
+# ## 12. CUDA fixed and calibrated sweeps
+#
+# Select a saved study with `CJXL_CUDA_STUDY_ROOT`, or select each run with
+# `CJXL_CUDA_FIXED_RUN` and `CJXL_CUDA_RUN`. Without overrides, the newest
+# initialized sibling `gjxl-cuda*-study-*` directory is selected. Exact source
+# revisions, machine information and configuration IDs are exported to
+# `studies.json`; comparison across revisions must account for policy changes.
+# For example, the updated integration policy uses fixed DCT8, uniform initial
+# quantization, Gaborish off and zero AQ updates at ordinary efforts 1–4.
+# The protocol uses fully-resident CUDA and eight maximum participating CPU
+# threads. Timing covers the
+# synchronized public encode call after one validation encode and one explicit
+# warmup, with five independent processes per accepted setting. File I/O,
+# decoding and fast-ssim2 scoring are outside that interval.
+#
+# The fixed grid is Q10/30/50/70/80/90/95, efforts 1–10 and all manifest
+# images. Calibration independently targets fast-ssim2 60/70/85 ±0.5 per image.
+# Failed allocations and unresolved targets remain in the coverage denominator.
+# Support is measured per setting: old-branch 48 MP failures are not presumed
+# to recur on the updated policy. No values are imputed for failed settings.
+# Figures never start
+# collection, and historical Metal/CPU measurements are not used as a speedup
+# baseline across machines. Override `CJXL_CUDA_FIXED_RUN` and
+# `CJXL_CUDA_RUN` to read another pair of saved CUDA studies.
+# See `doc/runtime-cuda-quality.md` for setup, qualification and resume commands.
+
+# %%
+def cuda_coverage_rows(run, config):
+    """One row per requested setting, including settings with no measurement."""
+    study = load_quality_helpers()
+    rows = []
+    if study.is_fixed(config):
+        timed = {r["job_id"]: r for r in study.fixed_rows(run, config)}
+        scored = {r["source_job_id"] for r in study.read_records(run, "scores", config)}
+        failed = {r["job_id"]: r for r in study.read_records(run, "failures", config)
+                  if r.get("phase") == "fixed-timing"}
+        for image in config["images"]:
+            for effort in config["efforts"]:
+                for quality in config["qualities"]:
+                    key = study.fixed_key(image["image_id"], quality, effort)
+                    ready = timed.get(key, {}).get("timing_complete", False) and key in scored
+                    rows.append({"run": "fixed", "setting_id": key,
+                                 "image_id": image["image_id"], "resolution_class": image["resolution_class"],
+                                 "megapixels": image["width"] * image["height"] / 1e6,
+                                 "effort": effort, "quality": quality,
+                                 "status": "complete" if ready else failed.get(key, {}).get("status", "incomplete"),
+                                 "timing_samples": timed.get(key, {}).get("timing_sample_count", 0)})
+    else:
+        for row in study.per_image_rows(run, config, "measured"):
+            rows.append({"run": "calibrated", "setting_id": study.match_key(row["image_id"], row["effort"], row["target"]),
+                         "image_id": row["image_id"], "resolution_class": row["resolution_class"],
+                         "megapixels": row["pixels"] / 1e6,
+                         "effort": row["effort"], "target": row["target"],
+                         "status": "complete" if row["status"] == "ready" else row["status"],
+                         "timing_samples": row.get("timing_sample_count", 0)})
+    return rows
+
+
+def plot_cuda_throughput_by_resolution(frame, cells, config):
+    """Keep each full manifest resolution cohort independent, including missing ones."""
+    records = []
+    for effort in config["efforts"]:
+        for row in resolution_throughput_rows(frame, cells, effort=effort).to_dict("records"):
+            records.append({"effort": effort, **row})
+    rows = pd.DataFrame(records)
+    order = rows.groupby("resolution_class")["mean_megapixels"].first().sort_values().index
+    figure, axis = plt.subplots(figsize=(9, 5), layout="constrained")
+    for index, resolution in enumerate(order):
+        group = rows.loc[rows["resolution_class"] == resolution].sort_values("effort")
+        label = f"{RESOLUTION_NAMES.get(resolution, resolution)} ({int(group['image_count'].iloc[0])} images)"
+        if not group["timing_complete"].any():
+            label += " — unavailable"
+        axis.plot(group["effort"], group["throughput_mp_s"], marker="o", markersize=4,
+                  color=plt.get_cmap("tab10")(index), label=label)
+    if rows["timing_complete"].any():
+        axis.set_yscale("log")
+    else:
+        axis.set_ylim(0, 1)
+        axis.set_yticks([])
+        axis.text(0.5, 0.5, "No complete resolution/quality cohorts yet", ha="center",
+                  va="center", transform=axis.transAxes)
+    axis.set_xticks(config["efforts"])
+    axis.set_xlabel("Encoding effort")
+    axis.set_ylabel("Complete-encode throughput (MP/s)")
+    axis.set_title("GJXL CUDA throughput by resolution")
+    axis.legend(loc="best", fontsize=8)
+    figure.text(0.5, -0.03,
+                "Fixed manifest cohort per resolution · equal mean over Q30/50/70/80/90/95 · missing values are not filled",
+                ha="center", fontsize=8)
+    return figure, rows
+
+
+def generate_cuda_figures(fixed_run=CUDA_FIXED_RUN, calibrated_run=CUDA_RUN,
+                          output_dir=OUTPUT_DIR / "gjxl-cuda", formats=SAVE_FORMATS, show=False):
+    """Render both saved CUDA studies and an exhaustive coverage audit; no encoding."""
+    import json
+    study = load_quality_helpers()
+    configure_style()
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    figures, coverage, records = {}, [], {}
+    for mode, location in (("fixed", fixed_run), ("calibrated", calibrated_run)):
+        run = pathlib.Path(location)
+        if not (run / "metadata.json").is_file():
+            print(f"No saved CUDA {mode} data at {run}; skipping. Collection is never started here.")
+            continue
+        config = study.load_config(run)
+        if config.get("backend") != "cuda" or study.is_fixed(config) != (mode == "fixed"):
+            raise ValueError(f"Expected a CUDA {mode} study at {run}")
+        coverage.extend(cuda_coverage_rows(run, config))
+        records[mode] = {"path": str(run.resolve()), "configuration_id": config["configuration_id"],
+                         "encoder_revision": config["encoder_revision"], "machine": config.get("machine"),
+                         "coverage": study.run_completion(run, config)}
+        destination = output_dir / mode
+        csv_path = run / "summary/image-tuples.csv"
+        if (mode == "fixed" and csv_path.is_file() and csv_path.stat().st_size
+                and not pd.read_csv(csv_path).empty):
+            frame, cells, runtime_figures, _ = generate_characterization(csv_path, destination, formats=formats, show=False)
+            figures.update({f"{mode}/{key}": fig for key, fig in runtime_figures.items()})
+            throughput_figure, throughput_rows = plot_cuda_throughput_by_resolution(frame, cells, config)
+            save_figure(throughput_figure, destination, "throughput-by-resolution", formats)
+            throughput_rows.to_csv(destination / "throughput-by-resolution.csv", index=False)
+            figures["fixed/throughput-by-resolution"] = throughput_figure
+        figures.update({f"{mode}/{key}": fig for key, fig in
+                        generate_quality_figures(run, destination, formats, show=False).items()})
+        source = "sweep" if mode == "fixed" else "calibrated"
+        figures.update({f"{mode}/{key}": fig for key, fig in
+                        generate_rate_quality_figures(run, destination, formats, show=False, source=source).items()})
+        if mode == "calibrated":
+            figures.update({f"{mode}/{key}": fig for key, fig in
+                            generate_rate_quality_figures(run, destination, formats, show=False,
+                                                          source=source, view="target-error").items()})
+    if coverage:
+        frame = pd.DataFrame(coverage)
+        frame.to_csv(output_dir / "coverage.csv", index=False)
+        figure, axes = plt.subplots(1, len(records), figsize=(7 * len(records), 5), squeeze=False, layout="constrained")
+        for axis, mode in zip(axes.flat, records):
+            selected = frame.loc[frame["run"] == mode].copy()
+            selected["category"] = selected["status"].map(
+                lambda value: value if value in ("complete", "cuda-out-of-memory") else "other unresolved")
+            counts = pd.crosstab(selected["resolution_class"], selected["category"])
+            order = selected.groupby("resolution_class")["megapixels"].median().sort_values().index.tolist()
+            counts = counts.reindex(order)
+            labels = [RESOLUTION_NAMES.get(name, name) for name in order]
+            left = np.zeros(len(order))
+            for category, color in (("complete", "#238b45"), ("cuda-out-of-memory", "#d95f0e"), ("other unresolved", "#bdbdbd")):
+                values = counts.get(category, pd.Series(0, index=order)).to_numpy()
+                axis.barh(labels, values, left=left, label=category, color=color)
+                for y, (start, value) in enumerate(zip(left, values)):
+                    if value:
+                        axis.text(start + value / 2, y, str(value), ha="center", va="center", fontsize=9,
+                                  color="white" if category == "complete" else "black")
+                left += values
+            axis.set_title(f"CUDA {mode}: {sum(selected['status'] == 'complete')}/{len(selected)} complete")
+            axis.set_xlabel("Requested settings (all manifest images retained)")
+            axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), fontsize=8)
+        figure.suptitle("Measurement coverage · allocation failures and unresolved targets stay visible")
+        save_figure(figure, output_dir, "coverage", formats)
+        figures["coverage"] = figure
+    (output_dir / "studies.json").write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
+    if show:
+        from IPython.display import display
+        for figure in figures.values():
+            display(figure)
+    for figure in figures.values():
+        plt.close(figure)
+    return figures, records
+
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules:
+    cuda_figures, cuda_studies = generate_cuda_figures(show=True)

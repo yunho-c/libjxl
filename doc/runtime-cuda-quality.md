@@ -142,11 +142,42 @@ python ../cuda-study/collection-code/cjxl_cuda_study.py validate --study ../cuda
 
 Keep the corpus, binaries, environments, logs, ledgers, generated plots and
 executed notebooks outside Git. Commit the reusable sources and documentation.
-The notebooks read saved data only; analysis instructions accompany the CUDA
-section of `cjxl_runtime_characterization_notebook.py`.
+The notebooks read saved data only. For partial or completed saved results:
+
+```powershell
+python tools/scripts/cjxl_cuda_analysis.py --study ../cuda-study
+```
+
+This exports PNG/SVG figures, an HTML gallery, study identities and one coverage
+row per requested setting. It verifies coverage counts, unique setting IDs and
+image/SVG structure. Missing cohorts stay missing, even if all their images
+failed. Inspect the figures visually as a separate step. To execute every cell
+of the current notebook after both sweeps pass the raw-data audit:
+
+```powershell
+python tools/scripts/cjxl_cuda_analysis.py --study ../cuda-study --execute
+```
+
+Use `--output-dir PATH` to keep analysis artifacts separate from the study.
+Execution uses a local Jupyter kernel with explicit dataset/output paths,
+checks the resulting configuration IDs and coverage against `verification.json`,
+and compares its CUDA PNG figures byte-for-byte with direct rendering (SVGs
+contain timestamps and are parsed and hashed separately). The output
+includes the executed `.ipynb`, source SHA-256, executed cell count and error
+count. It does not assume a fixed notebook cell count, so upstream notebook
+additions are retained. Failed execution preserves the notebook for inspection.
+
+Install the notebook's declared matplotlib/numpy/pandas/plotly/scipy dependencies
+plus `nbformat`, `nbclient` and `ipykernel` for Run All. When opening the percent
+notebook manually, set `CJXL_CUDA_STUDY_ROOT`; optional `CJXL_CUDA_FIXED_RUN` and
+`CJXL_CUDA_RUN` override individual saved runs. Without overrides, it discovers
+the newest initialized sibling `gjxl-cuda*-study-*` directory, falling back to
+`gjxl-cuda-study`. The CUDA section records the actual selected revisions and
+never uses Metal/CPU measurements from another machine as a speedup baseline.
 
 ## Development checks (no GPU collection)
 
 ```powershell
 python -m unittest discover -s tools/scripts -p cjxl_cuda_study_test.py
+python -m unittest discover -s tools/scripts -p cjxl_cuda_analysis_test.py
 ```
