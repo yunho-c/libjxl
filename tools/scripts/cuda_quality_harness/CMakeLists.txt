@@ -1,0 +1,43 @@
+cmake_minimum_required(VERSION 3.25)
+project(gjxl_cuda_quality_harness LANGUAGES CXX)
+find_package(gjxl CONFIG REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+if(NOT DEFINED GJXL_QUALITY_REVISION OR NOT DEFINED GJXL_SOURCE_DIR)
+  message(FATAL_ERROR "GJXL_QUALITY_REVISION and GJXL_SOURCE_DIR are required")
+endif()
+add_executable(gjxl_cuda_quality_benchmark quality_benchmark.cpp)
+target_compile_features(gjxl_cuda_quality_benchmark PRIVATE cxx_std_20)
+target_compile_definitions(gjxl_cuda_quality_benchmark PRIVATE
+  GJXL_QUALITY_REVISION="${GJXL_QUALITY_REVISION}")
+target_include_directories(gjxl_cuda_quality_benchmark PRIVATE "${GJXL_SOURCE_DIR}/src")
+target_sources(gjxl_cuda_quality_benchmark PRIVATE "${GJXL_SOURCE_DIR}/src/io/pfm.cpp")
+target_link_libraries(gjxl_cuda_quality_benchmark PRIVATE gjxl::codestream CUDA::cudart)
+
+# FindCUDAToolkit may expose cudart's import library rather than its Windows DLL.
+# Keep the runtime beside each executable so the frozen build is self-contained.
+function(copy_cuda_runtime target)
+  if(WIN32)
+    file(GLOB cuda_runtime_dlls "${CUDAToolkit_BIN_DIR}/cudart64*.dll")
+    if(NOT cuda_runtime_dlls)
+      message(FATAL_ERROR "No cudart runtime DLL in ${CUDAToolkit_BIN_DIR}")
+    endif()
+    foreach(dll IN LISTS cuda_runtime_dlls)
+      add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:${target}>"
+        VERBATIM)
+    endforeach()
+  endif()
+endfunction()
+copy_cuda_runtime(gjxl_cuda_quality_benchmark)
+
+option(GJXL_QUALITY_BUILD_POLICY_TESTS "Build the updated low-effort policy tests" ON)
+if(GJXL_QUALITY_BUILD_POLICY_TESTS)
+foreach(test_name IN ITEMS cuda_low_effort low_effort_strategy_policy)
+  add_executable(gjxl_${test_name}_test "${GJXL_SOURCE_DIR}/tests/${test_name}_test.cpp")
+  target_compile_features(gjxl_${test_name}_test PRIVATE cxx_std_20)
+  target_include_directories(gjxl_${test_name}_test PRIVATE "${GJXL_SOURCE_DIR}/src" "${GJXL_SOURCE_DIR}/tests")
+  target_compile_definitions(gjxl_${test_name}_test PRIVATE GJXL_TEST_HAS_METAL=0)
+  target_link_libraries(gjxl_${test_name}_test PRIVATE gjxl::codestream CUDA::cudart)
+  copy_cuda_runtime(gjxl_${test_name}_test)
+endforeach()
+endif()
