@@ -132,6 +132,13 @@ BUTTERAUGLI_RUN = pathlib.Path(
         "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-butteraugli-pilot-20260908",
     )
 ).expanduser()
+# Separate saved stage captures; the default is a historical E4 preview only.
+# E1-E10 stay visible, with missing efforts explicitly marked. No collection.
+GJXL_STAGE_MANIFEST = pathlib.Path(os.environ.get(
+    "CJXL_GJXL_STAGE_MANIFEST",
+    "/Users/yunhocho/GitHub/gjxl/reports/runtime-breakdown-preview-20260920/notebook-manifest-v2.json",
+)).expanduser()  # None skips the GJXL breakdown section.
+GJXL_STAGE_RESOLUTION = STAGE_TABLE_RESOLUTION  # None renders every saved resolution.
 # Keep the two-metric comparison on the same three-image pilot cohort.
 BUTTERAUGLI_COMPARE_RUN = pathlib.Path(
     os.environ.get(
@@ -2980,6 +2987,75 @@ if __name__ == "__main__" and DEBUG_STAGE_BREAKDOWN_BY_QUALITY:
         # )
         plt.show()
         plt.close(debug_figure)
+
+
+# %% [markdown]
+# ### GJXL runtime breakdown by effort: workflow, serializer, and GPU stages
+#
+# `GJXL_STAGE_MANIFEST` / `CJXL_GJXL_STAGE_MANIFEST` selects a separate saved
+# profile bundle. `GJXL_STAGE_RESOLUTION` selects a corpus/resolution (`None`
+# shows all); `NORMALIZE_STAGE_BARS` switches percentages versus milliseconds.
+# Every declared effort is shown, but a bar requires the complete declared
+# image/setting cohort and every requested repetition. Missing data stays
+# marked **missing**, never zero. Exports include coverage and exact GPU IDs.
+#
+# **Available now:** the historical E4 zero-AQ candidate (`b1fbfc1` + patch),
+# six images, three samples each, image-specific distances near fast-ssim2 85.
+# This is a preview, not current-main results or the notebook's full sweep.
+# E1-E3 and E5-E10 require new captures; the saved full-effort quality studies
+# contain uninstrumented totals and cannot supply missing stage measurements.
+#
+# The three panels have different denominators:
+#
+# - **Workflow:** additive internal wall times; quantization includes CPU
+#   orchestration and GPU waits. Outer teardown/publication is excluded.
+# - **Serializer:** DC/AC tokenization, entropy optimization, section writing,
+#   assembly, validation, and an explicit residual from the same host capture.
+# - **GPU stages:** initial quantization, forward transforms, final CfL/DC and
+#   coefficients, plus measured reference features, reconstruction, filtering,
+#   Butteraugli and AQ policy where present. Repeated stages are summed within
+#   a sample. These counters come from a **separate instrumented invocation**;
+#   they are not added to host time or used to subdivide its quantization bar.
+#
+# Current stage instrumentation disables combined deferred ACS/AQ and changes
+# encoder boundaries. It also omits resident input preparation. The GPU panel
+# is therefore diagnostic; attributing the production combined path requires
+# instrumentation work as well as fresh data. Counter sums are not complete
+# GPU execution time. No overlapping worker times or nested host timers enter
+# these bars. Percentages use summed durations, not independent stage medians.
+#
+# This cell only reads saved profiles and exports `gjxl-stage-breakdown-*.png/svg`,
+# `gjxl-stage-{means,samples,coverage,gpu-stages,rejected}.csv`, and methodology.
+# It never builds, profiles, encodes, or scores. See
+# `doc/runtime-gjxl-profile.md` for the input format and new-data requirements.
+
+# %%
+def generate_gjxl_stage_breakdowns(manifest_path, output_dir, *, resolution=None,
+                                   normalize=True, formats=SAVE_FORMATS, show=False):
+    import importlib
+
+    source = pathlib.Path(load_quality_helpers().__file__).resolve().parent
+    sys.path.insert(0, str(source))
+    try:
+        helper = importlib.import_module("cjxl_gjxl_stage_breakdown")
+    finally:
+        sys.path.pop(0)
+    return helper.generate_breakdowns(
+        manifest_path, output_dir, resolution=resolution, normalize=normalize,
+        formats=formats, show=show,
+    )
+
+
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and GJXL_STAGE_MANIFEST is not None):
+    gjxl_stage_report = generate_gjxl_stage_breakdowns(
+        GJXL_STAGE_MANIFEST, OUTPUT_DIR, resolution=GJXL_STAGE_RESOLUTION,
+        normalize=NORMALIZE_STAGE_BARS, show=True,
+    )
+    if gjxl_stage_report is not None:
+        gjxl_stage_coverage = gjxl_stage_report["coverage"]
+        gjxl_stage_means = gjxl_stage_report["means"]
+        display(gjxl_stage_coverage.drop(columns="missing_tuples"))
 
 
 # %% [markdown]
