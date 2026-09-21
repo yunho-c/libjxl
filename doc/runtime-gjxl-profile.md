@@ -120,6 +120,34 @@ six-image study needs no additional measurements. Further cohorts or changed
 encoder revisions need fresh captures; uninstrumented historical quality
 sweeps cannot supply stage attribution retrospectively.
 
+## Paper figure
+
+`tools/scripts/cjxl_gjxl_paper_breakdown.py` exports a compact, two-panel
+publication figure from the saved paired Q80 captures: the two CLIC test
+images (3.09 and 3.36 MP), and the 48 MP forest-stream image, each at efforts
+1-10. It reads saved data only and uses the same validated complete-call
+partition as the notebook.
+
+```sh
+uv run tools/scripts/cjxl_gjxl_paper_breakdown.py \
+  --config /Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/gjxl-stages-q80-20260921/config.json \
+  --output-dir /Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/gjxl-runtime-paper-20260921/output/pdf
+```
+
+The figure has nine stage groups, 100% stacked bars, and mean profiled
+milliseconds above each bar. Exact GPU stages are regrouped, including
+Gaborish in transform/reconstruction and indirect dispatch setup in AC
+search. Every sample must still sum to its original complete-call time.
+Input preparation can include GPU work; the hatched remaining elapsed time
+includes orchestration, gaps and outer workflow work and is not CPU-only.
+There is no ordinary-run scaling. The panels contain selected images, so
+their differences do not establish resolution scaling independently of content.
+
+Outputs include a 7-inch-wide vector PDF with embedded fonts, editable SVG,
+600-dpi PNG, a caption and LaTeX figure snippet, sample/mean/stage-map CSVs,
+methodology metadata, and copies of the rendering and loading scripts.
+The output README gives reproduction instructions and attribution details.
+
 ## Historical preview boundary
 
 Legacy schema-2 manifests still dispatch to `cjxl_gjxl_stage_breakdown.py`.
