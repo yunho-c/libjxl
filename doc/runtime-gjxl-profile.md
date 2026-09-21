@@ -9,6 +9,8 @@ collect measurements. Configure:
   profile manifest path; `None` skips the section.
 - `GJXL_STAGE_RESOLUTION`: a manifest resolution class; `None` renders all.
 - `NORMALIZE_STAGE_BARS`: percentages when true, mean milliseconds when false.
+- `GJXL_STAGE_GPU_DIAGNOSTICS`: false by default; true adds a separate GPU
+  diagnostic figure. GPU counters never enter the flat wall-time chart.
 
 The default bundle is
 `/Users/yunhocho/GitHub/gjxl/reports/runtime-breakdown-preview-20260920/notebook-manifest-v2.json`.
@@ -21,19 +23,30 @@ collection-needed message instead of attempting collection.
 
 ## Measurement boundaries
 
-The first panel partitions **internal workflow wall time** into input
-preparation, quantization pipeline, CPU serializer, and a residual. This total
-excludes outer teardown/publication. Quantization includes host orchestration,
-GPU execution, and waits. Do not substitute it for the complete public-call
-latency in the notebook's uninstrumented throughput figures.
+The default is a **single flat stacked bar per effort**, with one denominator:
+internal workflow wall time. Input preparation is replaced by geometry/storage,
+color transform, matrix-scale statistics, resident preparation, quantization
+setup, and its residual. The CPU serializer is replaced by validation, DC/AC
+tokenization, entropy optimization, section writing, assembly, and its residual.
+Quantization pipeline time and other workflow time complete the partition.
 
-The second panel partitions **serializer wall time**, from the same host
-capture, into validation, DC/AC tokenization, entropy optimization, section
-writing, assembly, and a residual. Overlapping aggregate worker counters are
-not used. A large residual is unresolved attribution, not a known GPU stage.
+Parent timers are replaced, never added to their children. Flattening is done
+within each raw sample before aggregation. The sum of every flat sample must
+equal its original workflow total; all three residuals must be nonnegative.
+Serializer percentages now use the whole workflow denominator. For example,
+a 20 ms entropy phase within a 50 ms serializer in a 100 ms workflow is 20%
+of the flat bar, not 40%. Overlapping aggregate worker counters are not used.
+A large residual remains unresolved attribution, not a known GPU stage.
 
-The third panel groups **nonoverlapping GPU timestamp intervals from a separate
-instrumented invocation**. It retains initial quantization, quantizer adjustment,
+**Quantization remains unresolved** in the saved host data; its segment is
+hatched and explicitly labeled. This is a genuine missing-measurement boundary,
+not another collapsed plot panel. It includes host orchestration, GPU execution
+and waits. Splitting it accurately requires new instrumentation and captures.
+The workflow total excludes outer teardown/publication, so do not substitute
+it for uninstrumented complete public-call latency in throughput figures.
+
+The optional GPU figure groups **nonoverlapping timestamp intervals from a
+separate instrumented invocation**. It retains initial quantization, quantizer adjustment,
 forward transforms, final CfL, DC quantization and final coefficients, plus
 reference features, AC search, trial reconstruction, loop filtering,
 Butteraugli and AQ policy when those intervals are recorded. Exact stage IDs
@@ -135,7 +148,7 @@ across stages/submissions. Rejected timing samples are exported with reasons;
 their missing repetitions prevent that effort/kind from entering the chart.
 Structural/provenance failures stop loading rather than producing a chart.
 
-A resolution/effort/panel is shown only when every image × setting tuple has
+A resolution/effort/measurement kind is shown only when every image × setting tuple has
 all requested valid repetitions. Host and GPU coverage are independent;
 missing GPU captures never suppress valid host results. No missing effort
 is treated as zero. Repetitions are averaged within each tuple, then tuples
@@ -146,5 +159,9 @@ Exports under `OUTPUT_DIR` are `gjxl-stage-breakdown-<resolution>.png/svg`,
 `gjxl-stage-means.csv`, `gjxl-stage-samples.csv`, `gjxl-stage-coverage.csv`,
 `gjxl-stage-gpu-stages.csv`, `gjxl-stage-rejected.csv`, and
 `gjxl-stage-methodology.json`. Exact GPU-stage rows are validated raw samples;
-the grouped means table contains only complete cohorts. None of these
-exports are joined to uninstrumented throughput measurements.
+the grouped means table contains only complete cohorts. `kind=flat` in the
+means/samples/coverage exports supplies the default plot; the workflow and
+serializer kinds remain available for auditing. They are overlapping views of
+the same measurements and must not be summed with `flat`. The optional GPU
+figure is saved as `gjxl-gpu-stage-diagnostic-<resolution>.png/svg`. None of
+these exports are joined to uninstrumented throughput measurements.

@@ -2,7 +2,7 @@
 # Copyright (c) the JPEG XL Project Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
-"""Saved-data-only GJXL host partitions and separate GPU-counter diagnostics.
+"""Saved-data-only, flat GJXL wall breakdown and optional GPU diagnostics.
 
 Input contract and collection limitations: doc/runtime-gjxl-profile.md.
 This module never starts a benchmark, builds code, or modifies input data.
@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
 from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
@@ -35,6 +36,16 @@ HOST_GROUPS = {
         "Assembly": ("codestream_assembly",),
     },
 }
+INPUT_GROUPS = {
+    "Input geometry / storage": "input_geometry_and_storage",
+    "Input color transform": "input_color_transform",
+    "Matrix-scale statistics": "input_matrix_scale_stats",
+    "Resident input preparation": "input_resident_preparation",
+    "Quantization setup": "input_quantization_preparation",
+}
+UNRESOLVED_PIPELINE = "Quantization pipeline (unresolved)"
+FLAT_STAGES = (*INPUT_GROUPS, "Other input preparation", UNRESOLVED_PIPELINE,
+               *HOST_GROUPS["serializer"], "Other serializer", "Other workflow")
 GPU_GROUPS = (
     "Reference features", "Initial quantization", "Quantizer adjustment",
     "AC strategy search", "Other frontend", "Forward transform",
@@ -43,16 +54,20 @@ GPU_GROUPS = (
     "Final coefficients", "Other GPU stages",
 )
 COLORS = {
-    "workflow": ("#CCD6DF", "#396E9E", "#CF8845", "#E7E9EC"),
-    "serializer": ("#AAB7C4", "#287568", "#84B4A0", "#79629F",
-                   "#D3A454", "#B98269", "#D9DDE2"),
+    "flat": ("#8CA8BB", "#7CBFB6", "#578C89", "#B5C9D7", "#7796AD", "#D9E1E7",
+             "#396E9E", "#AAB7C4", "#287568", "#84B4A0", "#79629F", "#D3A454",
+             "#B98269", "#BBC1CB", "#E7E9EC"),
     "gpu": tuple(plt.get_cmap("tab20").colors[:len(GPU_GROUPS)]),
 }
-KINDS = ("workflow", "serializer", "gpu")
+KINDS = ("flat", "workflow", "serializer", "gpu")
 RESOLUTION_LABELS = {"kodak_0_4mp": "Kodak", "clic_1_8_to_3_4mp": "CLIC test",
                      "12mp": "Unsplash 12 MP", "24mp": "Unsplash 24 MP",
                      "48mp": "Unsplash 48 MP"}
 SEMANTICS = {
+    "flat": "One exclusive partition of each host sample's internal workflow total. "
+            "Replace input preparation and CPU serializer parents with their children and "
+            "explicit residuals before averaging. Quantization remains unresolved. No GPU "
+            "counter durations are inserted, rescaled, or added to this partition.",
     "workflow": "Internal profiled wall time; excludes outer teardown/publication. "
                 "Quantization includes host orchestration and waits.",
     "serializer": "Exclusive host phases plus an explicit residual, within the same host capture.",
@@ -118,6 +133,20 @@ def host_partitions(sample):
             raise ValueError("Host partition exceeds its measured total")
         values["Other " + kind] = residual
         result[kind] = values
+    # Flatten within each sample: never add parent timers to their children,
+    # nor normalize serializer children to the serializer's smaller total.
+    inputs = {name: duration(p[key]) for name, key in INPUT_GROUPS.items()}
+    residual = p["input_preparation"] - sum(inputs.values())
+    if residual < 0:
+        raise ValueError("Input partition exceeds its measured total")
+    flat = dict(inputs)
+    flat["Other input preparation"] = residual
+    flat[UNRESOLVED_PIPELINE] = p["quantization_pipeline"]
+    flat.update(result["serializer"])
+    flat["Other workflow"] = result["workflow"]["Other workflow"]
+    if not math.isclose(sum(flat.values()), p["total"], rel_tol=1e-12, abs_tol=1):
+        raise ValueError("Flat partition does not sum to workflow total")
+    result["flat"] = flat
     return result
 
 
@@ -293,63 +322,76 @@ def load_profiles(manifest_path):
                 coverage=coverage, gpu_stages=pd.DataFrame(exact_rows), rejected=pd.DataFrame(rejected))
 
 
-def plot_breakdown(report, resolution, normalize=True):
+def plot_breakdown(report, resolution, normalize=True, *, kind="flat"):
+    """One bar per effort with a single denominator; GPU is a separate figure."""
+    if kind not in ("flat", "gpu"):
+        raise ValueError("Plot kind must be flat or gpu")
     m = report["manifest"]
     efforts = m["efforts"]
-    data = report["means"].query("resolution_class == @resolution")
-    fig, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True)
-    fig.subplots_adjust(left=.085, right=.67, top=.85, bottom=.15, hspace=.48)
-    titles = ("Workflow wall time", "Within the CPU serializer", "GPU stage counters · separate diagnostic captures")
-    for ax, kind, title in zip(axes, KINDS, titles):
-        part = data.query("kind == @kind")
-        names = (list(HOST_GROUPS[kind]) + ["Other " + kind]) if kind != "gpu" else list(GPU_GROUPS)
-        present = part.groupby("stage")["ms"].sum()
-        names = [name for name in names if present.get(name, 0) > 0]
-        colors = dict(zip((list(HOST_GROUPS[kind]) + ["Other " + kind])
-                          if kind != "gpu" else GPU_GROUPS, COLORS[kind]))
-        heights = np.zeros(len(efforts))
-        for name in names:
-            vals = part[part["stage"] == name].set_index("effort")["percent" if normalize else "ms"]
-            vals = vals.reindex(efforts).fillna(0).to_numpy()
-            ax.bar(efforts, vals, bottom=heights, color=colors[name], width=.72)
-            heights += vals
-        complete = set(part["effort"])
-        for effort in efforts:
-            if effort not in complete:
-                ax.text(effort, .035, "missing", rotation=90, ha="center", va="bottom",
-                        color="#8A9299", fontsize=8, transform=ax.get_xaxis_transform())
+    part = report["means"].query("resolution_class == @resolution and kind == @kind")
+    fig, ax = plt.subplots(figsize=(13, 6.6))
+    fig.subplots_adjust(left=.085, right=.67, top=.74, bottom=.25)
+    stages = FLAT_STAGES if kind == "flat" else GPU_GROUPS
+    present = part.groupby("stage")["ms"].sum()
+    names = [name for name in stages if present.get(name, 0) > 0]
+    colors = dict(zip(stages, COLORS[kind]))
+    heights = np.zeros(len(efforts))
+    handles = []
+    for name in names:
+        vals = part[part["stage"] == name].set_index("effort")["percent" if normalize else "ms"]
+        vals = vals.reindex(efforts).fillna(0).to_numpy()
+        hatch = "///" if name == UNRESOLVED_PIPELINE else None
+        ax.bar(efforts, vals, bottom=heights, color=colors[name], width=.72,
+               hatch=hatch, edgecolor="white", linewidth=.25)
+        handles.append(Patch(facecolor=colors[name], edgecolor="white", hatch=hatch, label=name))
         if normalize:
-            totals = part.groupby("effort")["ms"].sum()
-            for effort, total in totals.items():
-                ax.text(effort, 102, f"{total:.1f} ms", ha="center", fontsize=8)
-        ax.set_title(title, loc="left", fontsize=12)
-        ax.set_ylabel("% of panel total" if normalize else "Mean ms / encode")
-        ax.set_ylim(0, 115 if normalize else max(1, heights.max() * 1.18))
-        ax.set_xlim(min(efforts) - .65, max(efforts) + .65)
-        ax.set_xticks(efforts)
-        ax.tick_params(labelbottom=True)
-        ax.grid(axis="y", alpha=.15)
-        ax.set_axisbelow(True)
-        for spine in ("top", "right"):
-            ax.spines[spine].set_visible(False)
-        if names:
-            ax.legend(handles=[Patch(color=colors[name], label=name) for name in names],
-                      loc="center left", bbox_to_anchor=(1.02, .5), frameon=False,
-                      fontsize=9, ncols=2 if len(names) > 8 else 1)
-    axes[-1].set_xlabel("Effort")
+            for effort, bottom, value in zip(efforts, heights, vals):
+                if value >= 8:
+                    luminance = np.dot(to_rgb(colors[name]), [.299, .587, .114])
+                    ax.text(effort, bottom + value / 2, f"{value:.0f}%", ha="center", va="center",
+                            color="white" if luminance < .56 else "#172B40", fontsize=8,
+                            bbox=dict(facecolor=colors[name], edgecolor="none", pad=1.5)
+                            if hatch else None)
+        heights += vals
+    complete = set(part["effort"])
+    for effort in efforts:
+        if effort not in complete:
+            ax.text(effort, .035, "missing", rotation=90, ha="center", va="bottom",
+                    color="#8A9299", fontsize=8, transform=ax.get_xaxis_transform())
+    if normalize:
+        for effort, total in part.groupby("effort")["ms"].sum().items():
+            ax.text(effort, 103, f"{total:.1f} ms", ha="center", fontsize=9)
+    ax.set_ylabel(("Profiled workflow wall time (%)" if kind == "flat" else "Measured GPU stage time (%)")
+                  if normalize else "Mean ms / encode")
+    ax.set_ylim(0, 115 if normalize else max(1, heights.max() * 1.18))
+    ax.set_xlim(min(efforts) - .65, max(efforts) + .65)
+    ax.set_xticks(efforts)
+    ax.grid(axis="y", alpha=.15)
+    ax.set_axisbelow(True)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    if handles:
+        ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.02, .5), frameon=False, fontsize=9)
+    ax.set_xlabel("Effort")
     cohort = [i for i in m["images"] if i["resolution_class"] == resolution]
     label = RESOLUTION_LABELS.get(resolution, resolution)
-    fig.suptitle(f"GJXL runtime breakdown · {label}\n{m['label']}", x=.085, ha="left", fontsize=16, y=.975)
-    fig.text(.085, .901, f"{len(cohort)} images · {m['settings_label']} · {m['samples_per_capture']} samples/tuple · "
-             f"{m['cpu_threads']} CPU-thread cap · fully resident Metal", fontsize=10, color="#556270")
-    fig.text(.085, .09, "Missing efforts have no complete capture cohort; they are not measured zeros. Each panel has its own denominator.", fontsize=9)
-    fig.text(.085, .063, "GPU profiling changes execution structure and omits input preparation. GPU counters are not added to workflow time.", fontsize=9)
-    fig.text(.085, .036, "Internal workflow time excludes outer teardown/publication. Saved profiles only; no benchmarks are started.", fontsize=9)
+    title = "GJXL runtime breakdown" if kind == "flat" else "GJXL GPU stages · separate diagnostic"
+    fig.suptitle(f"{title} · {label}\n{m['label']}", x=.085, ha="left", fontsize=16, y=.965)
+    fig.text(.085, .83, f"{len(cohort)} images · {m['settings_label']} · {m['samples_per_capture']} samples/tuple · "
+             f"{m['cpu_threads']} CPU-thread cap", fontsize=10, color="#556270")
+    if kind == "flat":
+        fig.text(.085, .13, "One total: internal workflow wall time. Input and serializer parents are replaced by their measured substages.", fontsize=9)
+        fig.text(.085, .09, "Hatched quantization time is unresolved. Finer GPU attribution requires new instrumentation and captures.", fontsize=9)
+        fig.text(.085, .05, "Outer teardown/publication excluded. Missing efforts are unmeasured; only saved data is used.", fontsize=9)
+    else:
+        fig.text(.085, .13, "Separate GPU-instrumented invocations; denominator is the sum of recorded stage intervals, not workflow time.", fontsize=9)
+        fig.text(.085, .09, "Profiling changes execution structure and omits resident input preparation. These counters cannot split the wall-time bar.", fontsize=9)
+        fig.text(.085, .05, "Missing efforts have no complete capture cohort. This diagnostic is not production-path attribution.", fontsize=9)
     return fig
 
 
 def generate_breakdowns(manifest_path, output_dir, *, resolution=None, normalize=True,
-                        formats=("png", "svg"), show=False):
+                        formats=("png", "svg"), show=False, gpu_diagnostics=False):
     if manifest_path is None or not Path(manifest_path).expanduser().is_file():
         print("No GJXL stage manifest. New workflow/GPU captures are required; see doc/runtime-gjxl-profile.md.")
         return None
@@ -359,7 +401,8 @@ def generate_breakdowns(manifest_path, output_dir, *, resolution=None, normalize
     for name in ("samples", "means", "coverage", "gpu_stages", "rejected"):
         report[name].to_csv(output / f"gjxl-stage-{name.replace('_', '-')}.csv", index=False)
     methodology = dict(manifest=report["manifest"], manifest_path=report["manifest_path"],
-                       semantics=SEMANTICS, normalize=normalize,
+                       semantics=SEMANTICS, normalize=normalize, plot_kind="flat",
+                       gpu_diagnostics=gpu_diagnostics,
                        manifest_sha256=hashlib.sha256(Path(report["manifest_path"]).read_bytes()).hexdigest())
     (output / "gjxl-stage-methodology.json").write_text(json.dumps(methodology, indent=2) + "\n")
     resolutions = list(report["coverage"]["resolution_class"].unique())
@@ -368,14 +411,17 @@ def generate_breakdowns(manifest_path, output_dir, *, resolution=None, normalize
             raise ValueError("Resolution not in the GJXL profile cohort: " + resolution)
         resolutions = [resolution]
     report["figures"] = {}
+    report["gpu_figures"] = {}
     for res in resolutions:
-        figure = plot_breakdown(report, res, normalize)
-        report["figures"][res] = figure
-        for suffix in formats:
-            figure.savefig(output / f"gjxl-stage-breakdown-{res}.{suffix}", dpi=180)
-        if show:
-            plt.show()
-        plt.close(figure)
+        for kind in (("flat", "gpu") if gpu_diagnostics else ("flat",)):
+            figure = plot_breakdown(report, res, normalize, kind=kind)
+            report["figures" if kind == "flat" else "gpu_figures"][res] = figure
+            name = "gjxl-stage-breakdown" if kind == "flat" else "gjxl-gpu-stage-diagnostic"
+            for suffix in formats:
+                figure.savefig(output / f"{name}-{res}.{suffix}", dpi=180)
+            if show:
+                plt.show()
+            plt.close(figure)
     ready = report["coverage"].query("status == 'complete'")
     for kind in KINDS:
         found = sorted(int(e) for e in ready.loc[ready["kind"] == kind, "effort"].unique())
