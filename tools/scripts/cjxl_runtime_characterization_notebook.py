@@ -2261,6 +2261,8 @@ def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
 # resolution panels use two columns. Serif text, open markers,
 # distinct solid/dashed encoder lines, and light horizontal guides remain
 # legible in grayscale. Effort labels use short ranges for coincident points.
+# GJXL effort labels stay above their points; libjxl labels stay below. Collision
+# resolution searches sideways and farther outward without switching sides.
 # Small vertical spans retain PCHIP–Akima sensitivity, not confidence intervals.
 # Subplot headers and missing-data notes are hidden by default. Set
 # `show_headers=True` or `show_missing_data=True` to include them; the saved
@@ -2373,16 +2375,20 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
                     if len(efforts) > 1 and efforts == list(range(efforts[0], efforts[-1] + 1))
                     else "e" + ",".join(str(effort) for effort in efforts)
                 )
+                # Offset points use screen coordinates, independent of the inverted y-axis.
+                direction = 1 if encoder == "gjxl" else -1
                 label = axis.annotate(
-                    effort_label, (x, y), xytext=(0, 7 if encoder == "libjxl" else -12),
-                    textcoords="offset points", ha="center", color=colors[encoder], fontsize=7,
+                    effort_label, (x, y), xytext=(0, direction * 7),
+                    textcoords="offset points", ha="center",
+                    va="bottom" if direction > 0 else "top",
+                    color=colors[encoder], fontsize=7,
                     bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
                           "boxstyle": "square,pad=0.1"},
                     arrowprops={"arrowstyle": "-", "color": colors[encoder],
                                 "lw": 0.45, "alpha": 0.65},
                 )
                 label.set_in_layout(False)
-                annotations.append((label, 1 if encoder == "libjxl" else -1))
+                annotations.append((label, direction))
             missing = [f"e{point['effort']} ({point['ready_count']}/{point['image_count']})"
                        for point in selected if point["status"] != "ready"]
             if missing:
@@ -2449,10 +2455,10 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
         original = label.get_position()
         best = None
         inside = label.axes.get_window_extent(renderer)
-        # Try both vertical directions; narrow panels can exhaust one side.
-        offsets = [original[1] + sign * direction * 9 * level
-                   for level in range(7) for sign in (1, -1)]
-        for vertical in dict.fromkeys(offsets):
+        # Try horizontal shifts first, then move farther out on the encoder's side.
+        # Every candidate, including the fallback, keeps the label on that side.
+        offsets = [original[1] + direction * 9 * level for level in range(7)]
+        for vertical in offsets:
             placed = False
             for horizontal in (0, -12, 12, -24, 24, -36, 36):
                 label.set_position((horizontal, vertical))
