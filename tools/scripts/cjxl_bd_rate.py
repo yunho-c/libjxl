@@ -297,6 +297,8 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
         "sources": [{
             "run": item["run"], "encoder": study.encoder_name(item["config"]),
             "configuration_id": item["config"]["configuration_id"],
+            "display_label": item["config"].get("display_label"),
+            "composite_sources": item["config"].get("composite_sources"),
             "metric_version": item["config"]["metric_version"],
             "repetitions": item["config"]["repetitions"],
             "warmups": item["config"]["warmups"],

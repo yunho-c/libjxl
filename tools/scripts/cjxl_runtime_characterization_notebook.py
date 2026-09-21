@@ -118,7 +118,7 @@ GJXL_RUN = pathlib.Path(
         "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-full-20260910",
     )
 ).expanduser()
-# Completed full fixed-Q study; set to None to skip its section.
+# Saved fixed-Q study; a composite selection labels its source revisions in the BD-rate legend.
 # Reading either GJXL study never starts collection.
 GJXL_FIXED_RUN = pathlib.Path(
     os.environ.get(
@@ -2315,6 +2315,9 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
     markers = {"libjxl": "o", "gjxl": "s"}
     linestyles = {"libjxl": "-", "gjxl": "--"}
     labels = {"libjxl": "libjxl", "gjxl": "GJXL (Metal)"}
+    for source in report["sources"]:
+        if source.get("display_label"):
+            labels[source["encoder"]] = source["display_label"]
     baseline = report["baseline"]
     annotations = []
     for axis, scope in zip(axes, scopes):
@@ -2880,6 +2883,9 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # timing repetitions. `BD_RATE_COMPARE_RUN = None` selects libjxl alone; its
 # default adds GJXL's fixed sweep. Change `BD_RATE_BASELINE`,
 # `BD_RATE_QUALITY_RANGE`, `BD_RATE_EFFORTS`, or `BD_RATE_IMAGE_IDS` above.
+# GJXL_FIXED_RUN selects the saved fixed study, including explicitly labeled
+# composites that use different source builds by effort. Its separate calibrated
+# run is not used for this plot.
 #
 # Each effort is compared with the baseline on the same raw measured SSIMU2
 # interval (default 75–85), integrating log(bytes) per image with PCHIP and
@@ -3005,10 +3011,10 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # ## 9. Measured libjxl versus GJXL
 #
 # GJXL_RUN selects a separate forced fully-resident Metal study. The comparison
-# now uses the full 65-image, efforts 1–10 GJXL run from 2026-09-10, alongside
-# the paused libjxl study. GJXL has 1,947/1,950 accepted and fully timed settings.
-# The three unresolved cases are CLIC image 28d24b9c83de066597ff96a68769884f,
-# target 60, efforts 4/5/6. Those aggregate CLIC points remain missing (31/32);
+# uses the configured saved 65-image study alongside the paused libjxl baseline.
+# A composite may combine separately measured builds by effort; consult its
+# metadata.json for the exact revision and source ledger for each effort.
+# Unresolved targets retain their original coverage limits;
 # neither encoder's incomplete points are filled in or silently re-cohorted.
 #
 # The comparison
@@ -3065,8 +3071,9 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
 #
 # Set GJXL_FIXED_RUN (or CJXL_GJXL_FIXED_RUN before starting Jupyter) to a
 # separately initialized --mode fixed run. These cells only read saved data.
-# The default is the complete 2026-09-10 sweep: 4,550 tuples, 22,750 timing
-# samples, and 4,550 quality scores across all 65 images and efforts 1–10.
+# A complete full sweep has 4,550 tuples, 22,750 timing samples, and 4,550
+# quality scores across all 65 images and efforts 1–10. Composite datasets
+# retain their source builds and collection sessions by effort in metadata.json.
 # Runtime figures accept timing-only CSVs: missing stages remain unknown and
 # stage plots are omitted. The quality Pareto is explicitly an interpolated
 # preview, not a matched-quality measurement. Q labels use libjxl's nominal

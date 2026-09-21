@@ -71,6 +71,8 @@ def seed_snapshot(args, images, metric_version, decoder_hash, benchmark_hash):
         return None
     source = args.seed_run.resolve()
     config = load_config(source, verify=True)
+    if config.get("analysis_only"):
+        raise StudyError("Composite datasets cannot seed encoder calibration")
     if not is_fixed(config) or encoder_name(config) != "gjxl":
         raise StudyError("--seed-run requires a GJXL fixed sweep")
     if (
@@ -296,6 +298,8 @@ def metric_name(config):
 
 
 def require_encoding_allowed(config):
+    if config.get("analysis_only"):
+        raise StudyError("Composite datasets are analysis-only; collect into a new source run")
     if config.get("preview_only") or metric_name(config) == "butteraugli":
         raise StudyError(
             "Butteraugli is preview-only: no calibration or timing encodes"
@@ -1937,6 +1941,8 @@ def main(argv=None):
         return 0
     collecting = args.command in ("score", "calibrate", "measure", "pilot", "run")
     config = load_config(args.run, verify=collecting and not args.dry_run)
+    if collecting and config.get("analysis_only"):
+        require_encoding_allowed(config)
     if args.command in ("calibrate", "measure", "pilot", "run"):
         require_encoding_allowed(config)
     if args.command == "pilot" and not config["pilot"]:
