@@ -173,6 +173,10 @@ THROUGHPUT_MIN_MEGAPIXELS = 1.0
 THROUGHPUT_QUALITIES = (30, 50, 70, 80, 90, 95)
 THROUGHPUT_EFFORTS = None  # None retains every configured libjxl effort, including gaps.
 THROUGHPUT_IMAGE_IDS = None  # None uses the manifest cohort above the resolution threshold.
+PAPER_BATCH_RUN = pathlib.Path(os.environ.get(
+    "CJXL_PAPER_BATCH_RUN",
+    "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/batch-gjxl-full-max24mp-20260916",
+)).expanduser()  # None skips the separate, coverage-checked B1/B4 table.
 
 
 # %% [markdown]
@@ -2719,6 +2723,77 @@ def generate_encoding_throughput_tables(libjxl_run, gjxl_run, output_dir, *,
 
 
 # %%
+def generate_paper_batch_tables(run, output_dir, *, show=False):
+    """Read validated B1/B4 pairs; never start collection or modify the run."""
+    import html
+    import importlib
+    import json
+
+    run = pathlib.Path(run).resolve()
+    if not (run / "metadata.json").exists():
+        print(f"No paper batch study at {run}; skipping B1/B4 table.")
+        return None
+    source = pathlib.Path(load_quality_helpers().__file__).resolve().parent
+    sys.path.insert(0, str(source))
+    try:
+        helper = importlib.import_module("cjxl_batch_characterization")
+    finally:
+        sys.path.pop(0)
+    config = helper.load_config(run)
+    records = helper.checked_records(run, config)
+    cells, points = helper.analyze(config, records)
+    rows = []
+    for effort in config["efforts"]:
+        row = {"effort": effort}
+        for codec in ("libjxl", "gjxl"):
+            if codec not in config.get("encoders", ("libjxl", "gjxl")):
+                continue
+            point = next(p for p in points if p["encoder"] == codec and p["effort"] == effort)
+            row.update({f"{codec}_{key}": point[key] for key in ("b1_mp_s", "b4_mp_s", "batch_gain")})
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    prefix = "encoding-batch-pilot" if config["pilot"] else "encoding-batch-throughput"
+    label = "Diagnostic pilot" if config["pilot"] else "Saved B1/B4 study"
+    encoders = config.get("encoders", ["gjxl", "libjxl"])
+    resource_caption = "GJXL shares 8 CPU participants plus Metal. " if "gjxl" in encoders else ""
+    if "libjxl" in encoders:
+        resource_caption += "libjxl uses 8 inner workers for B1 and 2 per image for B4, with separate outer caller threads. "
+    caption = (
+        f"{label} ({', '.join(encoders)}): {len(config['images'])} images, efforts {config['efforts']}, "
+        f"nominal Q{config['qualities']}, {config['repetitions']} independent rounds. "
+        f"{len(records)}/{len(helper.jobs(config))} validated pairs. "
+        "MP/s pools input pixels over per-image median call times within each quality, "
+        "then averages quality-specific rates. B4 repeats each image four times; "
+        "gain is B4 MP/s divided by paired B1 MP/s. Missing cells stay blank. "
+        + resource_caption + "Nominal distance and effort settings; measured quality is not matched. "
+        "These paired B1 controls use the batch harness and remain separate from "
+        "the original single-image paper table."
+    )
+    output = pathlib.Path(output_dir).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    table.to_csv(output / (prefix + ".csv"), index=False)
+    table.to_latex(output / (prefix + ".tex"), index=False, float_format="%.2f", na_rep="—", escape=True)
+    preview = "<h3>" + html.escape(label) + " · B1/B4 encoding throughput</h3><p>" + html.escape(caption) + "</p>"
+    preview += table.to_html(index=False, float_format=lambda x: f"{x:.2f}", na_rep="—", border=0)
+    (output / (prefix + ".html")).write_text(preview)
+    pd.DataFrame(cells).to_csv(output / (prefix + "-image-tuples.csv"), index=False)
+    pd.DataFrame(points).to_csv(output / (prefix + "-coverage.csv"), index=False)
+    provenance = {key: config[key] for key in
+                  ("configuration_id", "pilot", "images", "efforts", "qualities", "repetitions",
+                   "quality_to_distance", "protocol", "thread_policy", "build", "host")}
+    provenance.update(encoders=config.get("encoders", ["gjxl", "libjxl"]),
+                      max_megapixels=config.get("max_megapixels"),
+                      caption=caption, run=str(run), metadata_sha256=helper.sha(run / "metadata.json"),
+                      samples_sha256=helper.sha(run / "samples.jsonl") if records else None,
+                      completed_pairs=len(records), expected_pairs=len(helper.jobs(config)))
+    helper.write_json(output / (prefix + "-methodology.json"), provenance)
+    if show:
+        from IPython.display import HTML, display
+        display(HTML(preview))
+    return {"table": table, "coverage": pd.DataFrame(points), "tuples": pd.DataFrame(cells),
+            "methodology": provenance}
+
+
 def load_batch_benchmark(run):
     """Read saved summaries; never import the bundle's collection/analysis scripts."""
     import json
@@ -3339,6 +3414,8 @@ if __name__ == "__main__" and "ipykernel" in sys.modules and GJXL_FIXED_RUN is n
 #
 # The separate historical batch bundle below uses different inputs, revisions,
 # quality and CPU settings, so it is not used to fill additional columns here.
+# The new paired B1/B4 collection is displayed separately below, with its own
+# fixed-cohort coverage and explicit CPU settings.
 
 # %%
 if (__name__ == "__main__" and "ipykernel" in sys.modules
@@ -3351,6 +3428,44 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
     )
     encoding_throughput_table = encoding_throughput_tables["table"]
     encoding_throughput_coverage = encoding_throughput_tables["coverage"]
+
+
+# %% [markdown]
+# ### Paired B1/B4 collection: GJXL, excluding 48 MP
+#
+# `PAPER_BATCH_RUN` / `CJXL_PAPER_BATCH_RUN` selects the new saved batch study.
+# The default run collects **GJXL only** on 38 images from 1 through 24 MP:
+# Q30/50/70/80/90/95, efforts 1–10, and five independent rounds (11,400 pairs).
+# All three 48 MP images are excluded. The largest images run first; partial
+# efforts remain blank until the entire selected cohort and all rounds finish.
+# The completed `batch-paper-small-pilot-20260916` and bounded
+# `batch-paper-pilot-20260916` remain separately selectable for diagnostics.
+# Each fresh process
+# makes one validation encode, one warm B1/B4 pair, and one measured pair.
+# B1/B4 order and encoder order alternate between rounds. B4 contains four
+# copies of the same image; it measures aggregate throughput, not lower latency.
+# Every timed output must equal the single-image reference, whose hash must
+# equal that encoder's retained original fixed-study codestream.
+#
+# GJXL has a shared 8-participant CPU cap and fully-resident Metal. libjxl uses
+# 8 inner workers for B1 and 2 per image for B4; its outer caller threads are
+# separate. These are distinct resource policies, recorded in the caption.
+# The table requires every image/quality/repetition in the selected batch study.
+# Its B1 controls use the batch harness and remain separate from the original
+# single-image harness. The background job also exports the original B1 table
+# on these same 38 images under its `report/single-image-baseline` directory;
+# use that cohort when comparing with B4. The original 41-image table above is
+# unchanged. Retained environment snapshots document background desktop load.
+#
+# This cell validates saved raw hashes and computes rates without running any
+# encoders or modifying the study. It exports `encoding-batch-pilot.*` for a
+# pilot and `encoding-batch-throughput.*` otherwise, with coverage/provenance.
+# Set `PAPER_BATCH_RUN = None` to skip. Collection instructions and resource
+# guards are in `doc/batch-runtime-quality.md`.
+
+# %%
+if __name__ == "__main__" and "ipykernel" in sys.modules and PAPER_BATCH_RUN is not None:
+    paper_batch_tables = generate_paper_batch_tables(PAPER_BATCH_RUN, OUTPUT_DIR, show=True)
 
 
 # %% [markdown]

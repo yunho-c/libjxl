@@ -47,6 +47,11 @@ struct Options {
       std::max<size_t>(1, JxlThreadParallelRunnerDefaultNumWorkerThreads());
   int effort = 7;
   float distance = 1.2f;
+  size_t total_workers = 0;
+  bool single_image_control = false;
+  bool batch_first = false;
+  bool threads_explicit = false;
+  fs::path reference_output;
 };
 
 void Usage(const char* executable) {
@@ -55,6 +60,8 @@ void Usage(const char* executable) {
       << " --input FILE.pfm|DIRECTORY [--input ...]"
          " [--batch-sizes 1,2,4,8] [--samples N] [--warmups N]"
          " [--threads-per-image N] [--distance VALUE] [--effort 1..10]"
+         " [--total-workers N] [--single-image-control] [--batch-first]"
+         " [--reference-output NEW.jxl]"
          " [--raw-samples NEW.csv]\n"
          "RGB PFMs must contain finite linear sRGB pixels and have scale "
          "+/-1.\n"
@@ -88,6 +95,8 @@ Options ParseOptions(int argc, char** argv) {
       Usage(argv[0]);
       std::exit(EXIT_SUCCESS);
     }
+    if (arg == "--single-image-control") { options.single_image_control = true; continue; }
+    if (arg == "--batch-first") { options.batch_first = true; continue; }
     if (++i == argc) throw std::runtime_error("Missing value for " + arg);
     const std::string value = argv[i];
     if (arg == "--input") {
@@ -101,6 +110,11 @@ Options ParseOptions(int argc, char** argv) {
       options.warmups = PositiveInteger(value);
     } else if (arg == "--threads-per-image") {
       options.threads = PositiveInteger(value);
+      options.threads_explicit = true;
+    } else if (arg == "--total-workers") {
+      options.total_workers = PositiveInteger(value);
+    } else if (arg == "--reference-output") {
+      options.reference_output = value;
     } else if (arg == "--effort") {
       options.effort = static_cast<int>(PositiveInteger(value));
       if (options.effort > 10) throw std::runtime_error("Effort must be 1..10");
@@ -135,6 +149,13 @@ Options ParseOptions(int argc, char** argv) {
   }
   if (options.inputs.empty())
     throw std::runtime_error("At least one --input is required");
+  if (options.total_workers) {
+    if (options.threads_explicit) throw std::runtime_error("Choose total-workers or threads-per-image");
+    for (size_t count : options.batch_sizes)
+      if (count > options.total_workers || options.total_workers % count)
+        throw std::runtime_error("Batch sizes must divide total-workers");
+    options.threads = options.total_workers;
+  }
   return options;
 }
 
@@ -366,26 +387,29 @@ void Benchmark(const fs::path& path, const PackedPixelFile& image,
                const std::vector<uint8_t>& reference, size_t count,
                const Options& options, std::ostream* raw) {
   BatchEncoder serial(1, options);
-  BatchEncoder batch(count, options);
+  Options batch_options = options;
+  if (options.total_workers) batch_options.threads = options.total_workers / count;
+  BatchEncoder batch(count, batch_options);
+  const size_t control_count = options.single_image_control ? 1 : count;
   auto pair = [&](bool batch_first) {
     int64_t serial_ns, batch_ns;
     if (batch_first) {
       batch_ns = TimeBatch(batch, image, count, reference);
-      serial_ns = TimeBatch(serial, image, count, reference);
+      serial_ns = TimeBatch(serial, image, control_count, reference);
     } else {
-      serial_ns = TimeBatch(serial, image, count, reference);
+      serial_ns = TimeBatch(serial, image, control_count, reference);
       batch_ns = TimeBatch(batch, image, count, reference);
     }
     return std::make_pair(serial_ns, batch_ns);
   };
-  for (size_t i = 0; i < options.warmups; ++i) (void)pair(i % 2 != 0);
+  for (size_t i = 0; i < options.warmups; ++i) (void)pair((i % 2 != 0) != options.batch_first);
   std::vector<double> serial_ms, batch_ms, ratios;
   for (size_t i = 0; i < options.samples; ++i) {
-    const bool batch_first = i % 2 != 0;
+    const bool batch_first = (i % 2 != 0) != options.batch_first;
     const auto ns = pair(batch_first);
     serial_ms.push_back(static_cast<double>(ns.first) / 1e6);
     batch_ms.push_back(static_cast<double>(ns.second) / 1e6);
-    ratios.push_back(static_cast<double>(ns.first) / ns.second);
+    ratios.push_back(static_cast<double>(ns.first) / ns.second * count / control_count);
     if (raw) {
       *raw << "libjxl," << Csv(path.string()) << ',' << Csv(path.string())
            << ',' << image.info.xsize << ',' << image.info.ysize << ',' << count
@@ -393,10 +417,13 @@ void Benchmark(const fs::path& path, const PackedPixelFile& image,
            << ",cpu,cpu,n/a,"
            << std::setprecision(std::numeric_limits<float>::max_digits10)
            << options.distance << ',' << options.effort
-           << ",fixed_per_image:" << options.threads
+           << ",fixed_per_image:" << batch_options.threads
            << ",linear_rgb_to_in_memory_codestream," << ns.first << ','
-           << ns.second << ',' << reference.size() << '\n'
-           << std::flush;
+           << ns.second << ',' << reference.size();
+      if (options.single_image_control || options.total_workers)
+        *raw << ',' << control_count << ',' << options.total_workers << ','
+             << batch_options.threads << ",,,";
+      *raw << '\n' << std::flush;
       if (!*raw) throw std::runtime_error("Unable to write raw samples");
     }
   }
@@ -428,7 +455,11 @@ int main(int argc, char** argv) {
                                  options.raw_samples.string());
       raw << "codec,workload,source,width,height,batch_size,sample,order,"
              "requested_backend,backend,aq_mode,distance,effort,thread_policy,"
-             "timing_boundary,serial_ns,batch_ns,encoded_bytes_per_image\n";
+             "timing_boundary,serial_ns,batch_ns,encoded_bytes_per_image";
+      if (options.single_image_control || options.total_workers)
+        raw << ",serial_image_count,cpu_budget,cpu_threads_per_image,"
+               "domain_peak_cpu_participants,domain_peak_backing_bytes,domain_peak_committed_bytes";
+      raw << '\n';
     }
     std::cerr << "libjxl image batch benchmark: effort=" << options.effort
               << " distance=" << options.distance
@@ -443,6 +474,14 @@ int main(int argc, char** argv) {
     for (const auto& path : inputs) {
       const auto image = LoadImage(path);
       const auto reference = Reference(image, options);
+      if (!options.reference_output.empty()) {
+        if (inputs.size() != 1 || fs::exists(options.reference_output))
+          throw std::runtime_error("Reference output requires one input and a new path");
+        std::ofstream output(options.reference_output, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(reference.data()), reference.size());
+        output.close();
+        if (!output) throw std::runtime_error("Unable to write reference output");
+      }
       for (const size_t count : options.batch_sizes) {
         Benchmark(path, image, reference, count, options,
                   raw.is_open() ? &raw : nullptr);

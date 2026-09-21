@@ -116,6 +116,10 @@ batch results remain separate because their workload, revisions, and resource
 settings differ; they do not supply batch columns or multiplicative gains for
 this table.
 
+The new paired B1/B4 collector and separate notebook table are documented in
+[batch-runtime-quality.md](batch-runtime-quality.md). `PAPER_BATCH_RUN` selects
+the saved study; pilot coverage and resource policies remain explicit.
+
 The export can also run independently of all notebook plots:
 
 ```python
