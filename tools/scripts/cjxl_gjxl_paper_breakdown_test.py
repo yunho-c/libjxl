@@ -66,9 +66,12 @@ class PaperBreakdownTest(unittest.TestCase):
         args = parser.parse_args(required)
         self.assertEqual(tuple(args.panels), ("12mp",))
         self.assertFalse(args.show_panel_titles)
-        args = parser.parse_args(required + ["--panels", "kodak", "48mp", "--show-panel-titles"])
+        self.assertEqual(args.legend_position, "bottom")
+        args = parser.parse_args(required + ["--panels", "kodak", "48mp", "--show-panel-titles",
+                                            "--legend-position", "right"])
         self.assertEqual(args.panels, ["kodak", "48mp"])
         self.assertTrue(args.show_panel_titles)
+        self.assertEqual(args.legend_position, "right")
 
     def test_selection_aliases_order_and_errors(self):
         manifest = fixture(ALL_PANELS)["manifest"]

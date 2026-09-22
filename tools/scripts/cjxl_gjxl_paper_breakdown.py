@@ -142,7 +142,10 @@ def paper_data(report, panels=None):
     return samples, means, mapping
 
 
-def make_figure(means, manifest, panels=None, *, show_panel_titles=False):
+def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
+                legend_position="bottom"):
+    if legend_position not in ("bottom", "right"):
+        raise ValueError("legend_position must be 'bottom' or 'right'")
     panels = resolve_panels(manifest, panels)
     style = {
         "font.family": "serif", "font.serif": ["DejaVu Serif"], "font.size": 9,
@@ -154,15 +157,20 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False):
         "hatch.linewidth": .32, "figure.facecolor": "white", "savefig.facecolor": "white",
     }
     with plt.rc_context(style):
-        columns = min(2, len(panels))
+        # Keep the 7-inch publication width. With a side legend, stack panels
+        # vertically so the ten timing annotations in each panel stay legible.
+        side_legend = legend_position == "right"
+        columns = 1 if side_legend else min(2, len(panels))
         rows = (len(panels) + columns - 1) // columns
-        plot_height, bottom_margin = 2.03, 1.04
+        plot_height = 2.03
+        bottom_margin = .46 if side_legend else 1.04
         top_margin = .58 if show_panel_titles else .22
         row_gap = .88 if show_panel_titles else .5
         height = rows * plot_height + (rows - 1) * row_gap + top_margin + bottom_margin
         fig, axes = plt.subplots(rows, columns, figsize=(7.0, height),
                                  sharey=True, squeeze=False)
-        fig.subplots_adjust(left=.078, right=.993, top=1-top_margin/height,
+        fig.subplots_adjust(left=.078, right=.625 if side_legend else .993,
+                            top=1-top_margin/height,
                             bottom=bottom_margin/height, wspace=.10,
                             hspace=row_gap/plot_height)
         for index, (ax, res) in enumerate(zip(axes.flat, panels)):
@@ -196,7 +204,7 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False):
             ax.text(0, 1.0, "Mean profiled time (ms)", transform=ax.transAxes,
                     fontsize=7.2, color=".35")
             if index % columns == 0:
-                ax.set_ylabel("Profiled encode time (%)", labelpad=6)
+                ax.set_ylabel("Encode time (%)", labelpad=6)
             else:
                 ax.tick_params(axis="y", left=False)
                 ax.spines["left"].set_visible(False)
@@ -210,14 +218,22 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False):
                          fontsize=8.0, color=".35", va="top")
         for ax in list(axes.flat)[len(panels):]:
             fig.delaxes(ax)
-        # Legend order follows the bottom-to-top stack, left-to-right by row.
+        # Legend order follows the bottom-to-top stack: by row for the bottom
+        # legend, top-to-bottom for the single-column right legend.
         handles = [Patch(facecolor=color, edgecolor="#8A8D91" if k == "remaining" else "white",
                          linewidth=.35, hatch="///" if k == "remaining" else None, label=label)
                    for k, (label, color) in GROUPS.items()]
-        order = [0, 3, 6, 1, 4, 7, 2, 5, 8]
-        fig.legend(handles=[handles[i] for i in order], ncols=3, loc="lower center",
-                   bbox_to_anchor=(.52, .065/height), frameon=False, handlelength=1.65,
-                   handleheight=.85, columnspacing=1.55, handletextpad=.55, labelspacing=.7)
+        if side_legend:
+            grid_center = (bottom_margin + height - top_margin) / (2 * height)
+            fig.legend(handles=handles, ncols=1, loc="center left",
+                       bbox_to_anchor=(.65, grid_center), frameon=False,
+                       handlelength=1.65, handleheight=.85, handletextpad=.55,
+                       labelspacing=.9, borderaxespad=0)
+        else:
+            order = [0, 3, 6, 1, 4, 7, 2, 5, 8]
+            fig.legend(handles=[handles[i] for i in order], ncols=3, loc="lower center",
+                       bbox_to_anchor=(.52, .065/height), frameon=False, handlelength=1.65,
+                       handleheight=.85, columnspacing=1.55, handletextpad=.55, labelspacing=.7)
         return fig
 
 
@@ -241,7 +257,8 @@ def make_caption(manifest, panels=None):
     )
 
 
-def export(config_path, output_dir, panels=None, *, show_panel_titles=False):
+def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
+           legend_position="bottom"):
     report = paired.load_profiles(config_path)
     c = report["manifest"]
     panels = resolve_panels(c, panels)
@@ -250,7 +267,8 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False):
         raise ValueError("This paper caption/layout expects nominal Q80 and efforts 1-10")
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
-    figure = make_figure(means, c, panels, show_panel_titles=show_panel_titles)
+    figure = make_figure(means, c, panels, show_panel_titles=show_panel_titles,
+                         legend_position=legend_position)
     size_inches = figure.get_size_inches().tolist()
     stem = "gjxl-runtime-breakdown-paper"
     # The PDF/SVG backends read these settings when saving, after make_figure's
@@ -277,6 +295,7 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False):
         "encoder_revision": c["source_revision"], "nominal_quality": c["quality"],
         "distance": c["distance"], "panels": panels, "groups": GROUPS,
         "show_panel_titles": show_panel_titles,
+        "legend_position": legend_position,
         "selected_images": [i for i in c["images"] if i["resolution_class"] in panels],
         "boundary": paired.SEMANTICS["flat"], "aggregation": paired.SEMANTICS["aggregation"],
         "size_inches": size_inches, "dpi": 600, "scaling": "none",
@@ -303,6 +322,7 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False):
         "```sh\nuv run cjxl_gjxl_paper_breakdown.py \\\n"
         f"  --config {shlex.quote(str(Path(config_path).resolve()))} \\\n"
         f"  --panels {shlex.join(panels)} \\\n"
+        f"  --legend-position {legend_position} \\\n"
         + ("  --show-panel-titles \\\n" if show_panel_titles else "") +
         "  --output-dir .\n```\n\n"
         "This command only reads saved measurements; it never runs the encoder. "
@@ -314,7 +334,10 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False):
         "multiple panels in display order, e.g. `--panels kodak 48mp`. "
         "Available aliases include `kodak`, `clic`, `12mp`, `24mp`, and `48mp`; "
         "canonical resolution-class names from the capture config also work. "
-        "The layout uses at most two panels per row.\n\n"
+        "Use `--legend-position bottom` (the default) or `--legend-position right`. "
+        "With a bottom legend, the layout uses at most two panels per row. "
+        "With a right legend, panels stack vertically to preserve readable "
+        "timing labels within the 7-inch figure width.\n\n"
         "## Reading the figure\n\n"
         "Bars show raw profiled runtime shares, without ordinary-run scaling. "
         "Repetitions are averaged within each image, then images are weighted equally. "
@@ -347,6 +370,9 @@ def argument_parser():
                              "12mp, 24mp, 48mp, or resolution classes from the config.")
     parser.add_argument("--show-panel-titles", action="store_true",
                         help="Show subplot titles and subtitles (hidden by default).")
+    parser.add_argument("--legend-position", choices=("bottom", "right"), default="bottom",
+                        help="Stage legend placement (default: bottom). A right legend "
+                             "stacks multiple panels vertically at the same figure width.")
     return parser
 
 
@@ -354,4 +380,4 @@ if __name__ == "__main__":
     parser = argument_parser()
     args = parser.parse_args()
     print(export(args.config, args.output_dir, args.panels,
-                 show_panel_titles=args.show_panel_titles))
+                 show_panel_titles=args.show_panel_titles, legend_position=args.legend_position))

@@ -152,14 +152,20 @@ one full-width panel for a single selection and at most two panels per row
 for multiple selections. Hiding the headings also removes their reserved
 vertical space; the timing annotations and axis labels remain visible.
 
+Use `--legend-position right` for a single-column stage legend beside the
+plot, or `--legend-position bottom` for the default three-column legend
+underneath. The right-legend layout stacks multiple panels vertically to
+keep timing labels readable within the same 7-inch figure width.
+
 The Python entry points accept the same options, e.g.
-`export(config_path, output_dir, panels=["kodak", "48mp"], show_panel_titles=True)`.
+`export(config_path, output_dir, panels=["kodak", "48mp"], show_panel_titles=True,
+legend_position="right")`.
 Captions, selected-image metadata, CSVs and reproduction commands follow the
 chosen panels. An unknown, duplicate or unavailable class is an error;
 incomplete selected cohorts cannot silently produce a bar.
 
-The figure has nine stage groups, 100% stacked bars, and mean profiled
-milliseconds above each bar. Exact GPU stages are regrouped, including
+The figure has nine stage groups, 100% stacked bars labeled "Encode time (%)",
+and mean profiled milliseconds above each bar. Exact GPU stages are regrouped, including
 Gaborish in transform/reconstruction and indirect dispatch setup in AC
 search. Every sample must still sum to its original complete-call time.
 Input preparation can include GPU work; the hatched remaining elapsed time
