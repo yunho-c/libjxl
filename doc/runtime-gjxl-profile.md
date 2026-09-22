@@ -168,7 +168,7 @@ Captions, selected-image metadata, CSVs and reproduction commands follow the
 chosen panels. An unknown, duplicate or unavailable class is an error;
 incomplete selected cohorts cannot silently produce a bar.
 
-The figure has ten stage groups, 100% stacked bars labeled "Encode time (%)",
+The figure has ten stage groups, 100% stacked bars labeled "Encode time contribution (%)",
 and mean profiled milliseconds above each bar. Exact GPU stages are regrouped, including
 Gaborish in transform/reconstruction and indirect dispatch setup in AC
 search. Every sample must still sum to its original complete-call time.

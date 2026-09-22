@@ -214,10 +214,10 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
             ax.spines[["top", "right"]].set_visible(False)
             ax.spines["left"].set_bounds(0, 100)
             ax.grid(axis="y", color=".90", linewidth=.45, zorder=0)
-            ax.text(0, 1.0, "Mean profiled time (ms)", transform=ax.transAxes,
-                    fontsize=7.2, color=".35")
+            ax.text(.5, 1.0, "Encode time (ms)", transform=ax.transAxes,
+                    ha="center", fontsize=7.2, color=".35")
             if index % columns == 0:
-                ax.set_ylabel("Encode time (%)", labelpad=6)
+                ax.set_ylabel("Encode time contribution (%)", labelpad=6)
             else:
                 ax.tick_params(axis="y", left=False)
                 ax.spines["left"].set_visible(False)
