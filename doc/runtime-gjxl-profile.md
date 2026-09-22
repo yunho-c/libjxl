@@ -168,12 +168,25 @@ Captions, selected-image metadata, CSVs and reproduction commands follow the
 chosen panels. An unknown, duplicate or unavailable class is an error;
 incomplete selected cohorts cannot silently produce a bar.
 
-The figure has nine stage groups, 100% stacked bars labeled "Encode time (%)",
+The figure has ten stage groups, 100% stacked bars labeled "Encode time (%)",
 and mean profiled milliseconds above each bar. Exact GPU stages are regrouped, including
 Gaborish in transform/reconstruction and indirect dispatch setup in AC
 search. Every sample must still sum to its original complete-call time.
-Input preparation can include GPU work; the hatched remaining elapsed time
-includes orchestration, gaps and outer workflow work and is not CPU-only.
+Input preparation can include GPU work. **GPU pipeline orchestration**
+contains the quantization-pipeline wall time minus its nonoverlapping measured
+GPU stages. This includes evaluator and frame-output preparation, frame assembly,
+initial-quantization and resident AQ remainders, and pipeline work outside the
+inner wall scopes. It can contain host-side processing, synchronization, resource
+management and profiling. It is an elapsed-time accounting category, not measured
+GPU execution, CPU utilization, or isolated profiling overhead. For this capture
+revision, effort 10 CPU AC selection remains included; it is not separately plotted.
+The hatched **Remaining elapsed time** now contains only other workflow time and
+outer publication / teardown. These residuals are not final execution stages.
+
+For the 12 MP image at Q80, effort 7, the six-sample mean orchestration
+time is 18.834689 ms (7.269264% of the profiled encode), and remaining time is
+0.876271 ms (0.338198%). This regrouping uses the existing captures and preserves
+every complete-call total and measured GPU stage; no new measurement is needed.
 There is no ordinary-run scaling. The panels contain selected images, so
 their differences do not establish resolution scaling independently of content.
 

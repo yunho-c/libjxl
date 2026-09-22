@@ -36,7 +36,7 @@ class PaperBreakdownTest(unittest.TestCase):
 
     def test_absent_stage_is_zero_before_equal_image_average(self):
         samples, means, _ = paper.paper_data(fixture())
-        self.assertTrue(samples.groupby(paper.KEYS).size().eq(9).all())
+        self.assertTrue(samples.groupby(paper.KEYS).size().eq(len(paper.GROUPS)).all())
         for resolution in paper.DEFAULT_PANELS:
             part = means[means.resolution_class == resolution].set_index("group")
             self.assertAlmostEqual(part.loc["reconstruct", "ms"], 5)
@@ -48,6 +48,60 @@ class PaperBreakdownTest(unittest.TestCase):
         report["gpu_stages"].loc[0, "ms"] += 1
         with self.assertRaisesRegex(ValueError, "complete-call partition"):
             paper.paper_data(report)
+
+    def test_pipeline_residual_is_separate_from_outer_workflow(self):
+        report = fixture()
+        extra = []
+        for key in report["samples"][paper.KEYS].drop_duplicates().to_dict("records"):
+            for stage, ms in ((paper.paired.PIPELINE_REMAINDER, 12),
+                              ("Other workflow", 2), (paper.paired.OUTER, 1)):
+                extra.append(dict(key, kind="flat", stage=stage, ms=ms))
+        report["samples"] = pd.concat([report["samples"], pd.DataFrame(extra)])
+        samples, means, mapping = paper.paper_data(report)
+        self.assertTrue(samples.query("group == 'orchestration'").ms.eq(12).all())
+        self.assertTrue(samples.query("group == 'remaining'").ms.eq(3).all())
+        part = means.set_index("group")
+        self.assertAlmostEqual(part.loc["orchestration", "percent"], 30)
+        self.assertAlmostEqual(part.loc["remaining", "percent"], 7.5)
+        self.assertAlmostEqual(part.ms.sum(), 40)
+        self.assertEqual(mapping.set_index("stage").loc[
+            paper.paired.PIPELINE_REMAINDER, "group"], "orchestration")
+
+    def test_caption_distinguishes_support_time_from_gpu_execution(self):
+        caption = paper.make_caption(fixture()["manifest"])
+        self.assertIn("pipeline wall time minus measured GPU stages", caption)
+        self.assertIn("effort 10 CPU AC selection", caption)
+        self.assertIn("not measured GPU execution or isolated profiling overhead", caption)
+
+    def test_legend_and_stack_orders_match_with_ten_groups(self):
+        report = fixture()
+        _, means, _ = paper.paper_data(report)
+        # Give every group a distinct positive height to check actual placement.
+        means["ms"] = means["group"].map({k: i+1 for i, k in enumerate(paper.GROUPS)})
+        means["percent"] = 100 * means.ms / means.ms.sum()
+        expected = [label for label, _ in paper.GROUPS.values()]
+        for position in ("bottom", "right"):
+            with self.subTest(position=position):
+                fig = paper.make_figure(means, report["manifest"], legend_position=position)
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()
+                labels = fig.legends[0].get_texts()
+                # Sort rendered labels by row and then column, independent of
+                # Matplotlib's column-major storage and our input permutation.
+                ordered = sorted(labels, key=lambda t: (
+                    -round(t.get_window_extent(renderer).y0, 1),
+                    t.get_window_extent(renderer).x0))
+                self.assertEqual([t.get_text().replace("\n", " ") for t in ordered], expected)
+                bounds = fig.legends[0].get_window_extent(renderer)
+                self.assertGreaterEqual(bounds.x0, 0)
+                self.assertGreaterEqual(bounds.y0, 0)
+                self.assertLessEqual(bounds.x1, fig.bbox.x1)
+                self.assertLessEqual(bounds.y1, fig.bbox.y1)
+                bars = [c.patches[0] for c in fig.axes[0].containers]
+                bars.sort(key=lambda p: p.get_y(), reverse=True)
+                by_group = means.set_index("group")
+                for group, bar in zip(paper.GROUPS, bars):
+                    self.assertAlmostEqual(bar.get_height(), by_group.loc[group, "percent"])
 
     def test_incomplete_panel_is_rejected(self):
         report = fixture()

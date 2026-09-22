@@ -33,11 +33,20 @@ GROUPS = {
     "reconstruct": ("GPU: Transform / reconstruction", "#88CCEE"),
     "perceptual": ("GPU: Perceptual evaluation", "#117733"),
     "finalize": ("GPU: Quantization / finalization", "#44AA99"),
+    "orchestration": ("GPU pipeline orchestration", "#999999"),
     "tokens": ("CPU: Tokenization", "#CC6677"),
     "entropy": ("CPU: Entropy optimization", "#AA4499"),
     "serialize": ("CPU: Other serialization", "#882255"),
     "remaining": ("Remaining elapsed time", "#D5D7DA"),
 }
+ORCHESTRATION_DEFINITION = (
+    "Quantization-pipeline wall time minus nonoverlapping measured GPU stages. "
+    "Includes setup, host-side processing, synchronization, resource management, "
+    "and profiling. CPU AC selection at effort 10 remains included in this capture "
+    "revision. This is an elapsed-time accounting category, not measured GPU "
+    "execution, CPU utilization, or isolated profiling overhead."
+)
+REMAINING_DEFINITION = "Other workflow time plus outer publication / teardown."
 KEYS = ["resolution_class", "image_id", "setting", "effort", "sample_index"]
 
 
@@ -88,7 +97,9 @@ def host_group(stage):
         return "entropy"
     if stage in ("Validation", "Section writing", "Assembly", "Other serializer"):
         return "serialize"
-    if stage in (paired.PIPELINE_REMAINDER, "Other workflow", paired.OUTER):
+    if stage == paired.PIPELINE_REMAINDER:
+        return "orchestration"
+    if stage in ("Other workflow", paired.OUTER):
         return "remaining"
     raise ValueError("Unmapped host stage: " + stage)
 
@@ -163,7 +174,7 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
         columns = 1 if side_legend else min(2, len(panels))
         rows = (len(panels) + columns - 1) // columns
         plot_height = 2.03
-        bottom_margin = .46 if side_legend else 1.04
+        bottom_margin = .46 if side_legend else 1.26
         top_margin = .58 if show_panel_titles else .22
         row_gap = .88 if show_panel_titles else .5
         height = rows * plot_height + (rows - 1) * row_gap + top_margin + bottom_margin
@@ -232,7 +243,7 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
                        handlelength=1.65, handleheight=.85, handletextpad=.55,
                        labelspacing=.9, borderaxespad=0)
         else:
-            order = [0, 3, 6, 1, 4, 7, 2, 5, 8]
+            order = [i for column in range(3) for i in range(column, len(handles), 3)]
             fig.legend(handles=[handles[i] for i in order], ncols=3, loc="lower center",
                        bbox_to_anchor=(.52, .065/height), frameon=False, handlelength=1.65,
                        handleheight=.85, columnspacing=1.55, handletextpad=.55, labelspacing=.7)
@@ -250,9 +261,12 @@ def make_caption(manifest, panels=None):
         f"{c['samples']} repetitions are averaged per image, then images receive equal "
         "weight. GPU intervals and host phases come from the same encode, with "
         "nonoverlapping attribution and explicit elapsed-time residuals. Perceptual "
-        "evaluation includes Butteraugli reference features and comparisons. Hatched "
-        "remaining time includes pipeline orchestration, gaps and outer workflow work; "
-        "it is not attributed wholly to CPU or GPU execution. Measurements use Apple "
+        "evaluation includes Butteraugli reference features and comparisons. GPU pipeline "
+        "orchestration is pipeline wall time minus measured GPU stages, including "
+        "setup, host-side processing, synchronization, resource management and profiling; "
+        "it also includes effort 10 CPU AC selection in this revision. It is not measured "
+        "GPU execution or isolated profiling overhead. Hatched remaining time contains "
+        "other workflow time and outer publication / teardown. Measurements use Apple "
         f"M4 Pro (20 GPU cores), {c['cpu_threads']} CPU participants and GJXL revision "
         f"{c['source_revision'][:7]}. Profiling perturbs execution; no scaling to "
         "ordinary-run timings is applied. Input loading and backend creation are excluded."
@@ -303,6 +317,8 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
         "boundary": paired.SEMANTICS["flat"], "aggregation": paired.SEMANTICS["aggregation"],
         "size_inches": size_inches, "dpi": 600, "scaling": "none",
         "grouping": "Exact GPU stages remapped; sample complete-call totals unchanged.",
+        "group_definitions": {"orchestration": ORCHESTRATION_DEFINITION,
+                              "remaining": REMAINING_DEFINITION},
         "sample_partitions_checked": samples[KEYS].drop_duplicates().shape[0],
         "bar_count": means[["resolution_class", "effort"]].drop_duplicates().shape[0],
         "data_scope": "Selected images; content and resolution vary together; not matched quality.",
@@ -357,8 +373,16 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
         "evaluation includes reference features and Butteraugli comparisons. Exact "
         "GPU stage IDs and host phases are listed in `*-stage-map.csv`. Input "
         "preparation is a host wall-time interval that can include GPU work. "
-        "The hatched residual is remaining elapsed time, including orchestration, "
-        "gaps and outer workflow work; it is not a CPU-only category.\n\n"
+        "GPU pipeline orchestration is the quantization-pipeline wall time "
+        "minus its nonoverlapping measured GPU stages. It includes evaluator and "
+        "frame-output preparation, frame assembly, initial-quantization and resident "
+        "AQ remainders, and pipeline work outside the inner wall scopes. This "
+        "elapsed-time accounting category can include setup, host-side processing, "
+        "synchronization, resource management and profiling; it is not measured GPU "
+        "execution, CPU utilization, or isolated profiling overhead. Effort 10 CPU "
+        "AC selection remains included for this capture revision. The hatched "
+        "remaining elapsed time contains only other workflow time and outer "
+        "publication / teardown. Neither residual is a final execution stage.\n\n"
         "These are selected images, not a whole-corpus mean or a controlled "
         "resolution-scaling experiment. Profiling can change stage times, and the "
         "collection was not a device-isolated idle experiment. Use the ordinary-run "
