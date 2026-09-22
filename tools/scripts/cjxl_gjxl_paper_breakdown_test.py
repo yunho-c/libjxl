@@ -79,10 +79,13 @@ class PaperBreakdownTest(unittest.TestCase):
         # Give every group a distinct positive height to check actual placement.
         means["ms"] = means["group"].map({k: i+1 for i, k in enumerate(paper.GROUPS)})
         means["percent"] = 100 * means.ms / means.ms.sum()
-        expected = [label for label, _ in paper.GROUPS.values()]
-        for position in ("bottom", "right"):
-            with self.subTest(position=position):
-                fig = paper.make_figure(means, report["manifest"], legend_position=position)
+        for position, show_remaining in (("bottom", False), ("bottom", True),
+                                         ("right", False), ("right", True)):
+            with self.subTest(position=position, show_remaining=show_remaining):
+                expected = [label for group, (label, _) in paper.GROUPS.items()
+                            if group != "remaining" or show_remaining]
+                fig = paper.make_figure(means, report["manifest"], legend_position=position,
+                                        show_remaining_legend=show_remaining)
                 fig.canvas.draw()
                 renderer = fig.canvas.get_renderer()
                 labels = fig.legends[0].get_texts()
@@ -120,11 +123,13 @@ class PaperBreakdownTest(unittest.TestCase):
         args = parser.parse_args(required)
         self.assertEqual(tuple(args.panels), ("12mp",))
         self.assertFalse(args.show_panel_titles)
+        self.assertFalse(args.show_remaining_legend)
         self.assertEqual(args.legend_position, "bottom")
         args = parser.parse_args(required + ["--panels", "kodak", "48mp", "--show-panel-titles",
-                                            "--legend-position", "right"])
+                                            "--legend-position", "right", "--show-remaining-legend"])
         self.assertEqual(args.panels, ["kodak", "48mp"])
         self.assertTrue(args.show_panel_titles)
+        self.assertTrue(args.show_remaining_legend)
         self.assertEqual(args.legend_position, "right")
 
     def test_selection_aliases_order_and_errors(self):
@@ -155,6 +160,8 @@ class PaperBreakdownTest(unittest.TestCase):
         fig = paper.make_figure(means, report["manifest"])
         self.assertEqual([ax.get_label() for ax in fig.axes], ["12mp"])
         self.assertEqual(fig.texts, [])
+        self.assertNotIn("Remaining elapsed time",
+                         [text.get_text() for text in fig.legends[0].get_texts()])
         titled = paper.make_figure(means, report["manifest"], show_panel_titles=True)
         self.assertEqual(titled.texts[0].get_text(), "(a)  Unsplash, 12 MP")
         self.assertIn("2 images", titled.texts[1].get_text())

@@ -33,7 +33,7 @@ GROUPS = {
     "reconstruct": ("GPU: Transform / reconstruction", "#88CCEE"),
     "perceptual": ("GPU: Perceptual evaluation", "#117733"),
     "finalize": ("GPU: Quantization / finalization", "#44AA99"),
-    "orchestration": ("GPU pipeline orchestration", "#999999"),
+    "orchestration": ("GPU: Pipeline orchestration", "#999999"),
     "tokens": ("CPU: Tokenization", "#CC6677"),
     "entropy": ("CPU: Entropy optimization", "#AA4499"),
     "serialize": ("CPU: Other serialization", "#882255"),
@@ -154,7 +154,7 @@ def paper_data(report, panels=None):
 
 
 def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
-                legend_position="bottom"):
+                legend_position="bottom", show_remaining_legend=False):
     if legend_position not in ("bottom", "right"):
         raise ValueError("legend_position must be 'bottom' or 'right'")
     panels = resolve_panels(manifest, panels)
@@ -174,7 +174,7 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
         columns = 1 if side_legend else min(2, len(panels))
         rows = (len(panels) + columns - 1) // columns
         plot_height = 2.03
-        bottom_margin = .46 if side_legend else 1.26
+        bottom_margin = .46 if side_legend else (1.26 if show_remaining_legend else 1.04)
         top_margin = .58 if show_panel_titles else .22
         row_gap = .88 if show_panel_titles else .5
         height = rows * plot_height + (rows - 1) * row_gap + top_margin + bottom_margin
@@ -215,7 +215,8 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
             ax.spines["left"].set_bounds(0, 100)
             ax.grid(axis="y", color=".90", linewidth=.45, zorder=0)
             ax.text(.5, 1.0, "Encode time (ms)", transform=ax.transAxes,
-                    ha="center", fontsize=7.2, color=".35")
+                    ha="center", fontproperties=ax.xaxis.label.get_fontproperties(),
+                    color=ax.xaxis.label.get_color())
             if index % columns == 0:
                 ax.set_ylabel("Encode time contribution (%)", labelpad=6)
             else:
@@ -235,7 +236,8 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
         # legend, top-to-bottom for the single-column right legend.
         handles = [Patch(facecolor=color, edgecolor="#8A8D91" if k == "remaining" else "white",
                          linewidth=.35, hatch="///" if k == "remaining" else None, label=label)
-                   for k, (label, color) in GROUPS.items()]
+                   for k, (label, color) in GROUPS.items()
+                   if k != "remaining" or show_remaining_legend]
         if side_legend:
             grid_center = (bottom_margin + height - top_margin) / (2 * height)
             fig.legend(handles=handles, ncols=1, loc="center left",
@@ -261,8 +263,8 @@ def make_caption(manifest, panels=None):
         f"{c['samples']} repetitions are averaged per image, then images receive equal "
         "weight. GPU intervals and host phases come from the same encode, with "
         "nonoverlapping attribution and explicit elapsed-time residuals. Perceptual "
-        "evaluation includes Butteraugli reference features and comparisons. GPU pipeline "
-        "orchestration is pipeline wall time minus measured GPU stages, including "
+        "evaluation includes Butteraugli reference features and comparisons. The "
+        "GPU: Pipeline orchestration segment is pipeline wall time minus measured GPU stages, including "
         "setup, host-side processing, synchronization, resource management and profiling; "
         "it also includes effort 10 CPU AC selection in this revision. It is not measured "
         "GPU execution or isolated profiling overhead. Hatched remaining time contains "
@@ -274,7 +276,7 @@ def make_caption(manifest, panels=None):
 
 
 def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
-           legend_position="bottom"):
+           legend_position="bottom", show_remaining_legend=False):
     report = paired.load_profiles(config_path)
     c = report["manifest"]
     panels = resolve_panels(c, panels)
@@ -284,7 +286,8 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     figure = make_figure(means, c, panels, show_panel_titles=show_panel_titles,
-                         legend_position=legend_position)
+                         legend_position=legend_position,
+                         show_remaining_legend=show_remaining_legend)
     size_inches = figure.get_size_inches().tolist()
     stem = "gjxl-runtime-breakdown-paper"
     # The PDF/SVG backends read these settings when saving, after make_figure's
@@ -312,6 +315,7 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
         "distance": c["distance"], "panels": panels, "groups": GROUPS,
         "show_panel_titles": show_panel_titles,
         "legend_position": legend_position,
+        "show_remaining_legend": show_remaining_legend,
         "stack_order_top_to_bottom": list(GROUPS),
         "selected_images": [i for i in c["images"] if i["resolution_class"] in panels],
         "boundary": paired.SEMANTICS["flat"], "aggregation": paired.SEMANTICS["aggregation"],
@@ -342,7 +346,8 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
         f"  --config {shlex.quote(str(Path(config_path).resolve()))} \\\n"
         f"  --panels {shlex.join(panels)} \\\n"
         f"  --legend-position {legend_position} \\\n"
-        + ("  --show-panel-titles \\\n" if show_panel_titles else "") +
+        + ("  --show-panel-titles \\\n" if show_panel_titles else "")
+        + ("  --show-remaining-legend \\\n" if show_remaining_legend else "") +
         "  --output-dir .\n```\n\n"
         "This command only reads saved measurements; it never runs the encoder. "
         "The loader verifies the input and capture hashes, settings, complete cohort "
@@ -354,6 +359,9 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
         "Available aliases include `kodak`, `clic`, `12mp`, `24mp`, and `48mp`; "
         "canonical resolution-class names from the capture config also work. "
         "Use `--legend-position bottom` (the default) or `--legend-position right`. "
+        "Remaining elapsed time is hidden from the legend by default; add "
+        "`--show-remaining-legend` to include its legend entry. Its hatched bar "
+        "segment, percentages, totals and exported data are always retained. "
         "With a bottom legend, the layout uses at most two panels per row. "
         "With a right legend, panels stack vertically to preserve readable "
         "timing labels within the 7-inch figure width.\n\n"
@@ -373,7 +381,7 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
         "evaluation includes reference features and Butteraugli comparisons. Exact "
         "GPU stage IDs and host phases are listed in `*-stage-map.csv`. Input "
         "preparation is a host wall-time interval that can include GPU work. "
-        "GPU pipeline orchestration is the quantization-pipeline wall time "
+        "GPU: Pipeline orchestration is the quantization-pipeline wall time "
         "minus its nonoverlapping measured GPU stages. It includes evaluator and "
         "frame-output preparation, frame assembly, initial-quantization and resident "
         "AQ remainders, and pipeline work outside the inner wall scopes. This "
@@ -404,6 +412,9 @@ def argument_parser():
     parser.add_argument("--legend-position", choices=("bottom", "right"), default="bottom",
                         help="Stage legend placement (default: bottom). A right legend "
                              "stacks multiple panels vertically at the same figure width.")
+    parser.add_argument("--show-remaining-legend", action="store_true",
+                        help="Show Remaining elapsed time in the legend (hidden by default). "
+                             "The plotted segment and data are always retained.")
     return parser
 
 
@@ -411,4 +422,5 @@ if __name__ == "__main__":
     parser = argument_parser()
     args = parser.parse_args()
     print(export(args.config, args.output_dir, args.panels,
-                 show_panel_titles=args.show_panel_titles, legend_position=args.legend_position))
+                 show_panel_titles=args.show_panel_titles, legend_position=args.legend_position,
+                 show_remaining_legend=args.show_remaining_legend))

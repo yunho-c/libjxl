@@ -160,10 +160,14 @@ Within each bar, stages run from input preparation at the top to remaining
 elapsed time at the bottom. This matches the existing legend order, read
 top-to-bottom on the right or left-to-right across rows at the bottom.
 Remaining time is an accounting residual, not a final execution stage.
+Its legend entry is hidden by default; use `--show-remaining-legend` to display it.
+This option changes only the legend: the hatched segment, percentages, total
+times and exported data always include remaining elapsed time. With the entry
+hidden, the bottom legend uses three rows instead of four.
 
 The Python entry points accept the same options, e.g.
 `export(config_path, output_dir, panels=["kodak", "48mp"], show_panel_titles=True,
-legend_position="right")`.
+legend_position="right", show_remaining_legend=True)`.
 Captions, selected-image metadata, CSVs and reproduction commands follow the
 chosen panels. An unknown, duplicate or unavailable class is an error;
 incomplete selected cohorts cannot silently produce a bar.
@@ -172,7 +176,7 @@ The figure has ten stage groups, 100% stacked bars labeled "Encode time contribu
 and mean profiled milliseconds above each bar. Exact GPU stages are regrouped, including
 Gaborish in transform/reconstruction and indirect dispatch setup in AC
 search. Every sample must still sum to its original complete-call time.
-Input preparation can include GPU work. **GPU pipeline orchestration**
+Input preparation can include GPU work. **GPU: Pipeline orchestration**
 contains the quantization-pipeline wall time minus its nonoverlapping measured
 GPU stages. This includes evaluator and frame-output preparation, frame assembly,
 initial-quantization and resident AQ remainders, and pipeline work outside the
