@@ -182,7 +182,9 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
             if not np.allclose(values.sum(axis=1), 100, atol=1e-9):
                 raise ValueError("A paper bar does not sum to 100 percent")
             bottom = np.zeros(len(efforts))
-            for group, (_, color) in GROUPS.items():
+            # Build upward in reverse so the visible top-to-bottom stack
+            # follows the legend's roughly chronological stage order.
+            for group, (_, color) in reversed(GROUPS.items()):
                 y = values[group].to_numpy()
                 ax.bar(efforts, y, bottom=bottom, width=.78, color=color,
                        edgecolor="white", linewidth=.28, zorder=3)
@@ -218,7 +220,7 @@ def make_figure(means, manifest, panels=None, *, show_panel_titles=False,
                          fontsize=8.0, color=".35", va="top")
         for ax in list(axes.flat)[len(panels):]:
             fig.delaxes(ax)
-        # Legend order follows the bottom-to-top stack: by row for the bottom
+        # Legend order follows the top-to-bottom stack: by row for the bottom
         # legend, top-to-bottom for the single-column right legend.
         handles = [Patch(facecolor=color, edgecolor="#8A8D91" if k == "remaining" else "white",
                          linewidth=.35, hatch="///" if k == "remaining" else None, label=label)
@@ -296,6 +298,7 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
         "distance": c["distance"], "panels": panels, "groups": GROUPS,
         "show_panel_titles": show_panel_titles,
         "legend_position": legend_position,
+        "stack_order_top_to_bottom": list(GROUPS),
         "selected_images": [i for i in c["images"] if i["resolution_class"] in panels],
         "boundary": paired.SEMANTICS["flat"], "aggregation": paired.SEMANTICS["aggregation"],
         "size_inches": size_inches, "dpi": 600, "scaling": "none",
@@ -339,6 +342,10 @@ def export(config_path, output_dir, panels=None, *, show_panel_titles=False,
         "With a right legend, panels stack vertically to preserve readable "
         "timing labels within the 7-inch figure width.\n\n"
         "## Reading the figure\n\n"
+        "Stages read from input preparation at the top of each bar to remaining "
+        "elapsed time at the bottom, matching the legend order. The bottom legend "
+        "reads left-to-right across rows; the right legend reads top-to-bottom. "
+        "Remaining time is an accounting residual, not a final execution stage.\n\n"
         "Bars show raw profiled runtime shares, without ordinary-run scaling. "
         "Repetitions are averaged within each image, then images are weighted equally. "
         "Percentages are ratios of those mean stage times to mean total time, "

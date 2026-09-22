@@ -156,6 +156,10 @@ Use `--legend-position right` for a single-column stage legend beside the
 plot, or `--legend-position bottom` for the default three-column legend
 underneath. The right-legend layout stacks multiple panels vertically to
 keep timing labels readable within the same 7-inch figure width.
+Within each bar, stages run from input preparation at the top to remaining
+elapsed time at the bottom. This matches the existing legend order, read
+top-to-bottom on the right or left-to-right across rows at the bottom.
+Remaining time is an accounting residual, not a final execution stage.
 
 The Python entry points accept the same options, e.g.
 `export(config_path, output_dir, panels=["kodak", "48mp"], show_panel_titles=True,
