@@ -6,12 +6,28 @@ Use the specification below. Inspect existing artifacts first, then build and va
 
 The standard BD-rate plot integrates curves from the fixed sweep's measured decoded scores. It does not require every encoder setting to hit an identical target score. The calibrated run separately searches for per-image settings near SSIMU2 targets and supports the matched-quality plots and a sparse-curve BD-rate diagnostic. Keep these observation sources explicit in both collection and analysis.
 
-Published starting points, verified against the remotes on September 24, 2026:
+Pin these sources and artifacts separately. These immutable starting revisions were verified on September 24, 2026; branch names locate the work, but their tips can move.
 
-- `https://github.com/yunho-c/libjxl.git`, branch `perf/quality-effort-sweep`, remote tip `6238450b9995f786faf38bb4ddae02a6cca5f3f3`. It includes the sweep/BD-rate helpers and the newer CUDA infrastructure (`a7c59acc`) and analysis (`6238450b`). Read `doc/runtime-cuda-quality.md` before adapting any collector: Windows locking and process handling already exist there. Its CUDA pipeline runs both fixed and calibrated phases, so do not invoke it as a libjxl-only sweep launcher.
-- `https://github.com/yunho-c/gjxl.git`, branch `perf/libjxl-comparison`, remote tip `950357c304b794ce92ce2b7c2e2148cebd774cbd`. This contains the CPU harness, build helper, and pinned `third_party/libjxl` submodule. Initialize submodules recursively. The Mac-only additional commit `c235e30` concerns wall-v3 instrumentation and is not required for the ordinary CPU baseline.
+| Role | Repository or artifact | Pinned Git revision |
+| --- | --- | --- |
+| Collection and analysis sources | `https://github.com/yunho-c/libjxl.git`, branch `perf/quality-effort-sweep` | `e5de19ce9d619cc7b16bea8758d71ad0c5119343` |
+| Calibration seed artifact | `doc/data/libjxl-calibrated-distances-e8ff0976.json` in the same repository | `c0f166ce745557410d5b506d4b838e498b713d73` |
+| CPU harness and build helper | `https://github.com/yunho-c/gjxl.git`, branch `perf/libjxl-comparison` | `950357c304b794ce92ce2b7c2e2148cebd774cbd` |
+| Measured libjxl encoder | Harness checkout's `third_party/libjxl` submodule | `e8ff09762481785938d8e4e01333ed3917571161` |
 
-Use fresh checkouts at explicitly recorded revisions. The Mac libjxl working branch has independent unpublished plot changes and should not be used as an implicit source of the remote branch state. Corpus PFMs and frozen run artifacts need a separate verified transfer; cloning these repositories does not supply them.
+The tooling revision `e5de19ce` contains the seed artifact byte-for-byte as introduced in `c0f166ce`. The previously advertised tooling revision `6238450b9995f786faf38bb4ddae02a6cca5f3f3` lacks that file and is insufficient for this handoff. The tooling revision is independent of the encoder revision: build the CPU baseline from the pinned harness submodule, rather than the tooling checkout's encoder sources.
+
+The seed table's SHA-256, over the exact file bytes, is `3934f2a1fe539f71d0f1adbedebfe2f5849fa45dd7e0ebf9288c2844b9d6a0f2`. From the tooling checkout, verify it before collection with this Python 3 command (PowerShell or a POSIX shell; replace `python` with `python3` or `py -3` as appropriate):
+
+```sh
+python -c "import hashlib,pathlib,sys; actual=hashlib.sha256(pathlib.Path('doc/data/libjxl-calibrated-distances-e8ff0976.json').read_bytes()).hexdigest(); print(actual); sys.exit(actual != '3934f2a1fe539f71d0f1adbedebfe2f5849fa45dd7e0ebf9288c2844b9d6a0f2')"
+```
+
+A missing file or a hash mismatch exits nonzero; stop and resolve it before using any seeds. Preserve the original artifact without reformatting it, including line endings; use `core.autocrlf=false` when creating the tooling checkout on Windows to avoid rewriting its bytes. Record the artifact's Git revision and SHA-256 in the local study metadata.
+
+Read `doc/runtime-cuda-quality.md` in the pinned tooling checkout before adapting any collector: Windows locking and process handling already exist there. Its CUDA pipeline runs both fixed and calibrated phases, so do not invoke it as a libjxl-only sweep launcher. Initialize the harness checkout's submodules recursively. The Mac-only additional harness commit `c235e30` concerns wall-v3 instrumentation and is not required for the ordinary CPU baseline.
+
+Use fresh checkouts at the pinned revisions. Record the actual collection, adapter, harness, and analysis revisions and any dirty diffs used for the new study, alongside the encoder revision and seed artifact identity; retain any required portability changes as separate commits. Corpus PFMs and frozen run artifacts need a separate verified transfer; cloning these repositories does not supply them.
 
 1. Freeze the encoder and build provenance.
 
