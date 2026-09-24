@@ -122,9 +122,13 @@ Use fresh checkouts at the pinned revisions. Record the actual collection, adapt
 
    This is one Q80/e7 repetition, not the sweep. Use unique raw-record paths and append repetition IDs 0–4. Freeze any portability changes and validate that resume skips completed samples without mixing machines/builds. Keep actual ledger schema versions; `wall_profile_version=2/3` describes separate instrumentation, not a requirement to relabel ordinary timing records. Stage profiling is unnecessary for this plot.
 
+   Require a newly written output from every measured process, hash it, and compare it against the setting's retained codestream before appending that repetition. Retain each original harness JSON and its hash. Never copy repetition 0's hash into later records without verifying their outputs; equal byte counts do not prove equality. The revised runtime collector implements this evidence protocol and supports timing-only invocation without stage/Samply tools. See [CPU timing evidence and warmup qualification](runtime-cpu-safety.md).
+
 9. Validate, run resumably, and deliver the evidence.
 
    First dry-run the complete schedule and perform a short pilot containing Kodak, CLIC, and a large PFM, including a high-effort case. Check that outputs decode, hashes/geometry/configuration join correctly, quality scoring works, all five repetitions are retained, and interruption/resume and duplicate rejection work. Exercise seed acceptance, seed rejection, unresolved-seed handling, and the total probe cap without requiring a full search at every setting. Keep pilot data in its own run unless its final frozen configuration is identical to the full study.
+
+   Before full CPU timing, run the separate counterbalanced warmup-sensitivity diagnostic (normally one versus three explicit warmups). Freeze its response policy in the benchmark configuration: flag and continue by default, bounded retry, or error. Keep every diagnostic attempt and warning outside the sweep; retries must not discard earlier flags or reset on resume. Record the threshold, retry bound and decision with the results.
 
    After the pilot passes, launch the fixed sweep followed by the calibrated run with a durable local scheduler, overlap protection, free-space checks, per-job timeout, live progress, retained logs, and a documented graceful pause/resume command. Estimate duration from the target-machine pilot, including untimed work; do not reuse the Mac ETA. Report missing settings and failures explicitly.
 

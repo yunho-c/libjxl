@@ -137,9 +137,10 @@ _cuda_workspace = (pathlib.Path(__file__).resolve().parents[3] if "__file__" in 
 
 
 def discover_cuda_study(workspace):
-    """Find the newest initialized sibling study without depending on its date."""
+    """Find the newest initialized, nonarchived sibling study."""
     candidates = [path for path in workspace.glob("gjxl-cuda*-study-*")
-                  if (path / "fixed/metadata.json").is_file()]
+                  if (path / "fixed/metadata.json").is_file()
+                  and not (path / "ARCHIVED.md").is_file()]
     return max(candidates, key=lambda path: (path / "fixed/metadata.json").stat().st_mtime,
                default=workspace / "gjxl-cuda-study")
 
