@@ -11,15 +11,16 @@ No work is started by importing this module.
 
 import argparse
 import collections
+import contextlib
 import csv
 import datetime
-import fcntl
 import hashlib
 import importlib.util
 import json
 import math
 import os
 from pathlib import Path
+import queue
 import random
 import re
 import select
@@ -29,7 +30,13 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 SCHEMA = 1
 COLOR = "RGB_D65_SRG_Rel_Lin"
@@ -116,6 +123,9 @@ def seed_snapshot(args, images, metric_version, decoder_hash, benchmark_hash):
 
 def initialize_gjxl(args, images):
     """New GJXL study: independent probes, shared pinned decoder and metric."""
+    if args.backend == "cuda":
+        from cjxl_cuda_characterization import initialize_cuda
+        return initialize_cuda(args, images, sys.modules[__name__])
     metadata_path = args.source_run / "metadata.json"
     source_metadata = json.loads(metadata_path.read_text())
     ordinary = source_metadata["configuration"]["build_records"]["ordinary"]["content"]
@@ -328,8 +338,16 @@ class StudyError(Exception):
     pass
 
 
+class CudaOutOfMemory(StudyError):
+    pass
+
+
 class BudgetExpired(Exception):
     pass
+
+
+class PauseRequested(Exception):
+    """A cooperative stop at a collector boundary, outside encoder timing."""
 
 
 def utc():
@@ -400,12 +418,15 @@ def verify_file(path, expected):
 
 
 class Budget:
-    def __init__(self, seconds=None, jobs=None):
+    def __init__(self, seconds=None, jobs=None, pause_file=None):
         self.deadline = time.monotonic() + seconds if seconds is not None else math.inf
         self.jobs = jobs
         self.completed = 0
+        self.pause_file = Path(pause_file) if pause_file is not None else None
 
     def check(self):
+        if self.pause_file is not None and self.pause_file.exists():
+            raise PauseRequested()
         if time.monotonic() >= self.deadline or (
             self.jobs is not None and self.completed >= self.jobs
         ):
@@ -416,8 +437,44 @@ class Budget:
         return min(maximum, self.deadline - time.monotonic())
 
 
+def process_group_options():
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
+def acquire_run_lock(lock):
+    if os.name == "nt":
+        lock.seek(0, os.SEEK_END)
+        if lock.tell() == 0:
+            lock.write("0")
+            lock.flush()
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def process_commands():
+    if os.name == "nt":
+        return subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^python(w|[0-9.]*)?\\.exe$' } | Select-Object -ExpandProperty CommandLine"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    return subprocess.check_output(["ps", "-axo", "command"], text=True)
+
+
 def stop_process(process):
     if process.poll() is None:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            process.wait(timeout=10)
+            return
         os.killpg(process.pid, signal.SIGTERM)
         try:
             process.wait(timeout=3)
@@ -436,7 +493,7 @@ def execute(command, run, budget, timeout):
             stdout=subprocess.PIPE,
             stderr=stderr,
             text=True,
-            start_new_session=True,
+            **process_group_options(),
         )
         try:
             stdout, _ = process.communicate(timeout=budget.timeout(timeout))
@@ -447,9 +504,9 @@ def execute(command, run, budget, timeout):
             process.stdout.close()
         if process.returncode:
             stderr.seek(0)
-            raise StudyError(
-                f"Command failed ({process.returncode}): {command}\n{stderr.read()[-4000:]}"
-            )
+            detail = stderr.read()[-4000:]
+            error_type = CudaOutOfMemory if "cudaErrorMemoryAllocation" in detail else StudyError
+            raise error_type(f"Command failed ({process.returncode}): {command}\n{detail}")
     return stdout
 
 
@@ -474,8 +531,16 @@ class Scorer:
             stderr=self.errors,
             text=True,
             bufsize=1,
-            start_new_session=True,
+            **process_group_options(),
         )
+        if os.name == "nt":
+            self.responses = queue.Queue()
+            def read_responses():
+                for line in self.process.stdout:
+                    self.responses.put(line)
+                self.responses.put("")
+            self.reader = threading.Thread(target=read_responses, daemon=True)
+            self.reader.start()
         try:
             self.info = self.response()
             if (self.info.get("width"), self.info.get("height")) != (
@@ -489,12 +554,19 @@ class Scorer:
             raise
 
     def response(self):
-        if not select.select(
-            [self.process.stdout], [], [], self.budget.timeout(self.config["timeout"])
-        )[0]:
-            self.budget.check()
-            raise StudyError("Metric subprocess timed out")
-        line = self.process.stdout.readline()
+        if os.name == "nt":
+            try:
+                line = self.responses.get(timeout=self.budget.timeout(self.config["timeout"]))
+            except queue.Empty as error:
+                self.budget.check()
+                raise StudyError("Metric subprocess timed out") from error
+        else:
+            if not select.select(
+                [self.process.stdout], [], [], self.budget.timeout(self.config["timeout"])
+            )[0]:
+                self.budget.check()
+                raise StudyError("Metric subprocess timed out")
+            line = self.process.stdout.readline()
         if not line:
             self.errors.seek(0)
             raise StudyError("Metric exited: " + self.errors.read()[-2000:])
@@ -552,6 +624,8 @@ class Scorer:
     def __exit__(self, *exc):
         if self.process:
             stop_process(self.process)
+            if hasattr(self, "reader"):
+                self.reader.join(timeout=10)
             self.process.stdin.close()
             self.process.stdout.close()
         if hasattr(self, "errors"):
@@ -772,6 +846,8 @@ def base_row(image, effort, distance, config=None):
     return {
         **{key: image[key] for key in SOURCE_FIELDS},
         "encoder": encoder,
+        "backend": (config or {}).get("backend", "metal" if encoder == "gjxl" else "cpu"),
+        "gpu_aq_mode": (config or {}).get("gpu_aq_mode", (config or {}).get("metal_aq_mode", "")),
         "pixels": image["width"] * image["height"],
         "effort": effort,
         "distance": distance,
@@ -966,8 +1042,8 @@ def harness(config, image, effort, distance, directory, run, budget, warmups):
         for key, value in {
             "encoder": "gjxl",
             "stage_profile_enabled": False,
-            "backend": "metal",
-            "metal_aq_mode": "fully-resident",
+            "backend": config.get("backend", "metal"),
+            ("gpu_aq_mode" if config.get("backend") == "cuda" else "metal_aq_mode"): "fully-resident",
             "density": "default",
             "compression": "automatic",
             "collect_final_score": False,
@@ -1028,6 +1104,8 @@ def fixed_rows(run, config):
         image = images[row["image_id"]]
         row.update(
             encoder=encoder_name(config),
+            backend=config.get("backend", "metal" if encoder_name(config) == "gjxl" else "cpu"),
+            gpu_aq_mode=config.get("gpu_aq_mode", config.get("metal_aq_mode", "")),
             resampling=1,
             reference_sha256=image["pfm_sha256"],
             expected_image_count=expected[(image["corpus"], image["resolution_class"])],
@@ -1046,6 +1124,8 @@ def collect_fixed_timings(run, config, budget, efforts=None):
     # Also check tuple/repetition membership and cross-repetition consistency.
     fixed_rows(run, config)
     done = {r["sample_id"] for r in existing}
+    failed = {r["job_id"] for r in read_records(run, "failures", config)
+              if r.get("phase") == "fixed-timing"}
     selected = sorted(e for e in config["efforts"] if efforts is None or e in efforts)
     for effort in selected:
         for repetition in range(config["repetitions"]):
@@ -1061,7 +1141,7 @@ def collect_fixed_timings(run, config, budget, efforts=None):
             for position, (image, quality, _) in enumerate(jobs):
                 key = fixed_key(image["image_id"], quality, effort)
                 sample_id = f"{key}|repetition={repetition}"
-                if sample_id in done:
+                if sample_id in done or key in failed:
                     continue
                 budget.check()
                 distance = config["quality_to_distance"][str(quality)]
@@ -1072,16 +1152,25 @@ def collect_fixed_timings(run, config, budget, efforts=None):
                     / f"q{quality:03d}-e{effort:02d}.jxl"
                 )
                 with tempfile.TemporaryDirectory(prefix="gjxl-fixed-") as temp:
-                    output, raw, sample = harness(
-                        config,
-                        image,
-                        effort,
-                        distance,
-                        Path(temp),
-                        run,
-                        budget,
-                        config["warmups"],
-                    )
+                    try:
+                        output, raw, sample = harness(
+                            config, image, effort, distance, Path(temp), run,
+                            budget, config["warmups"],
+                        )
+                    except CudaOutOfMemory as error:
+                        if not config.get("continue_cuda_oom"):
+                            raise
+                        save_record(run, "failures", config, {
+                            **base_row(image, effort, distance, config),
+                            "phase": "fixed-timing", "job_id": key,
+                            "sample_id": sample_id, "quality": quality,
+                            "repetition": repetition, "status": "cuda-out-of-memory",
+                            "error": str(error),
+                        })
+                        failed.add(key)
+                        budget.completed += 1
+                        print(f"unavailable {sample_id}: cuda-out-of-memory", flush=True)
+                        continue
                     if retained.exists():
                         verify_file(output, digest(retained))
                     else:
@@ -1124,12 +1213,17 @@ def fixed_completion(run, config):
     scored = {r["source_job_id"] for r in read_records(run, "scores", config)}
     complete = sum(r["timing_complete"] for r in rows)
     score_count = sum(r["job_id"] in scored for r in rows)
+    failed = {r["job_id"] for r in read_records(run, "failures", config)
+              if r.get("phase") == "fixed-timing"}
+    finished = {r["job_id"] for r in rows if r["timing_complete"] and r["job_id"] in scored}
     return {
         "expected_tuples": expected,
         "timed_tuples": complete,
         "timing_samples": sum(r["timing_sample_count"] for r in rows),
         "expected_timing_samples": expected * config["repetitions"],
         "scored_tuples": score_count,
+        "failed_tuples": len(failed),
+        "collection_finished": len(finished | failed) == expected,
         "complete": complete == score_count == expected,
     }
 
@@ -1147,7 +1241,8 @@ def collect_calibration(run, config, budget, efforts=None):
     scores = read_records(run, "scores", config, verify=True)
     probes = read_records(run, "probes", config, verify=True)
     outcomes = read_records(run, "calibration", config, verify=True)
-    done = {r["match_id"] for r in outcomes if r["status"] == "matched"}
+    done = {r["match_id"] for r in outcomes
+            if r["status"] == "matched" or config.get("terminal_calibration_outcomes")}
     for effort in config["measurement_efforts"]:
         if efforts is not None and effort not in efforts:
             continue
@@ -1205,15 +1300,17 @@ def collect_calibration(run, config, budget, efforts=None):
 
                     # Count previously attempted probes for this target, preserving its total cap on resume.
                     used = sum(p.get("match_id") == key for p in probes)
-                    best, status, _ = search(
-                        candidates,
-                        target,
-                        config["tolerance"],
-                        evaluate,
-                        config["minimum_distance"],
-                        config["maximum_distance"],
-                        max(0, config["max_evaluations"] - used),
-                    )
+                    failure = None
+                    try:
+                        best, status, _ = search(
+                            candidates, target, config["tolerance"], evaluate,
+                            config["minimum_distance"], config["maximum_distance"],
+                            max(0, config["max_evaluations"] - used),
+                        )
+                    except CudaOutOfMemory as error:
+                        if not config.get("continue_cuda_oom"):
+                            raise
+                        best, status, failure = None, "cuda-out-of-memory", str(error)
                     outcome = {
                         "match_id": key,
                         "image_id": image["image_id"],
@@ -1221,6 +1318,8 @@ def collect_calibration(run, config, budget, efforts=None):
                         "target": target,
                         "status": status,
                     }
+                    if failure:
+                        outcome["error"] = failure
                     if best:
                         # Retain one named-by-match artifact even when a seed from
                         # the original sweep already meets the target.
@@ -1295,10 +1394,14 @@ def collect_measurements(run, config, budget, efforts=None):
                     token = identity([match["match_id"], repetition])[:24]
                     (run / "raw").mkdir(exist_ok=True)
                     raw.replace(run / "raw" / ("timing-" + token + ".json"))
+                    raw_path = run / "raw" / ("timing-" + token + ".json")
                     row = {
                         **match,
                         "repetition": repetition,
                         "elapsed_ms": sample["elapsed_nanoseconds"] / 1e6,
+                        "elapsed_nanoseconds": sample["elapsed_nanoseconds"],
+                        "raw_path": str(raw_path),
+                        "raw_sha256": digest(raw_path),
                         "encoded_bytes": sample["encoded_bytes"],
                     }
                     save_record(run, "measurements", config, row)
@@ -1436,7 +1539,12 @@ def aggregate_points(rows):
             )
         )
         ready = [r for r in items if r["status"] == "ready"]
+        backends = {r.get("backend", "metal" if r["encoder"] == "gjxl" else "cpu") for r in items}
+        if len(backends) != 1:
+            raise StudyError("Cannot pool different encoder backends")
         out.update(
+            backend=backends.pop(),
+            gpu_aq_mode=items[0].get("gpu_aq_mode", ""),
             image_count=len(items),
             ready_count=len(ready),
             tolerance=items[0].get("tolerance", 0.5),
@@ -1628,6 +1736,7 @@ def summarize(run, config, modes=("preview", "measured"), compare_run=None):
     if is_fixed(config):
         write_csv(summary / "image-tuples.csv", fixed_rows(run, config))
         write_json(summary / "fixed-coverage.json", fixed_completion(run, config))
+    write_csv(summary / "failures.csv", read_records(run, "failures", config))
     totals = {}
     for mode in modes:
         if mode == "measured" and is_fixed(config):
@@ -1661,7 +1770,8 @@ def collect_warmup_check(run, config, budget):
     if encoder_name(config) != "gjxl":
         raise StudyError("The warmup check is currently a GJXL-only diagnostic")
     images = config["images"]
-    sentinels = {images[0]["image_id"]: images[0]}
+    small = min(images, key=lambda image: image["width"] * image["height"])
+    sentinels = {small["image_id"]: small}
     large = max(images, key=lambda image: image["width"] * image["height"])
     sentinels[large["image_id"]] = large
     effort, distance = max(config["measurement_efforts"]), 1.2
@@ -1799,6 +1909,7 @@ def run_completion(run, config):
         "unmatched": len(outcomes) - matched,
         "timed_matches": complete,
         "timing_samples": len(measurements),
+        "collection_finished": len(outcomes) == expected and complete == matched,
         "complete": matched == expected and complete == expected,
     }
 
@@ -1811,6 +1922,9 @@ def parse_args(argv=None):
     init.add_argument("--corpus", type=Path, required=True)
     init.add_argument("--tuples", type=Path)
     init.add_argument("--encoder", choices=("libjxl", "gjxl"), default="libjxl")
+    init.add_argument("--backend", choices=("metal", "cuda"), default="metal")
+    init.add_argument("--decoder", type=Path, help="pinned standalone decoder for a CUDA study")
+    init.add_argument("--build-record", type=Path, help="frozen CUDA harness/build provenance JSON")
     init.add_argument(
         "--mode",
         choices=("matched", "fixed"),
@@ -1829,7 +1943,7 @@ def parse_args(argv=None):
     init.add_argument(
         "--gjxl-source", type=Path, help="source checkout used for the GJXL build"
     )
-    init.add_argument("--source-run", type=Path, required=True)
+    init.add_argument("--source-run", type=Path)
     init.add_argument("--scorer", type=Path, required=True)
     init.add_argument("--metric", choices=METRICS, default="fast-ssim2")
     init.add_argument("--intensity-target", type=float, default=80.0)
@@ -1856,6 +1970,7 @@ def parse_args(argv=None):
         "calibrate",
         "measure",
         "pilot",
+        "warmup",
         "run",
         "preview",
         "summarize",
@@ -1869,11 +1984,16 @@ def parse_args(argv=None):
                 type=Path,
                 help="saved alternative-metric run for e4/e5 diagnostics",
             )
-        if name in ("score", "calibrate", "measure", "pilot", "run"):
+        if name in ("score", "calibrate", "measure", "pilot", "warmup", "run"):
             p.add_argument(
                 "--budget-seconds", type=float, default=900 if name == "pilot" else None
             )
             p.add_argument("--max-jobs", type=int)
+            p.add_argument(
+                "--pause-file", type=Path,
+                help="stop at the next collector boundary when this file exists; "
+                     "retain it until an explicit resume",
+            )
         if name == "run":
             p.add_argument(
                 "--check-warmups",
@@ -1883,6 +2003,13 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     args.run = args.run.resolve()
     if args.command == "init":
+        if args.backend == "cuda" and args.encoder != "gjxl":
+            parser.error("--backend cuda requires --encoder gjxl")
+        if args.backend == "cuda":
+            if args.decoder is None or args.build_record is None:
+                parser.error("CUDA init requires --decoder and --build-record")
+        elif args.source_run is None:
+            parser.error("--source-run is required for the existing libjxl/Metal protocol")
         if (
             args.mode == "fixed" or args.seed_run is not None
         ) and args.encoder != "gjxl":
@@ -1939,11 +2066,11 @@ def main(argv=None):
     if args.command == "init":
         initialize(args)
         return 0
-    collecting = args.command in ("score", "calibrate", "measure", "pilot", "run")
+    collecting = args.command in ("score", "calibrate", "measure", "pilot", "warmup", "run")
     config = load_config(args.run, verify=collecting and not args.dry_run)
     if collecting and config.get("analysis_only"):
         require_encoding_allowed(config)
-    if args.command in ("calibrate", "measure", "pilot", "run"):
+    if args.command in ("calibrate", "measure", "pilot", "warmup", "run"):
         require_encoding_allowed(config)
     if args.command == "pilot" and not config["pilot"]:
         raise StudyError("pilot requires a --pilot configuration")
@@ -1985,10 +2112,14 @@ def main(argv=None):
             )
         )
         return 0
-    with (args.run / ".lock").open("a") as lock:
+    with contextlib.ExitStack() as locks:
+        lock = locks.enter_context((args.run / ".lock").open("a"))
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
+            acquire_run_lock(lock)
+            if collecting and config.get("collection_lock"):
+                device_lock = locks.enter_context(Path(config["collection_lock"]).open("a"))
+                acquire_run_lock(device_lock)
+        except OSError as error:
             raise StudyError("Another command is using this quality run") from error
         if not collecting:
             summarize(
@@ -1999,7 +2130,7 @@ def main(argv=None):
             )
             return 0
         # Don't overlap new timing with the existing sweep.
-        processes = subprocess.check_output(["ps", "-axo", "command"], text=True)
+        processes = process_commands()
         if any(
             "cjxl_runtime_characterization.py run" in line
             for line in processes.splitlines()
@@ -2007,13 +2138,13 @@ def main(argv=None):
             raise StudyError(
                 "Pause the original runtime sweep before quality collection"
             )
-        budget = Budget(args.budget_seconds, args.max_jobs)
+        budget = Budget(args.budget_seconds, args.max_jobs, args.pause_file)
         start, status = time.monotonic(), "complete"
         write_json(
             args.run / "runner.json",
             {
                 "pid": os.getpid(),
-                "pgid": os.getpgrp(),
+                "pgid": os.getpgrp() if os.name != "nt" else None,
                 "started_at": utc(),
                 "command": args.command,
                 "state": "running",
@@ -2039,11 +2170,12 @@ def main(argv=None):
                     if is_fixed(config)
                     else collect_measurements,
                     "run": collect_full_run,
+                    "warmup": collect_warmup_check,
                 }[command](args.run, config, budget)
         except (BudgetExpired, subprocess.TimeoutExpired):
             status = "budget-or-timeout"
             print("Stopped at budget/timeout; completed records are resumable.")
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, PauseRequested):
             status = "paused"
             print("Paused; completed records are resumable.")
         except BaseException:
@@ -2082,7 +2214,7 @@ def main(argv=None):
                 args.run / "runner.json",
                 {
                     "pid": os.getpid(),
-                    "pgid": os.getpgrp(),
+                    "pgid": os.getpgrp() if os.name != "nt" else None,
                     "stopped_at": utc(),
                     "command": args.command,
                     "state": status,
