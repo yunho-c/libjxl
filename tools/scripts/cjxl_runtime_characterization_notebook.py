@@ -119,7 +119,7 @@ QUALITY_RUN = pathlib.Path(
 GJXL_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_GJXL_RUN",
-        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-full-20260915",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/quality-gjxl-full-20260924",
     )
 ).expanduser()
 # Saved fixed-Q study; a composite selection labels its source revisions in the BD-rate legend.
@@ -127,7 +127,7 @@ GJXL_RUN = pathlib.Path(
 GJXL_FIXED_RUN = pathlib.Path(
     os.environ.get(
         "CJXL_GJXL_FIXED_RUN",
-        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/fixed-gjxl-full-20260915",
+        "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/fixed-gjxl-full-20260924",
     )
 ).expanduser()
 # CUDA studies are kept separate from the historical Metal/CPU comparisons.
