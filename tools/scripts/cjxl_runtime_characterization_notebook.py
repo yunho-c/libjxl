@@ -195,6 +195,12 @@ BD_RATE_SHOW_EFFORT_LINKS = True
 DEBUG_BD_RATE_SOURCE_COMPARISON = True
 DEBUG_BD_RATE_QUALITY_RANGE = (75.0, 84.5)  # Inside accepted target 85 +/- 0.5.
 
+# Direct calibrated comparison, independent of the fixed-sweep BD-rate plot.
+CALIBRATED_SIZE_TARGETS = (60, 70, 85)
+CALIBRATED_SIZE_BASELINE = ("libjxl", 7)
+CALIBRATED_SIZE_EFFORTS = None  # All configured efforts; one common cohort.
+CALIBRATED_SIZE_IMAGE_IDS = None  # Candidate cohort; exclusions are reported.
+
 # Independent saved batch benchmark; set to None to skip its section.
 BATCH_BENCHMARK_RUN = pathlib.Path(
     os.environ.get(
@@ -1766,6 +1772,9 @@ def main(argv=None):
     if args.gjxl_run:
         generate_encoder_comparison(args.quality_run, args.gjxl_run, args.output_dir,
                                     args.formats, args.show)
+        generate_calibrated_speed_size_figures(
+            args.quality_run, args.gjxl_run, args.output_dir, args.formats, args.show,
+        )
     return 0
 
 
@@ -2335,6 +2344,171 @@ def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
                 ha="right", fontsize=8)
     name = "pareto-measured-libjxl-vs-gjxl"
     save_figure(figure, pathlib.Path(output_dir), name, formats)
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return {name: figure}
+
+
+# %% [markdown]
+# ## Calibrated size and speed drawing functions
+#
+# Separate target panels use actual measured sizes and times. Their common
+# full-resolution cohort is selected once across both encoders, every effort,
+# and every target. Exclusions and achieved quality differences are exported.
+
+# %%
+def load_calibrated_comparison_helpers():
+    import importlib
+
+    source = pathlib.Path(load_quality_helpers().__file__).resolve().parent
+    sys.path.insert(0, str(source))
+    try:
+        return importlib.import_module("cjxl_calibrated_comparison")
+    finally:
+        sys.path.pop(0)
+
+
+def plot_calibrated_speed_size(report):
+    """Three measured target panels, with common axes and a declared cohort."""
+    with matplotlib.rc_context({**paper_plot_style(), "mathtext.fontset": "dejavuserif"}):
+        targets = report["targets"]
+        figure, axes = plt.subplots(1, len(targets), figsize=(3.5 * len(targets), 4.0),
+                                    sharex=True, sharey=True, squeeze=False)
+        axes = list(axes[0])
+        figure.subplots_adjust(left=0.075, right=0.99, top=0.89, bottom=0.27, wspace=0.10)
+        colors = {"libjxl": "#333333", "gjxl": "#0072B2"}
+        gjxl_source = next(source for source in report["sources"] if source["encoder"] == "gjxl")
+        backend = gjxl_source.get("backend", "metal")
+        gjxl_label = "GJXL (" + {"metal": "Metal", "cuda": "CUDA"}.get(backend, backend) + ")"
+        styles = {"libjxl": ("o", "-", "libjxl"), "gjxl": ("s", "--", gjxl_label)}
+        annotations = []
+        for axis, target in zip(axes, targets):
+            for encoder, (marker, linestyle, label) in styles.items():
+                points = sorted((p for p in report["points"] if p["target"] == target
+                                 and p["encoder"] == encoder and p["status"] == "ready"),
+                                key=lambda p: p["effort"])
+                axis.plot([p["mean_encode_ms"] for p in points],
+                          [p["mean_size_difference_pct"] for p in points],
+                          color=colors[encoder], marker=marker, linestyle=linestyle,
+                          markerfacecolor="white", markeredgewidth=0.9, lw=1.15, ms=4,
+                          label=label, gid=f"calibrated-{target:g}-{encoder}", zorder=3)
+                clusters = []
+                for point in points:
+                    if (clusters and abs(math.log(point["mean_encode_ms"] /
+                                                   clusters[-1][0]["mean_encode_ms"])) < 0.08
+                            and abs(point["mean_size_difference_pct"] -
+                                    clusters[-1][0]["mean_size_difference_pct"]) < 0.15):
+                        clusters[-1].append(point)
+                    else:
+                        clusters.append([point])
+                for cluster in clusters:
+                    efforts = [p["effort"] for p in cluster]
+                    effort_label = (f"e{efforts[0]}–{efforts[-1]}" if len(efforts) > 1
+                                    and efforts == list(range(efforts[0], efforts[-1] + 1))
+                                    else "e" + ",".join(map(str, efforts)))
+                    direction = 1 if encoder == "gjxl" else -1
+                    annotation = axis.annotate(
+                        effort_label,
+                        (math.exp(np.mean([math.log(p["mean_encode_ms"]) for p in cluster])),
+                         np.mean([p["mean_size_difference_pct"] for p in cluster])),
+                        xytext=(0, direction * 7), textcoords="offset points",
+                        ha="center", va="bottom" if direction > 0 else "top",
+                        color=colors[encoder], fontsize=7,
+                        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
+                              "boxstyle": "square,pad=0.1"},
+                        arrowprops={"arrowstyle": "-", "color": colors[encoder], "lw": 0.45},
+                    )
+                    annotation.set_in_layout(False)
+                    annotations.append((annotation, direction))
+            axis.set_title(f"SSIMULACRA2 {target:g}", loc="left", pad=8)
+            axis.set_xscale("log")
+            axis.axhline(0, color="0.45", lw=0.65, zorder=1)
+            axis.grid(axis="y", color="0.88", linewidth=0.5)
+            axis.set_axisbelow(True)
+            axis.margins(x=0.17, y=0.35)
+            axis.minorticks_off()
+            axis.tick_params(axis="both", which="major", length=3, width=0.7)
+            axis.text(0.02, 0.97, "Upper left is better", transform=axis.transAxes,
+                      va="top", fontsize=6.5, color="0.4")
+            if not report["cohort"]:
+                axis.set(xlim=(1, 10), ylim=(-1, 1))
+                axis.text(0.5, 0.5, "No common complete cohort", ha="center",
+                          transform=axis.transAxes, fontsize=8)
+        # Shared axes must be inverted only once.
+        axes[0].invert_yaxis()
+        baseline = report["baseline"]
+        axes[0].set_ylabel(f"Size difference vs. {baseline['encoder']} e{baseline['effort']} (%)")
+        figure.supxlabel("Mean measured encode time (ms)", y=0.16, fontsize=9)
+        handles, labels = axes[0].get_legend_handles_labels()
+        figure.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.065),
+                      ncols=2, frameon=False, handlelength=2.4, columnspacing=2, fontsize=8)
+        excluded = report["requested_image_count"] - report["image_count"]
+        figure.text(0.5, 0.025,
+                    f"Common full-resolution cohort: {report['image_count']}/{report['requested_image_count']} images"
+                    f" ({excluded} excluded) · Each encode within target ±{report['tolerance']:g}\n"
+                    "Equal image weights · Warm complete calls · No interpolation",
+                    ha="center", va="center", fontsize=7, color="0.35")
+        _place_calibrated_effort_labels(figure, axes, annotations)
+        return figure
+
+
+def _place_calibrated_effort_labels(figure, axes, annotations):
+    """Keep labels in their panel and on their encoder's side of the point."""
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    annotation_labels = {label for label, _ in annotations}
+    occupied = {axis: [text.get_window_extent(renderer).padded(2) for text in axis.texts
+                       if text not in annotation_labels] for axis in axes}
+    for axis in axes:
+        for line in axis.lines:
+            if line.get_marker() not in (None, "", "None"):
+                for x, y in zip(line.get_xdata(), line.get_ydata()):
+                    px, py = axis.transData.transform((x, y))
+                    radius = 0.5 * (line.get_markersize() + 2) * figure.dpi / 72
+                    occupied[axis].append(matplotlib.transforms.Bbox.from_bounds(
+                        px - radius, py - radius, 2 * radius, 2 * radius))
+    for label, direction in annotations:
+        inside = label.axes.get_window_extent(renderer)
+        candidates = []
+        for level in range(7):
+            for horizontal in (0, -12, 12, -24, 24, -36, 36):
+                position = (horizontal, direction * (7 + 9 * level))
+                label.set_position(position)
+                box = matplotlib.text.Text.get_window_extent(label, renderer).padded(1.5)
+                contained = inside.contains(box.x0, box.y0) and inside.contains(box.x1, box.y1)
+                overlaps = sum(box.overlaps(other) for other in occupied[label.axes])
+                candidates.append((not contained, overlaps, level, abs(horizontal), position, box))
+                if contained and overlaps == 0:
+                    break
+            if contained and overlaps == 0:
+                break
+        best = min(candidates, key=lambda item: item[:4])
+        label.set_position(best[4])
+        occupied[label.axes].append(best[5])
+
+
+def generate_calibrated_speed_size_figures(libjxl_run, gjxl_run, output_dir,
+                                           formats=SAVE_FORMATS, show=False, *,
+                                           targets=(60, 70, 85), efforts=None, image_ids=None,
+                                           baseline_encoder="libjxl", baseline_effort=7):
+    """Export the additional plot and auditable saved-data report only."""
+    import json
+
+    helper = load_calibrated_comparison_helpers()
+    report = helper.analyze(helper.load_studies([libjxl_run, gjxl_run]),
+                            targets=targets, efforts=efforts, image_ids=image_ids,
+                            baseline_encoder=baseline_encoder, baseline_effort=baseline_effort)
+    figure = plot_calibrated_speed_size(report)
+    name = "speed-size-calibrated"
+    output_dir = pathlib.Path(output_dir).expanduser().resolve()
+    save_figure(figure, output_dir, name, formats)
+    (output_dir / (name + "-report.json")).write_text(
+        json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    pd.DataFrame(report["points"]).to_csv(output_dir / (name + ".csv"), index=False)
+    print(f"Calibrated comparison: {report['image_count']}/{report['requested_image_count']} "
+          f"images in every panel; exclusions: {report['exclusion_image_counts']}")
     if show:
         plt.show()
     else:
@@ -3345,6 +3519,51 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
         show_headers=BD_RATE_SHOW_HEADERS,
         show_missing_data=BD_RATE_SHOW_MISSING_DATA,
         show_effort_links=BD_RATE_SHOW_EFFORT_LINKS,
+    )
+
+
+# %% [markdown]
+# ### Measured size and speed at calibrated quality targets
+#
+# This additional three-panel plot reads `QUALITY_RUN` and `GJXL_RUN`, leaving
+# the fixed-sweep BD-rate figure above unchanged. Targets default to 60, 70,
+# and 85. Each point uses actual calibrated output bytes and the median of five
+# measured complete calls per image; neither axis is interpolated. The vertical
+# axis is mean per-image size difference versus libjxl e7 at the same target,
+# **not BD-rate**. Images receive equal weight for both size differences and time.
+#
+# A single explicitly reported common cohort is used across both encoders,
+# all selected efforts, and all targets. Any image with an unresolved match,
+# incomplete timing, or encoder-side downsampling in any selected setting is
+# excluded everywhere. This subset does not represent the excluded images.
+# The default saved runs yield 54/65 images: ten have incomplete calibrations,
+# and one further image uses libjxl resampling at target 60. The actual cohort
+# is recomputed from saved ledgers; every exclusion is listed in the report.
+#
+# Each accepted score lies within target ±0.5. Paired scores can differ by up
+# to 1.0, so small size differences can reflect residual quality mismatch.
+# Achieved scores and paired differences are exported without quality correction.
+# Full calls exclude startup, file I/O, decoding, scoring, and calibration search.
+# Libjxl uses eight workers; GJXL uses a CPU participant cap of eight plus Metal.
+#
+# `CALIBRATED_SIZE_TARGETS`, `CALIBRATED_SIZE_EFFORTS`, and
+# `CALIBRATED_SIZE_IMAGE_IDS` select the requested grid and candidate cohort;
+# `CALIBRATED_SIZE_BASELINE` selects the comparison reference. Changing those
+# choices may change the common cohort. Panels always share axis limits.
+# Exports: `speed-size-calibrated.png/svg`, `.csv`, and `-report.json`, including
+# ledger hashes, encoder identities, per-image values, and excluded settings.
+# This cell never starts collection, encoding, decoding, or scoring.
+
+# %%
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and GJXL_RUN is not None
+        and (QUALITY_RUN / "metadata.json").is_file()
+        and (GJXL_RUN / "metadata.json").is_file()):
+    calibrated_speed_size_figures = generate_calibrated_speed_size_figures(
+        QUALITY_RUN, GJXL_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        targets=CALIBRATED_SIZE_TARGETS, efforts=CALIBRATED_SIZE_EFFORTS,
+        image_ids=CALIBRATED_SIZE_IMAGE_IDS,
+        baseline_encoder=CALIBRATED_SIZE_BASELINE[0], baseline_effort=CALIBRATED_SIZE_BASELINE[1],
     )
 
 

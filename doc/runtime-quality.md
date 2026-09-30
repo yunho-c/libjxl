@@ -74,6 +74,48 @@ BD values, aggregate coverage/reasons, interpolation differences, the explicit
 cohort and interval, and configuration/ledger identities. Rate-only results
 remain in the report when timing is incomplete, but do not become plot markers.
 
+## Measured size and speed at calibrated targets
+
+The notebook also exports **`speed-size-calibrated`**, with separate panels for
+SSIMULACRA2 targets 60, 70, and 85. It reads `QUALITY_RUN` and `GJXL_RUN`, and
+leaves the existing fixed-sweep `speed-bd-rate` figures unchanged. No collection,
+encoding, decoding, or scoring is started.
+
+The horizontal axis is the arithmetic mean of per-image median measured encode
+times. The vertical axis is the arithmetic mean of per-image size differences,
+`100 * (bytes / baseline_bytes - 1)`, versus libjxl effort 7 at the **same target**.
+It is not BD-rate. Both axes give each image equal weight; neither interpolates
+between quality settings. Panels share their axis limits.
+
+The common full-resolution cohort is selected once across both encoders, all
+selected efforts, and all targets. An image is excluded everywhere if any
+required calibration is unresolved, timing is incomplete, or resampling differs
+from 1. The caption reports retained/requested images, and the JSON lists every
+excluded image and setting. This explicitly selected subset is not an estimate
+for the excluded images. The default saved runs retain 54/65 images: ten have
+unresolved calibrations and one additional image is resampled by libjxl at 60.
+
+Each encode is within the configured target tolerance (normally ±0.5). Paired
+achieved scores can differ by up to twice that tolerance; no correction is made
+to the observed sizes or times. Per-image scores, paired score differences,
+configuration/build identities, and calibration/timing ledger hashes are
+retained in `speed-size-calibrated-report.json`. A point-level CSV and PNG/SVG
+figures are exported alongside it. Timing is warm complete-call wall time,
+excluding calibration search, startup, I/O, decoding, and scoring. Libjxl uses
+eight worker threads; GJXL uses a participant cap of eight plus Metal.
+
+`CALIBRATED_SIZE_TARGETS`, `CALIBRATED_SIZE_EFFORTS`,
+`CALIBRATED_SIZE_IMAGE_IDS`, and `CALIBRATED_SIZE_BASELINE` configure this
+independent notebook cell. Changing the requested grid can change the common
+cohort. To generate only these additional artifacts from saved data:
+
+```python
+figures = generate_calibrated_speed_size_figures(
+    QUALITY_RUN, GJXL_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+    targets=(60, 70, 85), baseline_encoder="libjxl", baseline_effort=7,
+)
+```
+
 ## Paper throughput table at matched nominal settings
 
 The runtime notebook's **Paper table: encoding throughput at matched nominal
