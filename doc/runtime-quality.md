@@ -204,10 +204,23 @@ setting it to `None` skips the section. Neither calibrated measurements nor
 the older summary CSVs supply timing samples. Current ledgers are read without
 starting collection or refreshing source studies. `THROUGHPUT_MIN_MEGAPIXELS`,
 `THROUGHPUT_QUALITIES`, `THROUGHPUT_EFFORTS`, and `THROUGHPUT_IMAGE_IDS` make the
-cohort and settings explicit. Every selected image and quality must have all
-configured repetitions before an encoder's effort row has a throughput value.
-Missing repetitions leave dashes and are listed in the coverage CSV; cohorts
-are never reduced to the available images.
+cohort and settings explicit. `THROUGHPUT_MISSING_OK = True` (the notebook default)
+selects one common image cohort: if either encoder lacks a configured repetition
+at any selected effort or quality, exclude that image from both encoders and
+every selected setting. This handles OOMs and unfinished timings without using
+partial medians or changing the cohort between rows. The caption reports the
+retained count; `cohort_selection` in the methodology JSON lists all excluded
+images and the incomplete settings that caused each exclusion. The coverage
+CSV describes the retained cohort. Rates characterize only that subset.
+
+Set `THROUGHPUT_MISSING_OK = False` for strict coverage: every selected image and
+quality must have all configured repetitions before an encoder's effort row
+has a value. Missing repetitions leave dashes and appear in the coverage CSV.
+An empty common cohort raises an error. Invalid or mismatched records still
+raise in either mode, even for images that would otherwise be excluded.
+Selecting fewer efforts can retain more images if later efforts are incomplete.
+The notebook currently selects E1–E9; set `THROUGHPUT_EFFORTS = None` to select
+every effort in the libjxl manifest.
 
 The loader checks input hashes/geometry, requested distances, timing protocol,
 revision/configuration identities, repetitions, and codestream consistency.
@@ -237,7 +250,8 @@ The export can also run independently of all notebook plots:
 ```python
 tables = generate_encoding_throughput_tables(
     QUALITY_RUN, GJXL_FIXED_RUN, OUTPUT_DIR,
-    min_megapixels=1.0, qualities=(30, 50, 70, 80, 90, 95), show=True,
+    min_megapixels=1.0, qualities=(30, 50, 70, 80, 90, 95),
+    missing_ok=True, show=True,
 )
 ```
 
@@ -270,12 +284,16 @@ The throughput table defaults to images of at least 1 MP and nominal Q30–Q95.
 Their cohorts and quality semantics differ; throughput is not matched-quality
 speedup. `--efforts` selects efforts for both tables, `--min-megapixels` changes
 only the throughput cohort, and `--quality-range LOW HIGH` changes only BD-rate.
+`--missing-ok` enables the common fully timed image intersection for throughput
+only. The CLI and Python helper default to strict coverage (`missing_ok=False`);
+the notebook explicitly enables it. The BD-rate table's cohort is unaffected.
 
 Use identical reference hashes and compatible measurement protocols. Missing
-timing leaves throughput blank; incomplete rate coverage leaves BD-rate blank
-without dropping images or extrapolating. Complete rate curves can yield BD-rate
-even when timings are incomplete. Preserve manifests and ledgers unchanged;
-do not edit configuration identities or substitute old Mac measurements.
+timing leaves throughput blank in strict mode; incomplete rate coverage leaves
+BD-rate blank without dropping images or extrapolating. Complete rate curves
+can yield BD-rate even when timings are incomplete. Preserve manifests and
+ledgers unchanged; do not edit configuration identities or substitute old Mac
+measurements.
 
 ## GJXL matched-quality comparison
 

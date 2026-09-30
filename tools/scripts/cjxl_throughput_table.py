@@ -219,8 +219,16 @@ def _aggregate(rows, efforts, qualities, repetitions, resolution="all"):
 
 
 def build_tables(libjxl_run, gjxl_run, *, min_megapixels=1.0,
-                 qualities=DEFAULT_QUALITIES, efforts=None, image_ids=None):
-    """Read current fixed-sweep timings; never drop missing image/quality cells."""
+                 qualities=DEFAULT_QUALITIES, efforts=None, image_ids=None,
+                 missing_ok=False):
+    """Compare saved timings, optionally on one fully timed common image cohort.
+
+    With missing_ok, an incomplete setting excludes its image from both
+    encoders and every selected effort/quality. All configured repetitions
+    remain required. Invalid records always raise, including excluded images.
+    """
+    if not isinstance(missing_ok, bool):
+        raise ValueError("missing_ok must be a boolean")
     studies, host = _load_runs(libjxl_run, gjxl_run)
     qualities = _selection(qualities, "qualities")
     efforts = _selection(studies[0]["config"]["efforts"] if efforts is None else efforts,
@@ -240,6 +248,26 @@ def build_tables(libjxl_run, gjxl_run, *, min_megapixels=1.0,
     images = _cohort(studies, min_megapixels, image_ids)
     tuples = [row for item in studies for row in _tuple_rows(item, images, efforts, qualities)]
     repetitions = studies[0]["config"]["repetitions"]
+    requested_ids = [image["image_id"] for image in images]
+    excluded = []
+    if missing_ok:
+        incomplete = defaultdict(list)
+        for row in tuples:
+            if not row["timing_complete"]:
+                incomplete[row["image_id"]].append({
+                    **{k: row[k] for k in ("encoder", "effort", "quality", "timing_sample_count")},
+                    "required_samples": repetitions,
+                })
+        excluded = [{"image_id": image["image_id"],
+                     "resolution_class": image["resolution_class"],
+                     "reason": "incomplete-timing",
+                     "incomplete_settings": incomplete[image["image_id"]]}
+                    for image in images if image["image_id"] in incomplete]
+        images = [image for image in images if image["image_id"] not in incomplete]
+        if not images:
+            raise ValueError("missing_ok leaves no fully timed images shared by both encoders "
+                             "across all selected efforts and qualities")
+        tuples = [row for row in tuples if row["image_id"] not in incomplete]
     table, by_quality, coverage = _aggregate(tuples, efforts, qualities, repetitions)
     by_resolution, weights = [], []
     total_mp = sum(image["pixels"] / 1e6 for image in images)
@@ -253,13 +281,18 @@ def build_tables(libjxl_run, gjxl_run, *, min_megapixels=1.0,
                         "megapixels": mp, "pixel_share": mp / total_mp})
     backend = studies[1]["config"].get("backend", "metal")
     backend_label = {"metal": "Metal", "cuda": "CUDA"}[backend]
+    cohort_note = (
+        f"The same {len(images)}/{len(requested_ids)} eligible images are used for both encoders "
+        f"and every selected effort and quality; {len(excluded)} images with incomplete timing "
+        "are excluded throughout. These rates describe only the retained cohort. "
+    ) if missing_ok else "A dash denotes incomplete timing coverage. "
     caption = (
         f"Warm encoding throughput at matched nominal distance and effort, on {len(images)} "
         f"images with at least {min_megapixels:g} MP. Rates pool original megapixels over "
         f"summed per-image median encode times ({repetitions} repetitions), then average "
         "equally across " + ", ".join(f"Q{q}" for q in qualities) + ". "
-        f"GJXL uses fully-resident {backend_label}. Speedup is GJXL/libjxl; a dash denotes incomplete "
-        "timing coverage. This compares nominal presets, not matched decoded quality."
+        f"GJXL uses fully-resident {backend_label}. Speedup is GJXL/libjxl. "
+        + cohort_note + "This compares nominal presets, not matched decoded quality."
     )
     provenance = []
     for item in studies:
@@ -283,6 +316,15 @@ def build_tables(libjxl_run, gjxl_run, *, min_megapixels=1.0,
     report = {
         "caption": caption, "schema_version": 1, "batch_size": 1,
         "min_megapixels": min_megapixels, "qualities": qualities, "efforts": efforts,
+        "missing_ok": missing_ok,
+        "cohort_selection": {
+            "mode": "common-complete" if missing_ok else "strict",
+            "requested_image_count": len(requested_ids),
+            "requested_image_ids": requested_ids,
+            "included_image_count": len(images),
+            "included_image_ids": [image["image_id"] for image in images],
+            "excluded_images": excluded,
+        },
         "quality_to_distance": {str(q): studies[0]["distances"][str(q)] for q in qualities},
         "aggregation": "arithmetic mean over qualities of sum(input MP) / sum(per-image median seconds)",
         "speedup": "ratio of encoder aggregate throughputs, not mean of per-image ratios",

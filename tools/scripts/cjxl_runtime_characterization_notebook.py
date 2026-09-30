@@ -228,8 +228,9 @@ THROUGHPUT_LIBJXL_RUN = QUALITY_RUN
 THROUGHPUT_GJXL_RUN = GJXL_FIXED_RUN  # None skips the table; batch data is separate.
 THROUGHPUT_MIN_MEGAPIXELS = 1.0
 THROUGHPUT_QUALITIES = (30, 50, 70, 80, 90, 95)
-THROUGHPUT_EFFORTS = None  # None retains every configured libjxl effort, including gaps.
+THROUGHPUT_EFFORTS = tuple(range(1, 10))  # E1–E9; None selects every configured libjxl effort.
 THROUGHPUT_IMAGE_IDS = None  # None uses the manifest cohort above the resolution threshold.
+THROUGHPUT_MISSING_OK = True  # Use one fully timed image intersection across both encoders/settings.
 PAPER_BATCH_RUN = pathlib.Path(os.environ.get(
     "CJXL_PAPER_BATCH_RUN",
     "/Users/yunhocho/GitHub/libjxl-runtime-study-2026-09-03/batch-gjxl-full-max24mp-20260916",
@@ -3285,7 +3286,8 @@ def generate_bd_rate_source_comparison(run, output_dir, formats=SAVE_FORMATS, sh
 def generate_encoding_throughput_tables(libjxl_run, gjxl_run, output_dir, *,
                                         min_megapixels=1.0,
                                         qualities=(30, 50, 70, 80, 90, 95),
-                                        efforts=None, image_ids=None, show=False):
+                                        efforts=None, image_ids=None, missing_ok=False,
+                                        show=False):
     """Independent saved-ledger table export; no encoders, scoring or profiling."""
     import importlib
 
@@ -3297,7 +3299,7 @@ def generate_encoding_throughput_tables(libjxl_run, gjxl_run, output_dir, *,
         sys.path.pop(0)
     tables = helper.build_tables(
         libjxl_run, gjxl_run, min_megapixels=min_megapixels,
-        qualities=qualities, efforts=efforts, image_ids=image_ids,
+        qualities=qualities, efforts=efforts, image_ids=image_ids, missing_ok=missing_ok,
     )
     tables["written"] = helper.write_tables(tables, output_dir)
     if show:
@@ -4250,10 +4252,17 @@ if __name__ == "__main__" and "ipykernel" in sys.modules and GJXL_FIXED_RUN is n
 # `THROUGHPUT_MIN_MEGAPIXELS = 1.0` excludes the sub-megapixel Kodak images.
 # `THROUGHPUT_QUALITIES` selects Q30/50/70/80/90/95, whose distance mappings must
 # agree between the studies. Q10 is excluded because libjxl automatically
-# downsamples at that setting. Each encoder must retain the same fixed image
-# cohort and every selected quality at each effort. Missing repetitions leave
-# that encoder's cell and the speedup blank; an effort is never silently dropped.
+# downsamples at that setting. `THROUGHPUT_MISSING_OK = True` excludes an image
+# if either encoder lacks any configured repetition at any selected effort or
+# quality. The resulting fixed intersection is used for both encoders, every
+# effort and every quality, including settings where excluded images succeeded.
+# This handles OOMs and unfinished timings without estimating missing samples.
+# The caption states the retained count; the methodology JSON lists every
+# excluded image and its incomplete settings. Results describe that subset.
+# Set the option to `False` to retain the full selected cohort: missing timings
+# then leave that encoder's cell and the speedup blank. Efforts are never dropped.
 # Use `THROUGHPUT_EFFORTS` and `THROUGHPUT_IMAGE_IDS` for explicit subsets.
+# Selecting fewer efforts can retain more images when a later effort is partial.
 #
 # For each effort and quality, throughput is total **original input MP** divided
 # by the sum of per-image median complete-encode seconds. The table takes the
@@ -4298,7 +4307,7 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
         THROUGHPUT_LIBJXL_RUN, THROUGHPUT_GJXL_RUN, OUTPUT_DIR,
         min_megapixels=THROUGHPUT_MIN_MEGAPIXELS,
         qualities=THROUGHPUT_QUALITIES, efforts=THROUGHPUT_EFFORTS,
-        image_ids=THROUGHPUT_IMAGE_IDS, show=True,
+        image_ids=THROUGHPUT_IMAGE_IDS, missing_ok=THROUGHPUT_MISSING_OK, show=True,
     )
     encoding_throughput_table = encoding_throughput_tables["table"]
     encoding_throughput_coverage = encoding_throughput_tables["coverage"]

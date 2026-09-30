@@ -26,6 +26,9 @@ def main(argv=None):
     parser.add_argument("--efforts", type=int, nargs="+", help="default: all libjxl efforts")
     parser.add_argument("--min-megapixels", type=float, default=1.0,
                         help="throughput cohort only; default: 1 MP")
+    parser.add_argument("--missing-ok", action="store_true",
+                        help="throughput only: use one fully timed image intersection across "
+                             "both encoders and all selected efforts/qualities")
     parser.add_argument("--quality-range", type=float, nargs=2, default=(75, 85),
                         metavar=("LOW", "HIGH"), help="BD-rate interval only; default: 75 85")
     args = parser.parse_args(argv)
@@ -35,7 +38,7 @@ def main(argv=None):
 
     tables = throughput.build_tables(
         args.libjxl_run, args.gjxl_run, min_megapixels=args.min_megapixels,
-        efforts=args.efforts,
+        efforts=args.efforts, missing_ok=args.missing_ok,
     )
     # This writer rejects output paths inside any source study before writing.
     paths = throughput.write_tables(tables, args.output_dir)
