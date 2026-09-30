@@ -1775,6 +1775,10 @@ def main(argv=None):
         generate_calibrated_speed_size_figures(
             args.quality_run, args.gjxl_run, args.output_dir, args.formats, args.show,
         )
+        generate_calibrated_speed_size_figures(
+            args.quality_run, args.gjxl_run, args.output_dir, args.formats, args.show,
+            consolidated=True,
+        )
     return 0
 
 
@@ -2357,6 +2361,8 @@ def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
 # Separate target panels use actual measured sizes and times. Their common
 # full-resolution cohort is selected once across both encoders, every effort,
 # and every target. Exclusions and achieved quality differences are exported.
+# The consolidated view averages these target results equally, without fitting
+# a curve between scores. It is a discrete summary, not BD-rate over an interval.
 
 # %%
 def load_calibrated_comparison_helpers():
@@ -2370,30 +2376,36 @@ def load_calibrated_comparison_helpers():
         sys.path.pop(0)
 
 
-def plot_calibrated_speed_size(report):
-    """Three measured target panels, with common axes and a declared cohort."""
+def plot_calibrated_speed_size(report, *, consolidated=False):
+    """Measured target panels or their equal-target mean on the same cohort."""
     with matplotlib.rc_context({**paper_plot_style(), "mathtext.fontset": "dejavuserif"}):
         targets = report["targets"]
-        figure, axes = plt.subplots(1, len(targets), figsize=(3.5 * len(targets), 4.0),
+        panels = [None] if consolidated else targets
+        figure, axes = plt.subplots(1, len(panels),
+                                    figsize=(4.4, 4.1) if consolidated else (3.5 * len(targets), 4.0),
+                                    dpi=180 if consolidated else matplotlib.rcParams["figure.dpi"],
                                     sharex=True, sharey=True, squeeze=False)
         axes = list(axes[0])
-        figure.subplots_adjust(left=0.075, right=0.99, top=0.89, bottom=0.27, wspace=0.10)
+        figure.subplots_adjust(left=0.17 if consolidated else 0.075, right=0.99,
+                               top=0.89, bottom=0.29 if consolidated else 0.27, wspace=0.10)
         colors = {"libjxl": "#333333", "gjxl": "#0072B2"}
         gjxl_source = next(source for source in report["sources"] if source["encoder"] == "gjxl")
         backend = gjxl_source.get("backend", "metal")
         gjxl_label = "GJXL (" + {"metal": "Metal", "cuda": "CUDA"}.get(backend, backend) + ")"
         styles = {"libjxl": ("o", "-", "libjxl"), "gjxl": ("s", "--", gjxl_label)}
         annotations = []
-        for axis, target in zip(axes, targets):
+        for axis, target in zip(axes, panels):
             for encoder, (marker, linestyle, label) in styles.items():
-                points = sorted((p for p in report["points"] if p["target"] == target
+                points = sorted((p for p in report["points"] if (consolidated or p["target"] == target)
                                  and p["encoder"] == encoder and p["status"] == "ready"),
                                 key=lambda p: p["effort"])
                 axis.plot([p["mean_encode_ms"] for p in points],
                           [p["mean_size_difference_pct"] for p in points],
                           color=colors[encoder], marker=marker, linestyle=linestyle,
                           markerfacecolor="white", markeredgewidth=0.9, lw=1.15, ms=4,
-                          label=label, gid=f"calibrated-{target:g}-{encoder}", zorder=3)
+                          label=label,
+                          gid=f"calibrated-{'mean' if consolidated else format(target, 'g')}-{encoder}",
+                          zorder=3)
                 clusters = []
                 for point in points:
                     if (clusters and abs(math.log(point["mean_encode_ms"] /
@@ -2422,7 +2434,9 @@ def plot_calibrated_speed_size(report):
                     )
                     annotation.set_in_layout(False)
                     annotations.append((annotation, direction))
-            axis.set_title(f"SSIMULACRA2 {target:g}", loc="left", pad=8)
+            title = ("Mean over SSIMULACRA2 " + ", ".join(f"{t:g}" for t in targets)
+                     if consolidated else f"SSIMULACRA2 {target:g}")
+            axis.set_title(title, loc="left", pad=8)
             axis.set_xscale("log")
             axis.axhline(0, color="0.45", lw=0.65, zorder=1)
             axis.grid(axis="y", color="0.88", linewidth=0.5)
@@ -2439,16 +2453,21 @@ def plot_calibrated_speed_size(report):
         # Shared axes must be inverted only once.
         axes[0].invert_yaxis()
         baseline = report["baseline"]
-        axes[0].set_ylabel(f"Size difference vs. {baseline['encoder']} e{baseline['effort']} (%)")
+        axes[0].set_ylabel(("Mean size difference" if consolidated else "Size difference")
+                           + f" vs. {baseline['encoder']} e{baseline['effort']} (%)")
         figure.supxlabel("Mean measured encode time (ms)", y=0.16, fontsize=9)
         handles, labels = axes[0].get_legend_handles_labels()
         figure.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.065),
                       ncols=2, frameon=False, handlelength=2.4, columnspacing=2, fontsize=8)
         excluded = report["requested_image_count"] - report["image_count"]
-        figure.text(0.5, 0.025,
-                    f"Common full-resolution cohort: {report['image_count']}/{report['requested_image_count']} images"
-                    f" ({excluded} excluded) · Each encode within target ±{report['tolerance']:g}\n"
-                    "Equal image weights · Warm complete calls · No interpolation",
+        caption = (f"Common full-resolution cohort: {report['image_count']}/{report['requested_image_count']} images"
+                   f" ({excluded} excluded) · Each encode within target ±{report['tolerance']:g}\n"
+                   "Equal image weights · Warm complete calls · No interpolation")
+        if consolidated:
+            caption = (f"{report['image_count']}/{report['requested_image_count']} images · Full resolution"
+                       " · Equal image and target weights\n"
+                       f"Each encode within target ±{report['tolerance']:g} · No interpolation · Not BD-rate")
+        figure.text(0.5, 0.025, caption,
                     ha="center", va="center", fontsize=7, color="0.35")
         _place_calibrated_effort_labels(figure, axes, annotations)
         return figure
@@ -2492,16 +2511,19 @@ def _place_calibrated_effort_labels(figure, axes, annotations):
 def generate_calibrated_speed_size_figures(libjxl_run, gjxl_run, output_dir,
                                            formats=SAVE_FORMATS, show=False, *,
                                            targets=(60, 70, 85), efforts=None, image_ids=None,
-                                           baseline_encoder="libjxl", baseline_effort=7):
-    """Export the additional plot and auditable saved-data report only."""
+                                           baseline_encoder="libjxl", baseline_effort=7,
+                                           consolidated=False):
+    """Export panels or their discrete target mean, each under its own name."""
     import json
 
     helper = load_calibrated_comparison_helpers()
     report = helper.analyze(helper.load_studies([libjxl_run, gjxl_run]),
                             targets=targets, efforts=efforts, image_ids=image_ids,
                             baseline_encoder=baseline_encoder, baseline_effort=baseline_effort)
-    figure = plot_calibrated_speed_size(report)
-    name = "speed-size-calibrated"
+    if consolidated:
+        report = helper.consolidate_targets(report)
+    figure = plot_calibrated_speed_size(report, consolidated=consolidated)
+    name = "speed-size-calibrated" + ("-mean" if consolidated else "")
     output_dir = pathlib.Path(output_dir).expanduser().resolve()
     save_figure(figure, output_dir, name, formats)
     (output_dir / (name + "-report.json")).write_text(
@@ -3564,6 +3586,43 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
         targets=CALIBRATED_SIZE_TARGETS, efforts=CALIBRATED_SIZE_EFFORTS,
         image_ids=CALIBRATED_SIZE_IMAGE_IDS,
         baseline_encoder=CALIBRATED_SIZE_BASELINE[0], baseline_effort=CALIBRATED_SIZE_BASELINE[1],
+    )
+
+
+# %% [markdown]
+# ### Consolidated size and speed across calibrated targets
+#
+# One marker per encoder/effort averages the three target panels above, using
+# the same common full-resolution cohort and equal weights for targets 60, 70,
+# and 85. At every image/target pair, size is normalized to libjxl e7 at that
+# target before averaging. Time is the arithmetic mean of the per-image,
+# per-target median complete calls. A logarithmic x-axis does not change this
+# arithmetic averaging. Both axes summarize exactly the same encodes.
+#
+# This is a discrete target average, **not BD-rate or a uniform integral over
+# SSIMULACRA2 60–85**. The uneven score spacing does not change the equal target
+# weights. No interpolation, quality correction, or extra measurements are used.
+# Exported target minima/maxima show quality dependence, not confidence bounds.
+# Keep the three-panel view alongside this overview to reveal cancellation.
+#
+# For a paper, report the selected 54/65-image cohort, target ±0.5 tolerance
+# (paired scores may differ by 1.0), equal weighting, and warm timing boundary.
+# Small size differences need caution; this summary neither removes residual
+# quality mismatch nor isolates GPU speedup from encoder policy differences.
+# Exports: `speed-size-calibrated-mean.png/svg`, `.csv`, and `-report.json`.
+# The report retains per-target points, per-image measurements and provenance.
+
+# %%
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and GJXL_RUN is not None
+        and (QUALITY_RUN / "metadata.json").is_file()
+        and (GJXL_RUN / "metadata.json").is_file()):
+    calibrated_speed_size_mean_figures = generate_calibrated_speed_size_figures(
+        QUALITY_RUN, GJXL_RUN, OUTPUT_DIR, SAVE_FORMATS, show=True,
+        targets=CALIBRATED_SIZE_TARGETS, efforts=CALIBRATED_SIZE_EFFORTS,
+        image_ids=CALIBRATED_SIZE_IMAGE_IDS,
+        baseline_encoder=CALIBRATED_SIZE_BASELINE[0], baseline_effort=CALIBRATED_SIZE_BASELINE[1],
+        consolidated=True,
     )
 
 

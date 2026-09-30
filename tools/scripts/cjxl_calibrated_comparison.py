@@ -164,3 +164,50 @@ def analyze(studies, *, targets=(60, 70, 85), efforts=None, image_ids=None,
             observation_source="calibrated",
         ) for item in studies], points=points, images=per_image,
     )
+
+
+def consolidate_targets(report):
+    """Average the declared discrete targets equally on the existing cohort.
+
+    This is a mean of measured relative sizes, not an integral in quality or
+    log-rate. Each baseline comparison remains at its own target. Averaging
+    target means equals averaging all image/target pairs because every point
+    uses the same complete cohort. Retain target detail to expose cancellation.
+    """
+    targets = report["targets"]
+    expected = {(source["encoder"], effort, target)
+                for source in report["sources"] for effort in report["efforts"]
+                for target in targets}
+    actual = [(p["encoder"], p["effort"], p["target"]) for p in report["points"]]
+    if not targets or set(actual) != expected or len(actual) != len(expected):
+        raise ValueError("Consolidation requires the complete declared target grid")
+    status = "ready" if report["image_count"] else "empty-cohort"
+    if any(p["image_count"] != report["image_count"] or p["status"] != status
+           for p in report["points"]):
+        raise ValueError("All target points must use the same complete cohort")
+    points = []
+    for encoder, effort in sorted({(encoder, effort) for encoder, effort, _ in expected}):
+        rows = [p for p in report["points"] if p["encoder"] == encoder and p["effort"] == effort]
+        point = dict(encoder=encoder, effort=effort, image_count=report["image_count"],
+                     target_count=len(targets), status=status)
+        if status == "ready":
+            for key in ("mean_encode_ms", "mean_size_difference_pct", "mean_score_error",
+                        "mean_paired_score_difference"):
+                point[key] = statistics.mean(p[key] for p in rows)
+            for key in ("max_abs_score_error", "max_abs_paired_score_difference"):
+                point[key] = max(p[key] for p in rows)
+            for key in ("mean_encode_ms", "mean_size_difference_pct"):
+                point["target_min_" + key] = min(p[key] for p in rows)
+                point["target_max_" + key] = max(p[key] for p in rows)
+            point["size_difference_changes_sign_across_targets"] = (
+                point["target_min_mean_size_difference_pct"] < 0
+                < point["target_max_mean_size_difference_pct"])
+        points.append(point)
+    return dict(
+        report, points=points, target_points=report["points"],
+        aggregation="Discrete equal-target arithmetic mean; no quality interpolation or integration",
+        target_weights=[dict(target=target, weight=1 / len(targets)) for target in targets],
+        rate_method="100 / (N * K) * sum_image,target(bytes / baseline_bytes_at_same_target - 1); not BD-rate",
+        timing_method="1 / (N * K) * sum_image,target(median measured complete-call milliseconds)",
+        range_interpretation="Target minima and maxima describe quality dependence, not uncertainty or confidence intervals",
+    )

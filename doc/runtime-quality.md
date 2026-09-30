@@ -116,6 +116,72 @@ figures = generate_calibrated_speed_size_figures(
 )
 ```
 
+## Consolidated calibrated size and speed
+
+**`speed-size-calibrated-mean`** adds a single-panel overview with one point per
+encoder/effort. It uses exactly the same common full-resolution cohort as the
+three-panel figure. For `N` images and `K` targets (normally 60, 70, 85), its axes
+are:
+
+```text
+x = sum_image,target(median measured encode time) / (N * K)
+y = 100 * sum_image,target(bytes / libjxl_e7_bytes_at_same_target - 1) / (N * K)
+```
+
+Each target and image receives equal weight. The ratio is taken before averaging;
+this is neither a ratio of pooled byte counts nor a geometric/logarithmic mean.
+The log time axis affects presentation only. A point is the arithmetic average
+of the three corresponding panel points. Unequal target spacing does not alter
+the weights: this summarizes **three discrete operating targets**, not a uniform
+quality interval or a presumed distribution of real workloads. There is no
+quality interpolation, integration, extrapolation, or new encoding.
+
+```python
+figures = generate_calibrated_speed_size_figures(
+    QUALITY_RUN, GJXL_RUN, OUTPUT_DIR, ("png", "svg", "pdf"), show=True,
+    targets=(60, 70, 85), baseline_encoder="libjxl", baseline_effort=7,
+    consolidated=True,
+)
+```
+
+This exports the overview under its own name, preserving the existing figures.
+Its CSV contains 20 aggregate points by default. Its JSON retains target weights,
+all target-specific points and per-image measurements, source hashes, achieved
+quality differences, and excluded images. Target minima/maxima and sign-change
+flags expose variation hidden by the mean; these ranges are not confidence
+intervals or measurement uncertainty.
+
+This is suitable as a paper overview when called **mean relative size at
+calibrated targets**, not BD-rate over 60–85. Retain the target panels in the
+paper or supplement. Disclose these limitations:
+
+- Averaging can hide target-dependent regressions and depends on the chosen
+  targets and weights. The three-panel companion exposes that dependence.
+- Calibration within ±0.5 permits paired score differences up to 1.0. Small
+  size differences may reflect this residual mismatch; averaging does not
+  correct it. The exported achieved scores support inspection.
+- The default 54/65-image common subset omits ten images with unresolved
+  calibration and one additional image with encoder-side downsampling. It
+  does not establish performance on the excluded images or full corpus.
+- Warm complete-call time excludes startup, I/O, decoding, quality scoring,
+  and calibration search. Different effort policies and CPU thread semantics
+  remain; this is an encoder comparison, not an isolated GPU acceleration result.
+
+The original fixed-sweep plot uses a different statistic, quality interval and
+cohort. Differences between the two figures are not evidence of an encoder
+performance change.
+
+Suggested caption for the default saved runs:
+
+> Mean encoding time versus mean relative encoded size at SSIMULACRA2 targets
+> 60, 70, and 85. Each point averages per-image, per-target results with equal
+> image and target weights on a common full-resolution subset of 54/65 images.
+> Size is normalized to libjxl effort 7 separately at each image and target;
+> time is the mean of five-call medians of warm complete encodes, excluding
+> calibration and I/O. Each encode is within ±0.5 of its target. Eleven images
+> are excluded for unresolved calibration or downsampling. This discrete
+> target average is not BD-rate; see the companion panels for quality dependence.
+
 ## Paper throughput table at matched nominal settings
 
 The runtime notebook's **Paper table: encoding throughput at matched nominal
