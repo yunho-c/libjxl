@@ -177,6 +177,7 @@ def load_calibrated_studies(runs):
         result.append({
             "run": str(run), "config": config, "scores": scores,
             "observation_source": "calibrated",
+            "calibration_outcomes": list(outcomes.values()),
             "scores_sha256": study.digest(run / "calibration.jsonl"),
             "timing_source": {"path": str(run / "measurements.jsonl"),
                               "sha256": study.digest(run / "measurements.jsonl")},
@@ -240,7 +241,8 @@ def _validate_studies(studies, baseline_encoder, baseline_effort, image_ids):
     return [images[name] for name in selected]
 
 
-def _curve(rows, quality_range, repetitions, grid, minimum_points=4):
+def _curve(rows, quality_range, repetitions, grid, minimum_points=4,
+           minimum_timing_samples=None):
     detail = {"sample_count": len(rows), "excluded_resampled_count": 0}
     if not rows:
         return {**detail, "status": "missing-scores"}
@@ -266,7 +268,13 @@ def _curve(rows, quality_range, repetitions, grid, minimum_points=4):
     if scores[0] > low or scores[-1] < high:
         return {**detail, "status": "missing-quality-bracket"}
     detail.update(status="ready", rate_ready=True, scores=scores, rates=rates)
-    if any(row.get("timing_sample_count") != repetitions for row in rows):
+    counts = [row.get("timing_sample_count", 0) for row in rows]
+    required = repetitions if minimum_timing_samples is None else minimum_timing_samples
+    if any(not isinstance(n, int) or n < 0 for n in counts):
+        return {**detail, "status": "incomplete-timing"}
+    detail.update(timing_sample_min=min(counts), timing_sample_max=max(counts),
+                  timing_provisional=any(n != repetitions for n in counts))
+    if any(not isinstance(n, int) or not required <= n <= repetitions for n in counts):
         return {**detail, "status": "incomplete-timing"}
     times = [row.get("elapsed_ms") for row in rows]
     if any(value is None or not math.isfinite(value) or value <= 0 for value in times):
@@ -277,7 +285,7 @@ def _curve(rows, quality_range, repetitions, grid, minimum_points=4):
 
 def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
             quality_range=(75, 85), efforts=None, image_ids=None, grid_size=101,
-            *, minimum_points=4):
+            *, minimum_points=4, minimum_timing_samples=None):
     """Return JSON-ready per-image results and fixed-cohort coverage diagnostics."""
     quality_range = _interval(quality_range)
     if minimum_points not in (2, 3, 4):
@@ -285,6 +293,10 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
     if not isinstance(grid_size, int) or grid_size < 2:
         raise ValueError("grid_size must be an integer >= 2")
     images = _validate_studies(studies, baseline_encoder, baseline_effort, image_ids)
+    if minimum_timing_samples is not None and (
+            not isinstance(minimum_timing_samples, int)
+            or not 1 <= minimum_timing_samples <= min(s["config"]["repetitions"] for s in studies)):
+        raise ValueError("minimum_timing_samples must be within the configured repetitions")
     selected_efforts = list(efforts) if efforts is not None else sorted({
         effort for item in studies for effort in item["config"]["efforts"]
     })
@@ -304,7 +316,7 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
             for effort in set(selected_efforts + [baseline_effort]):
                 curves[encoder, image["image_id"], effort] = _curve(
                     grouped[image["image_id"], effort], quality_range,
-                    item["config"]["repetitions"], grid, minimum_points,
+                    item["config"]["repetitions"], grid, minimum_points, minimum_timing_samples,
                 )
     rows = []
     for item in studies:
@@ -358,6 +370,9 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
                 abs(row["interpolation_delta_pp"]) for row in group)
         if point["status"] == "ready":
             point["mean_encode_ms"] = statistics.mean(row["mean_encode_ms"] for row in group)
+            point["timing_provisional"] = any(row["timing_provisional"] for row in group)
+            point["timing_sample_min"] = min(row["timing_sample_min"] for row in group)
+            point["timing_sample_max"] = max(row["timing_sample_max"] for row in group)
         points.append(point)
     return {
         "schema_version": 1,
@@ -370,7 +385,10 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
         "timing_boundary": "warm complete encode call; excludes startup, file I/O, decode and scoring",
         "resampling": f"only resampling=1; at least {minimum_points} monotone measured points per curve",
         "minimum_curve_points": minimum_points,
-        "timing_coverage": "all retained unresampled curve points require the configured repetitions",
+        "timing_coverage": ("all retained unresampled curve points require the configured repetitions"
+                            if minimum_timing_samples is None else
+                            f"preview: at least {minimum_timing_samples} repetitions per retained support; partial points flagged"),
+        "minimum_timing_samples": minimum_timing_samples,
         "efforts": selected_efforts,
         "sources": [{
             "run": item["run"], "encoder": study.encoder_name(item["config"]),
@@ -426,6 +444,56 @@ def analyze_same_effort(studies, quality_range=(75, 85), efforts=None, image_ids
     for key in ("points", "images"):
         report[key] = [dict(row, baseline_effort=part["baseline"]["effort"])
                        for part in reports for row in part[key] if row["encoder"] == "gjxl"]
+    return report
+
+
+def analyze_common_calibrated_cohort(studies, baseline_encoder="libjxl", baseline_effort=7,
+                                    quality_range=(75, 84.5), minimum_timing_samples=3):
+    """Use one explicitly reported image intersection across every requested effort.
+
+    This preview deliberately selects on observed coverage. It is not an estimate
+    for the excluded images. Partial timing medians are retained and flagged.
+    """
+    if any(s.get("observation_source") != "calibrated" for s in studies):
+        raise ValueError("The common-cohort preview requires calibrated studies")
+    full = analyze(studies, baseline_encoder, baseline_effort, quality_range,
+                   minimum_points=2, minimum_timing_samples=minimum_timing_samples)
+    required = {(study.encoder_name(s["config"]), e)
+                for s in studies for e in s["config"]["efforts"]}
+    lookup = {(r["image_id"], r["encoder"], r["effort"]): r for r in full["images"]}
+    images = _validate_studies(studies, baseline_encoder, baseline_effort, None)
+    failures = defaultdict(set)
+    for s in studies:
+        for row in s.get("calibration_outcomes", []):
+            if row["status"] != "matched":
+                failures[row["image_id"], study.encoder_name(s["config"]), row["effort"]].add(row["status"])
+    included, excluded = [], []
+    for image in images:
+        name = image["image_id"]
+        reasons = []
+        for encoder, effort in sorted(required):
+            row = lookup[name, encoder, effort]
+            if row["status"] != "ready":
+                reasons.append({"encoder": encoder, "effort": effort, "reason": row["status"],
+                                "collection_failures": sorted(failures[name, encoder, effort])})
+        if reasons:
+            excluded.append({"image_id": name, "resolution_class": image["resolution_class"],
+                             "reasons": reasons})
+        else:
+            included.append(name)
+    if not included:
+        raise ValueError("No common image cohort has the required quality and timing coverage")
+    report = analyze(studies, baseline_encoder, baseline_effort, quality_range,
+                     image_ids=included, minimum_points=2,
+                     minimum_timing_samples=minimum_timing_samples)
+    report["cohort_selection"] = {
+        "policy": "same image intersection across both encoders and every configured effort",
+        "selection_uses_observed_coverage": True,
+        "original_image_count": len(images), "included_image_count": len(included),
+        "included_image_ids": included, "excluded_images": excluded,
+        "efforts_by_encoder": {study.encoder_name(s["config"]): s["config"]["efforts"] for s in studies},
+        "limitation": "Trend applies to this subset; it does not estimate results for excluded images.",
+    }
     return report
 
 

@@ -111,6 +111,20 @@ class CudaAnalysisTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             analysis.verified_studies(self.root, records)
 
+    def test_encoder_comparison_skips_either_missing_study(self):
+        for missing in ("libjxl", "gjxl"):
+            with self.subTest(missing=missing):
+                roots = {name: self.root / missing / name for name in ("libjxl", "gjxl")}
+                for name, root in roots.items():
+                    if name != missing:
+                        root.mkdir(parents=True)
+                        (root / "metadata.json").write_text('{}')
+                with mock.patch.object(notebook, "load_quality_helpers") as helpers:
+                    self.assertEqual(notebook.generate_encoder_comparison(
+                        roots["libjxl"], roots["gjxl"], self.root / "plots"), {})
+                    helpers.assert_not_called()
+                self.assertFalse((self.root / "plots").exists())
+
     def test_render_comparison_ignores_svg_metadata_but_checks_png_bytes(self):
         before = dict(coverage_rows=2, figure_count=1, artifact_sha256={"plot.png":"pixels", "plot.svg":"date-one"})
         after = dict(coverage_rows=2, figure_count=1, artifact_sha256={"plot.png":"pixels", "plot.svg":"date-two"})
