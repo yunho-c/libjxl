@@ -1,3 +1,8 @@
+ignore/
+
+# Experiment results
+tools/scripts/characterization-plots/
+
 # Build output directories
 /build
 /build*
@@ -25,3 +30,9 @@ tools/scripts/__pycache__/
 
 # macOS Finder state files
 .DS_Store
+
+# Python
+*.pyc
+
+# Jupyter notebook
+*.ipynb
