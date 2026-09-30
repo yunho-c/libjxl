@@ -2851,8 +2851,10 @@ def generate_same_effort_bd_rate_table(libjxl_run, gjxl_run, output_dir, *,
     table = pd.DataFrame(rows).sort_values("effort").reset_index(drop=True)
     low, high = report["quality_range"]
     image_count = int(table["image_count"].iloc[0])
+    gjxl_label = next(source.get("display_label") or "GJXL"
+                      for source in report["sources"] if source["encoder"] == "gjxl")
     caption = (
-        f"GJXL versus libjxl at the same numbered effort; measured SSIMULACRA2 "
+        f"{gjxl_label} versus libjxl at the same numbered effort; measured SSIMULACRA2 "
         f"{low:g}–{high:g}. BD-rate integrates log(bytes) with PCHIP per image, "
         f"then averages percentages equally across the fixed {image_count}-image cohort. "
         "Negative values mean fewer bytes for GJXL. At least four monotone, "
@@ -2870,7 +2872,7 @@ def generate_same_effort_bd_rate_table(libjxl_run, gjxl_run, output_dir, *,
     formatters = {"BD-rate (%)": lambda value: f"{value:+.2f}",
                   "Sensitivity (pp)": lambda value: f"{value:.3f}"}
     preview = (
-        "<h3>GJXL versus libjxl: same-effort BD-rate</h3><p>"
+        "<h3>" + html.escape(gjxl_label) + " versus libjxl: same-effort BD-rate</h3><p>"
         + html.escape(caption) + "</p>"
         + display_table.to_html(index=False, formatters=formatters, na_rep="—", border=0)
     )

@@ -216,7 +216,11 @@ automatically downsamples there. Exact analyzed ledger hashes and build
 identities are exported. Warm timings include the complete CPU/GPU encoding
 call and synchronization, excluding startup, input preparation, file I/O and
 quality scoring. Numeric thread settings match, but libjxl workers and GJXL
-CPU participants have different semantics; GJXL additionally uses Metal.
+CPU participants have different semantics; GJXL additionally uses the recorded
+Metal or CUDA backend. Both fully-resident policies are supported. CUDA timing
+rows must explicitly match the manifest's backend and GPU AQ policy; legacy
+Metal rows without these fields remain supported. Captions and methodology
+reports retain the selected backend.
 
 This is a comparison of nominal effort presets, not equal decoded quality or
 identical algorithms. Keep rate-quality evidence alongside it. Historical
@@ -236,6 +240,42 @@ tables = generate_encoding_throughput_tables(
     min_megapixels=1.0, qualities=(30, 50, 70, 80, 90, 95), show=True,
 )
 ```
+
+### Generate both effort-wise tables on the CUDA machine
+
+Use that machine's own libjxl and GJXL/CUDA fixed sweeps. The libjxl input is
+the quality-study directory containing `scores.jsonl`; its `source_run` points
+to the local CPU fixed-sweep timings. The GJXL input is the CUDA study's `fixed`
+directory containing scores and timings. This does not use calibrated results
+or require a precomputed `speed-bd-rate-report.json`.
+
+From the repository root, with the notebook dependencies plus Jinja2 installed,
+run this command in PowerShell or a POSIX shell (substitute local paths):
+
+```sh
+python tools/scripts/cjxl_comparison_tables.py --libjxl-run C:/study/cpu-quality --gjxl-run C:/study/cuda/fixed --output-dir C:/study/comparison-tables
+```
+
+Alternatively, `uv run tools/scripts/cjxl_comparison_tables.py` with the same
+arguments installs the script's declared dependencies. Both run paths are
+required, so the command never falls back to Mac results or automatic discovery.
+Keep the output directory outside the source studies and CPU timing directory.
+The command reads saved records only; it never starts benchmark collection.
+
+It exports `encoding-throughput` CSV/HTML/LaTeX tables, supporting coverage and
+methodology files, and `bd-rate-same-effort.csv`, `.html`, `.tex`, and `-report.json`.
+The BD-rate table directly compares GJXL effort N with libjxl effort N over
+measured SSIMULACRA2 75–85, using the full manifest cohort and equal image weights.
+The throughput table defaults to images of at least 1 MP and nominal Q30–Q95.
+Their cohorts and quality semantics differ; throughput is not matched-quality
+speedup. `--efforts` selects efforts for both tables, `--min-megapixels` changes
+only the throughput cohort, and `--quality-range LOW HIGH` changes only BD-rate.
+
+Use identical reference hashes and compatible measurement protocols. Missing
+timing leaves throughput blank; incomplete rate coverage leaves BD-rate blank
+without dropping images or extrapolating. Complete rate curves can yield BD-rate
+even when timings are incomplete. Preserve manifests and ledgers unchanged;
+do not edit configuration identities or substitute old Mac measurements.
 
 ## GJXL matched-quality comparison
 

@@ -84,6 +84,9 @@ def _refresh_timings(run, config, scores):
         if not set(repetitions) <= set(range(config["repetitions"])):
             raise ValueError("Unexpected timing repetition")
         for value in values:
+            if (study.encoder_name(config) == "gjxl"
+                    and value.get("backend", "metal") != config.get("backend", "metal")):
+                raise ValueError("Timing backend does not match study manifest")
             for key in ("image_id", "effort", "distance", "encoded_bytes",
                         "output_sha256", "width", "height", "pixels"):
                 if value[key] != row[key]:
@@ -222,6 +225,9 @@ def _validate_studies(studies, baseline_encoder, baseline_effort, image_ids):
             image = images.get(row["image_id"])
             if image is None or row["effort"] not in config["efforts"]:
                 raise ValueError("Score observation is outside its study manifest")
+            if (study.encoder_name(config) == "gjxl"
+                    and row.get("backend", "metal") != config.get("backend", "metal")):
+                raise ValueError("Score backend does not match study manifest")
             if (row.get("encoder") != study.encoder_name(config)
                     or row.get("metric") != "fast-ssim2"
                     or row["reference_sha256"] != image["pfm_sha256"]
@@ -369,7 +375,10 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
         "sources": [{
             "run": item["run"], "encoder": study.encoder_name(item["config"]),
             "configuration_id": item["config"]["configuration_id"],
-            "display_label": item["config"].get("display_label"),
+            "backend": item["config"].get(
+                "backend", "metal" if study.encoder_name(item["config"]) == "gjxl" else "cpu"),
+            "display_label": item["config"].get("display_label") or (
+                "GJXL (CUDA)" if item["config"].get("backend") == "cuda" else None),
             "composite_sources": item["config"].get("composite_sources"),
             "metric_version": item["config"]["metric_version"],
             "repetitions": item["config"]["repetitions"],

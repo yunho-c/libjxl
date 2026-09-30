@@ -44,8 +44,10 @@ def _load_runs(libjxl_run, gjxl_run):
         raise ValueError("libjxl_run must select a libjxl quality-study manifest")
     if study.encoder_name(gjxl) != "gjxl" or not study.is_fixed(gjxl):
         raise ValueError("gjxl_run must select a GJXL fixed nominal-quality study")
-    if gjxl.get("backend") != "metal" or gjxl.get("metal_aq_mode") != "fully-resident":
-        raise ValueError("This table requires fully-resident Metal GJXL")
+    backend = gjxl.get("backend")
+    policy_key = {"metal": "metal_aq_mode", "cuda": "gpu_aq_mode"}.get(backend)
+    if policy_key is None or gjxl.get(policy_key) != "fully-resident":
+        raise ValueError("This table requires fully-resident Metal or CUDA GJXL")
     for key in ("num_threads", "repetitions", "warmups", "intensity_target"):
         if lib[key] != gjxl[key]:
             raise ValueError("Incompatible timing protocol: " + key)
@@ -141,6 +143,15 @@ def _tuple_rows(item, images, efforts, qualities):
                 or row.get("reference_sha256") != image["pfm_sha256"]
                 or row.get("resampling") != 1):
             raise ValueError("GJXL timing identity or resampling mismatch: " + expected_job)
+        if codec == "gjxl":
+            # Historical Metal rows predate backend fields. CUDA rows must
+            # identify their backend and policy explicitly; never relabel them.
+            backend = config.get("backend", "metal")
+            row_backend = row.get("backend", "metal")
+            policy = row.get("gpu_aq_mode", row.get("metal_aq_mode",
+                             "fully-resident" if row_backend == "metal" else None))
+            if row_backend != backend or policy != "fully-resident":
+                raise ValueError("GJXL timing backend or policy mismatch: " + expected_job)
         if row.get("resampling", 1) != 1:
             raise ValueError("Resampled timing is not eligible: " + expected_job)
         elapsed = row["elapsed_nanoseconds"]
@@ -240,12 +251,14 @@ def build_tables(libjxl_run, gjxl_run, *, min_megapixels=1.0,
         mp = sum(image["pixels"] / 1e6 for image in subset)
         weights.append({"resolution_class": resolution, "image_count": len(subset),
                         "megapixels": mp, "pixel_share": mp / total_mp})
+    backend = studies[1]["config"].get("backend", "metal")
+    backend_label = {"metal": "Metal", "cuda": "CUDA"}[backend]
     caption = (
         f"Warm encoding throughput at matched nominal distance and effort, on {len(images)} "
         f"images with at least {min_megapixels:g} MP. Rates pool original megapixels over "
         f"summed per-image median encode times ({repetitions} repetitions), then average "
         "equally across " + ", ".join(f"Q{q}" for q in qualities) + ". "
-        "GJXL uses fully-resident Metal. Speedup is GJXL/libjxl; a dash denotes incomplete "
+        f"GJXL uses fully-resident {backend_label}. Speedup is GJXL/libjxl; a dash denotes incomplete "
         "timing coverage. This compares nominal presets, not matched decoded quality."
     )
     provenance = []
@@ -253,6 +266,8 @@ def build_tables(libjxl_run, gjxl_run, *, min_megapixels=1.0,
         config = item["config"]
         provenance.append({
             "encoder": item["codec"], "run": item["run"],
+            "backend": config.get("backend", "metal" if item["codec"] == "gjxl" else "cpu"),
+            "gpu_aq_mode": config.get("gpu_aq_mode", config.get("metal_aq_mode")),
             "metadata_sha256": item["metadata_sha256"], "timing_ledger": item["ledger"],
             "revision": config.get("encoder_revision", config.get("libjxl_revision")),
             "composite_sources": config.get("composite_sources", []),
@@ -272,7 +287,8 @@ def build_tables(libjxl_run, gjxl_run, *, min_megapixels=1.0,
         "aggregation": "arithmetic mean over qualities of sum(input MP) / sum(per-image median seconds)",
         "speedup": "ratio of encoder aggregate throughputs, not mean of per-image ratios",
         "timing_boundary": "warm uninstrumented complete encode call; CPU/GPU work, transfers and synchronization included; startup, input preparation, file I/O and scoring excluded",
-        "resource_note": "Equal numeric thread settings have different participation semantics; GJXL additionally uses Metal",
+        "resource_note": "Equal numeric thread settings have different participation semantics; "
+                         f"GJXL additionally uses {backend_label}",
         "images": [{k: image[k] for k in (*study.SOURCE_FIELDS, "pixels", "pfm_sha256")}
                    for image in images],
         "resolution_weights": weights, "sources": provenance, "libjxl_host": host,
