@@ -384,6 +384,42 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
     }
 
 
+def analyze_same_effort(studies, quality_range=(75, 85), efforts=None, image_ids=None):
+    """Compare GJXL directly with libjxl at each numbered effort.
+
+    Reuse the fixed-sweep curve, identity, and cohort guards. Each effort gets
+    its own libjxl anchor before per-image percentages are averaged; differences
+    of already aggregated common-anchor BD percentages are not equivalent.
+    Rate coverage is independent of the retained timing diagnostics.
+    """
+    encoders = [study.encoder_name(item["config"]) for item in studies]
+    if sorted(encoders) != ["gjxl", "libjxl"]:
+        raise ValueError("Select exactly one libjxl and one GJXL study")
+    if any(item.get("observation_source", "fixed") != "fixed" for item in studies):
+        raise ValueError("Same-effort table requires fixed-sweep observations")
+    anchor = studies[encoders.index("libjxl")]
+    selected = list(anchor["config"]["efforts"] if efforts is None else efforts)
+    if (not selected or len(set(selected)) != len(selected)
+            or any(not isinstance(effort, int) or not 1 <= effort <= 10
+                   for effort in selected)):
+        raise ValueError("efforts must be unique integers in 1..10")
+    selected.sort()
+    reports = [analyze(studies, baseline_effort=effort, quality_range=quality_range,
+                       efforts=[effort], image_ids=image_ids) for effort in selected]
+    report = dict(reports[0])
+    report.update(
+        baseline={"encoder": "libjxl", "effort": "same as test"},
+        comparison="GJXL versus libjxl at the same numbered effort",
+        efforts=selected,
+        timing_required=False,
+        coverage_rule="BD-rate requires every image's rate curve; timing gaps do not invalidate it",
+    )
+    for key in ("points", "images"):
+        report[key] = [dict(row, baseline_effort=part["baseline"]["effort"])
+                       for part in reports for row in part[key] if row["encoder"] == "gjxl"]
+    return report
+
+
 def _encoder_build_identity(config, effort):
     """Compare the actual build selected for an effort, including composites."""
     if config.get("composite_sources"):

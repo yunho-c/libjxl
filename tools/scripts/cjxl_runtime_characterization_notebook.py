@@ -23,6 +23,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#   "jinja2>=3.1,<4",
 #   "matplotlib>=3.8,<4",
 #   "numpy>=1.26,<3",
 #   "pandas>=2.2,<3",
@@ -2820,6 +2821,79 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
 
 
 # %%
+def generate_same_effort_bd_rate_table(libjxl_run, gjxl_run, output_dir, *,
+                                      quality_range=(75, 85), efforts=None,
+                                      image_ids=None, show=False):
+    """Export a rate-only same-effort comparison from validated saved curves."""
+    import html
+    import json
+
+    helper = load_bd_rate_helpers()
+    report = helper.analyze_same_effort(
+        helper.load_studies([libjxl_run, gjxl_run]),
+        quality_range=quality_range, efforts=efforts, image_ids=image_ids,
+    )
+    rows = []
+    for point in report["points"]:
+        if point["scope"] != "all":
+            continue
+        complete = point["rate_ready_count"] == point["image_count"]
+        rows.append({
+            "effort": point["effort"],
+            "bd_rate_percent": point.get("bd_rate_pchip"),
+            "interpolation_sensitivity_pp": abs(point["interpolation_delta_pp"])
+            if complete else None,
+            "rate_ready_count": point["rate_ready_count"],
+            "image_count": point["image_count"],
+            "status": "complete" if complete else "missing-rate-coverage",
+        })
+    table = pd.DataFrame(rows).sort_values("effort").reset_index(drop=True)
+    low, high = report["quality_range"]
+    image_count = int(table["image_count"].iloc[0])
+    caption = (
+        f"GJXL versus libjxl at the same numbered effort; measured SSIMULACRA2 "
+        f"{low:g}–{high:g}. BD-rate integrates log(bytes) with PCHIP per image, "
+        f"then averages percentages equally across the fixed {image_count}-image cohort. "
+        "Negative values mean fewer bytes for GJXL. At least four monotone, "
+        "unresampled measured points must bracket the interval; no extrapolation. "
+        "The absolute PCHIP–Akima difference is interpolation sensitivity, not an "
+        "error bound or confidence interval. Images shows valid/selected pairs. "
+        "Incomplete rate coverage leaves BD-rate blank; incomplete timing does not."
+    )
+    display_table = pd.DataFrame({
+        "Effort": table["effort"],
+        "BD-rate (%)": table["bd_rate_percent"],
+        "Sensitivity (pp)": table["interpolation_sensitivity_pp"],
+        "Images": table["rate_ready_count"].astype(str) + "/" + table["image_count"].astype(str),
+    })
+    formatters = {"BD-rate (%)": lambda value: f"{value:+.2f}",
+                  "Sensitivity (pp)": lambda value: f"{value:.3f}"}
+    preview = (
+        "<h3>GJXL versus libjxl: same-effort BD-rate</h3><p>"
+        + html.escape(caption) + "</p>"
+        + display_table.to_html(index=False, formatters=formatters, na_rep="—", border=0)
+    )
+    output = pathlib.Path(output_dir).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    prefix = "bd-rate-same-effort"
+    report["caption"] = caption
+    table.to_csv(output / (prefix + ".csv"), index=False)
+    display_table.to_latex(
+        output / (prefix + ".tex"), index=False, formatters=formatters,
+        na_rep="--", escape=True, caption=caption, label="tab:bd-rate-same-effort",
+    )
+    (output / (prefix + ".html")).write_text(preview)
+    (output / (prefix + "-report.json")).write_text(
+        json.dumps(report, indent=2, allow_nan=False) + "\n")
+    if show:
+        from IPython.display import HTML, display
+
+        display(HTML(preview))
+        print("Saved bd-rate-same-effort.csv, .tex, .html and -report.json in", output)
+    return {"table": table, "report": report, "html": preview}
+
+
+# %%
 def plot_bd_rate_source_comparison(comparison, by_resolution=False):
     """Overlay independently computed fixed/calibrated estimates without re-cohorting."""
     reports = comparison["reports"]
@@ -3623,6 +3697,44 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
         image_ids=CALIBRATED_SIZE_IMAGE_IDS,
         baseline_encoder=CALIBRATED_SIZE_BASELINE[0], baseline_effort=CALIBRATED_SIZE_BASELINE[1],
         consolidated=True,
+    )
+
+
+# %% [markdown]
+# ### Paper table: GJXL versus libjxl at the same effort
+#
+# Each row compares GJXL directly with libjxl at that numbered effort, using
+# measured SSIMULACRA2 over `BD_RATE_QUALITY_RANGE` (default 75–85). This table
+# does not use the plot's common `BD_RATE_BASELINE` (libjxl e7) or subtract its
+# aggregate percentages. Negative BD-rate means fewer bytes for GJXL.
+#
+# The table uses `QUALITY_RUN`, `BD_RATE_COMPARE_RUN`, `BD_RATE_EFFORTS`, and
+# `BD_RATE_IMAGE_IDS`. By default all 65 manifest images receive equal weight,
+# including Kodak and 48 MP images; this is independent of the throughput
+# table's resolution filter and the separate batch study's 48 MP exclusion.
+# Each image contributes a directly computed PCHIP BD-rate percentage. At least
+# four monotone, unresampled points must bracket the quality interval in both
+# encoders. Missing rate curves leave an effort blank without shrinking its
+# cohort. Timing completeness is irrelevant to this rate-only table.
+#
+# Sensitivity is the absolute difference between pooled PCHIP and Akima values
+# in percentage points, not a confidence interval or interpolation-error bound.
+# The report retains both methods, per-image results, coverage, and source
+# identities. The selected saved GJXL revision can differ from the historical
+# batch run; this table does not imply that their source builds are identical.
+# Only saved data is read; no encoding, scoring, or calibration is launched.
+#
+# Exports: `bd-rate-same-effort.csv`, `.tex`, `.html`, and `-report.json`.
+
+# %%
+if (__name__ == "__main__" and "ipykernel" in sys.modules
+        and BD_RATE_COMPARE_RUN is not None
+        and (QUALITY_RUN / "metadata.json").is_file()
+        and (BD_RATE_COMPARE_RUN / "metadata.json").is_file()):
+    same_effort_bd_rate_table = generate_same_effort_bd_rate_table(
+        QUALITY_RUN, BD_RATE_COMPARE_RUN, OUTPUT_DIR, show=True,
+        quality_range=BD_RATE_QUALITY_RANGE, efforts=BD_RATE_EFFORTS,
+        image_ids=BD_RATE_IMAGE_IDS,
     )
 
 
