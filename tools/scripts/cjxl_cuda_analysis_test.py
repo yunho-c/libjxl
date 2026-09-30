@@ -90,6 +90,10 @@ class CudaAnalysisTest(unittest.TestCase):
             os.utime(path, (stamp, stamp))
         (self.root / "gjxl-cuda-study-uninitialized").mkdir()
         self.assertEqual(notebook.discover_cuda_study(self.root), newer)
+        (newer / "ARCHIVED.md").write_text("Wrong corpus; retained as historical evidence.")
+        self.assertEqual(notebook.discover_cuda_study(self.root), older)
+        (older / "ARCHIVED.md").write_text("Archived")
+        self.assertEqual(notebook.discover_cuda_study(self.root), self.root / "gjxl-cuda-study")
 
     def test_percent_conversion_retains_upstream_cells(self):
         cells = analysis.notebook_cells("# %%\nx = 1\n# %% [markdown]\n# Text\n# %%\ny = 2\n")

@@ -619,6 +619,8 @@ def load_or_create_metadata(args, corpus_value, tools):
         "thread_count": args.num_threads,
         "warmups_per_process": args.warmups,
         "timing_repetitions": args.repetitions,
+        "timing_output_verification": "per-process-sha256-and-retained-raw-v1",
+        "warmup_check": warmup_configuration(args),
         "stage_samples_per_process": args.stage_samples,
         "stage_warmups_per_process": args.stage_warmups,
         "samply_rate_hz": args.samply_rate,
@@ -714,13 +716,201 @@ def benchmark_command(binary, image, raw, quality, effort, threads, warmups, sam
     ]
 
 
+def validate_raw_timing(document, row):
+    expected = {
+        "schema_version": 1, "encoder": "libjxl", "stage_profile_enabled": False,
+        "timing_semantics": "complete-encode-wall-time",
+        "input_layout": "interleaved-linear-srgb-f32",
+        "input_width": row["width"], "input_height": row["height"],
+        "thread_count": row["thread_count"], "effort": row["effort"],
+        "validation_encodes": 1, "warmups": row["warmups"], "sample_count": 1,
+    }
+    if any(document.get(key) != value for key, value in expected.items()):
+        raise StudyError("Unexpected timing harness configuration")
+    if (not document.get("revision")
+            or not math.isclose(document.get("requested_distance", -1),
+                                row["distance"], rel_tol=2e-7)
+            or len(document.get("samples", [])) != 1):
+        raise StudyError("Unexpected timing harness distance/revision/samples")
+    sample = document["samples"][0]
+    if (sample.get("sample_index") != 0
+            or any(type(sample.get(key)) is not int or sample[key] <= 0
+                   for key in ("elapsed_nanoseconds", "encoded_bytes"))):
+        raise StudyError("Invalid raw timing sample")
+    return sample
+
+
+def measured_encode(args, image, benchmark, quality, effort, warmups,
+                    sample_id, retained_output, category):
+    """Keep raw evidence even on failure; hash the actual fresh-process output."""
+    root = args.output / "raw" / category
+    root.mkdir(parents=True, exist_ok=True)
+    token = hashlib.sha256(sample_id.encode()).hexdigest()[:24]
+    attempt = pathlib.Path(tempfile.mkdtemp(prefix=token + "-", dir=root))
+    raw, output = attempt / "raw.json", attempt / "output.jxl"
+    row = {
+        "sample_id": sample_id, "image_id": image.image_id,
+        "width": image.width, "height": image.height,
+        "distance": quality_to_distance(quality), "effort": effort,
+        "thread_count": args.num_threads, "warmups": warmups,
+    }
+    command = benchmark_command(benchmark, image, raw, quality, effort,
+                                args.num_threads, warmups, 1)
+    command.extend(("--output", str(output)))
+    atomic_json(attempt / "request.json", {**row, "command": command})
+    try:
+        run_command(command, capture=False)
+        document = json.loads(raw.read_text(encoding="utf-8"))
+        sample = validate_raw_timing(document, row)
+        if output.stat().st_size != sample["encoded_bytes"]:
+            raise StudyError("Measured output size differs from raw timing report")
+        output_hash = sha256_file(output)
+        if retained_output.exists():
+            if sha256_file(retained_output) != output_hash:
+                raise StudyError("Codestream changed across timing samples: " + sample_id)
+            output.unlink()
+        else:
+            retained_output.parent.mkdir(parents=True, exist_ok=True)
+            output.replace(retained_output)
+        return {
+            **row, **{key: sample[key] for key in ("elapsed_nanoseconds", "encoded_bytes")},
+            "output_path": str(retained_output.resolve()), "output_sha256": output_hash,
+            "raw_path": str(raw.resolve()), "raw_sha256": sha256_file(raw),
+            "harness_revision": document["revision"],
+        }
+    except Exception as error:
+        atomic_json(attempt / "failure.json", {**row, "error": str(error)})
+        raise
+
+
+def verify_timing_records(records):
+    """Reject duplicate IDs, modified artifacts, and unverified legacy records."""
+    seen, hashes = set(), {}
+    checked_outputs = set()
+    for row in records:
+        if row["sample_id"] in seen:
+            raise StudyError("Duplicate timing sample: " + row["sample_id"])
+        seen.add(row["sample_id"])
+        if not all(key in row for key in ("raw_path", "raw_sha256", "warmups")):
+            raise StudyError("Unverified legacy timing record; use a new run directory")
+        for path_key, hash_key in (("raw_path", "raw_sha256"), ("output_path", "output_sha256")):
+            identity = (row[path_key], row[hash_key])
+            if path_key == "output_path" and identity in checked_outputs:
+                continue
+            path = pathlib.Path(row[path_key])
+            if not path.is_file() or sha256_file(path) != row[hash_key]:
+                raise StudyError("Timing artifact hash mismatch: " + str(path))
+            if path_key == "output_path":
+                checked_outputs.add(identity)
+        document = json.loads(pathlib.Path(row["raw_path"]).read_text(encoding="utf-8"))
+        sample = validate_raw_timing(document, row)
+        if (document["revision"] != row["harness_revision"]
+                or any(sample[key] != row[key] for key in ("elapsed_nanoseconds", "encoded_bytes"))
+                or pathlib.Path(row["output_path"]).stat().st_size != row["encoded_bytes"]):
+            raise StudyError("Raw timing/ledger mismatch: " + row["sample_id"])
+        key = row.get("job_id", (row["image_id"], row["effort"], row["distance"]))
+        if hashes.setdefault(key, row["output_sha256"]) != row["output_sha256"]:
+            raise StudyError("Timing outputs disagree: " + row["sample_id"])
+
+
+def warmup_configuration(args):
+    return {
+        "enabled": args.check_warmups,
+        "policy": args.warmup_policy,
+        "threshold_percent": args.warmup_threshold_percent,
+        "max_retries": args.warmup_max_retries,
+        "pairs": 5, "quality": 80,
+        "warmups": [args.warmups, args.warmups + 2],
+        "sentinels": "smallest/largest corpus images; lowest/highest requested efforts",
+    }
+
+
+def command_warmup_check(args, images, benchmark, budget):
+    """Resumable counterbalanced checks, separate from measured sweep samples."""
+    config = warmup_configuration(args)
+    if not config["enabled"]:
+        return True
+    folder = args.output / "warmup-check"
+    folder.mkdir(parents=True, exist_ok=True)
+    ledger_path = folder / "samples.jsonl"
+    records = read_jsonl(ledger_path)
+    verify_timing_records(records)
+    done = {row["sample_id"] for row in records}
+    ordered = sorted(images, key=lambda image: (image.pixels, image.image_id))
+    sentinels = {image.image_id: image for image in (ordered[0], ordered[-1])}
+    efforts = sorted({min(args.efforts), max(args.efforts)})
+    attempts = []
+    limit = 1 + (config["max_retries"] if config["policy"] == "retry" else 0)
+    for attempt in range(limit):
+        for pair in range(config["pairs"]):
+            warmup_order = config["warmups"] if pair % 2 == 0 else config["warmups"][::-1]
+            for image in sentinels.values():
+                for effort in efforts:
+                    for warmups in warmup_order:
+                        sample_id = (f"warmup|attempt={attempt}|{image.image_id}|effort={effort}"
+                                     f"|pair={pair}|warmups={warmups}")
+                        if sample_id in done:
+                            continue
+                        if budget.exhausted:
+                            return False
+                        print(sample_id, flush=True)
+                        retained = output_path(folder, image, config["quality"], effort)
+                        row = measured_encode(args, image, benchmark, config["quality"], effort,
+                                              warmups, sample_id, retained, "warmup-check")
+                        row.update(attempt=attempt, pair=pair, recorded_at=utc_now())
+                        append_jsonl(ledger_path, row)
+                        records.append(row)
+                        done.add(sample_id)
+                        budget.completed_one()
+        results = []
+        for image in sentinels.values():
+            for effort in efforts:
+                selected = [r for r in records if r["attempt"] == attempt
+                            and r["image_id"] == image.image_id and r["effort"] == effort]
+                medians = {w: statistics.median(r["elapsed_nanoseconds"] / 1e6
+                                                for r in selected if r["warmups"] == w)
+                           for w in config["warmups"]}
+                baseline, extra = config["warmups"]
+                change = 100 * (medians[extra] / medians[baseline] - 1)
+                pairs = {(r["pair"], r["warmups"]): r["elapsed_nanoseconds"] for r in selected}
+                paired_changes = [100 * (pairs[p, extra] / pairs[p, baseline] - 1)
+                                  for p in range(config["pairs"])]
+                results.append({
+                    "image_id": image.image_id, "effort": effort,
+                    "median_ms_by_warmups": medians, "change_percent": change,
+                    "paired_changes_percent": paired_changes,
+                    "median_paired_change_percent": statistics.median(paired_changes),
+                    "needs_review": abs(change) > config["threshold_percent"],
+                })
+        flagged = any(row["needs_review"] for row in results)
+        outcome = {"attempt": attempt, "results": results, "needs_review": flagged}
+        attempts.append(outcome)
+        atomic_json(folder / f"attempt-{attempt}.json", outcome)
+        proceed = not flagged or config["policy"] == "continue"
+        retry = flagged and config["policy"] == "retry" and attempt + 1 < limit
+        atomic_json(folder / "summary.json", {
+            "configuration": config, "attempts": attempts,
+            "needs_review": any(item["needs_review"] for item in attempts),
+            "latest_needs_review": flagged, "proceed": proceed,
+            "action": "continue" if proceed else "retry" if retry else "error",
+            "interpretation": "Diagnostic samples excluded from sweep; all original flags retained.",
+        })
+        if flagged:
+            print(f"WARNING: CPU warmup sensitivity exceeds {config['threshold_percent']:g}% "
+                  f"on attempt {attempt + 1}; policy={config['policy']}. "
+                  f"See {folder / 'summary.json'}", file=sys.stderr, flush=True)
+        if proceed:
+            return True
+        if not retry:
+            raise StudyError("CPU warmup sensitivity check failed; diagnostic evidence retained")
+    return True
+
+
 def command_timing(args, images, benchmark, efforts, budget):
     records_path = args.output / "timings.jsonl"
     existing_records = read_jsonl(records_path)
+    verify_timing_records(existing_records)
     done = {record["sample_id"] for record in existing_records}
-    output_hashes = {}
-    for record in existing_records:
-        output_hashes.setdefault(record["job_id"], record["output_sha256"])
     for repetition in range(args.repetitions):
         jobs = shuffled_tuple_jobs(
             images,
@@ -738,79 +928,47 @@ def command_timing(args, images, benchmark, efforts, budget):
             if budget.exhausted:
                 return False
             final_output = output_path(args.output, image, quality, effort)
-            final_output.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix="cjxl-timing-") as temporary:
-                temporary = pathlib.Path(temporary)
-                raw = temporary / "raw.json"
-                staged_output = temporary / "output.jxl"
-                command = benchmark_command(
-                    benchmark,
-                    image,
-                    raw,
-                    quality,
-                    effort,
-                    args.num_threads,
-                    args.warmups,
-                    1,
-                )
-                if repetition == 0:
-                    command.extend(("--output", str(staged_output)))
-                print("timing %s" % sample_id, flush=True)
-                run_command(command, capture=False)
-                document = json.loads(raw.read_text(encoding="utf-8"))
-                if len(document["samples"]) != 1:
-                    raise StudyError("Timing harness did not emit exactly one sample")
-                if repetition == 0:
-                    staged_output.replace(final_output)
-                if not final_output.is_file():
-                    raise StudyError("Final codestream is missing: %s" % final_output)
-                identifier = job_id(image, quality, effort)
-                output_hash = output_hashes.get(identifier)
-                if output_hash is None:
-                    output_hash = sha256_file(final_output)
-                    output_hashes[identifier] = output_hash
-                record = {
-                    "schema_version": SCHEMA_VERSION,
-                    "recorded_at": utc_now(),
-                    "sample_id": sample_id,
-                    "job_id": identifier,
-                    "repetition": repetition,
-                    "schedule_position": position,
-                    "schedule_position_scope": (
-                        "effort_repetition"
+            print("timing %s" % sample_id, flush=True)
+            measured = measured_encode(args, image, benchmark, quality, effort,
+                                       args.warmups, sample_id, final_output, "timing")
+            record = {
+                **measured,
+                "schema_version": SCHEMA_VERSION,
+                "recorded_at": utc_now(),
+                "sample_id": sample_id,
+                "job_id": job_id(image, quality, effort),
+                "repetition": repetition,
+                "schedule_position": position,
+                "schedule_position_scope": (
+                    "effort_repetition"
+                    if args.schedule == SCHEDULE_EFFORT_MAJOR
+                    else "repetition"
+                ),
+                "schedule_policy": args.schedule,
+                "schedule_seed": phase_shuffle_seed(
+                    args.shuffle_seed,
+                    "timing",
+                    repetition,
+                    (
+                        effort
                         if args.schedule == SCHEDULE_EFFORT_MAJOR
-                        else "repetition"
+                        else None
                     ),
-                    "schedule_policy": args.schedule,
-                    "schedule_seed": phase_shuffle_seed(
-                        args.shuffle_seed,
-                        "timing",
-                        repetition,
-                        (
-                            effort
-                            if args.schedule == SCHEDULE_EFFORT_MAJOR
-                            else None
-                        ),
-                    ),
-                    "image_id": image.image_id,
-                    "corpus": image.corpus,
-                    "resolution_class": image.resolution_class,
-                    "width": image.width,
-                    "height": image.height,
-                    "pixels": image.pixels,
-                    "quality": quality,
-                    "distance": quality_to_distance(quality),
-                    "effort": effort,
-                    "thread_count": args.num_threads,
-                    "elapsed_nanoseconds": document["samples"][0]["elapsed_nanoseconds"],
-                    "encoded_bytes": document["samples"][0]["encoded_bytes"],
-                    "output_path": str(final_output.resolve()),
-                    "output_sha256": output_hash,
-                    "harness_revision": document["revision"],
-                }
-                append_jsonl(records_path, record)
-                done.add(sample_id)
-                budget.completed_one()
+                ),
+                "image_id": image.image_id,
+                "corpus": image.corpus,
+                "resolution_class": image.resolution_class,
+                "width": image.width,
+                "height": image.height,
+                "pixels": image.pixels,
+                "quality": quality,
+                "distance": quality_to_distance(quality),
+                "effort": effort,
+                "thread_count": args.num_threads,
+            }
+            append_jsonl(records_path, record)
+            done.add(sample_id)
+            budget.completed_one()
     return True
 
 
@@ -1129,7 +1287,8 @@ def command_run(args):
     corpus_value, all_images = load_corpus(args.corpus)
     images = filtered_images(all_images, args.image_filter)
     ordinary = require_executable(args.benchmark, "ordinary benchmark")
-    stage = require_executable(args.stage_benchmark, "stage benchmark")
+    stage = (require_executable(args.stage_benchmark, "stage benchmark")
+             if args.stage_benchmark else None)
     if getattr(args, "wall_profile_version", 0):
         if args.stage_build_manifest is None:
             raise StudyError("Expanded wall profiling requires --stage-build-manifest")
@@ -1141,16 +1300,20 @@ def command_run(args):
         for name, identity in manifest["files"].items():
             if sha256_file(pathlib.Path(identity["path"])) != identity["sha256"]:
                 raise StudyError("Frozen stage build file changed: %s" % name)
-    cjxl = require_executable(args.cjxl, "cjxl")
-    samply = require_executable(args.samply, "Samply")
+    cjxl = require_executable(args.cjxl, "cjxl") if args.cjxl else None
+    samply = (require_executable(args.samply, "Samply")
+              if args.samply and (args.phase in ("all", "profiles") or args.cjxl) else None)
     tools = {
         "ordinary_benchmark": file_identity(ordinary),
-        "stage_benchmark": file_identity(stage),
-        "cjxl": file_identity(cjxl),
-        "samply": file_identity(samply),
+        "stage_benchmark": file_identity(stage) if stage else None,
+        "cjxl": file_identity(cjxl) if cjxl else None,
+        "samply": file_identity(samply) if samply else None,
     }
     load_or_create_metadata(args, corpus_value, tools)
     record_execution_invocation(args, len(images))
+    if args.phase in ("all", "timing"):
+        if not command_warmup_check(args, all_images, ordinary, JobBudget(args.max_jobs)):
+            return
     budgets = {
         selected_phase: JobBudget(args.max_jobs)
         for selected_phase in ("timing", "stages", "profiles")
@@ -1417,6 +1580,10 @@ def command_verify(args):
     )
     reference_run = pathlib.Path(configuration.get("reference_run", run))
     timing_records = read_jsonl(reference_run / "timings.jsonl")
+    timing_configuration = json.loads(
+        (reference_run / "metadata.json").read_text(encoding="utf-8"))["configuration"]
+    if timing_configuration.get("timing_output_verification"):
+        verify_timing_records(timing_records)
     stage_records = read_jsonl(run / "stage-profiles.jsonl")
     by_sample = {record["sample_id"]: record for record in timing_records}
     stages = {record["job_id"]: record for record in stage_records}
@@ -1439,11 +1606,11 @@ def command_verify(args):
         elif samples[0] and sha256_file(output) != samples[0]["output_sha256"]:
             errors.append("output hash mismatch: %s" % output)
         stage = stages.get(identifier)
-        if stage is None:
+        if stage is None and configuration["tools"].get("stage_benchmark"):
             errors.append("missing stage profile: %s" % identifier)
-        elif not stage.get("output_matches_uninstrumented"):
+        elif stage is not None and not stage.get("output_matches_uninstrumented"):
             errors.append("stage output mismatch: %s" % identifier)
-        elif output.is_file() and sha256_file(output) != stage["output_sha256"]:
+        elif stage is not None and output.is_file() and sha256_file(output) != stage["output_sha256"]:
             errors.append("stage output hash mismatch: %s" % identifier)
         if stage is not None and configuration.get("wall_profile_version"):
             for sample in stage["samples"]:
@@ -1486,8 +1653,8 @@ def add_run_arguments(parser):
     parser.add_argument("--corpus", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--benchmark", required=True)
-    parser.add_argument("--stage-benchmark", required=True)
-    parser.add_argument("--cjxl", required=True)
+    parser.add_argument("--stage-benchmark", help="required for stages/all")
+    parser.add_argument("--cjxl", help="required for profiles/all")
     parser.add_argument("--samply", default="samply")
     parser.add_argument("--ordinary-build-manifest", type=pathlib.Path)
     parser.add_argument("--stage-build-manifest", type=pathlib.Path)
@@ -1501,6 +1668,13 @@ def add_run_arguments(parser):
     parser.add_argument("--efforts", default="1-10")
     parser.add_argument("--num-threads", type=int, default=8)
     parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--check-warmups", action=argparse.BooleanOptionalAction, default=True,
+                        help="run a separate resumable CPU warmup diagnostic before timing")
+    parser.add_argument("--warmup-policy", choices=("continue", "retry", "error"), default="continue",
+                        help="on sensitivity: flag and continue (default), bounded retry, or error")
+    parser.add_argument("--warmup-threshold-percent", type=float, default=5.0)
+    parser.add_argument("--warmup-max-retries", type=int, default=1,
+                        help="additional diagnostic attempts for retry policy; then error")
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--stage-warmups", type=int, default=1)
     parser.add_argument("--stage-samples", type=int, default=3)
@@ -1565,6 +1739,14 @@ def parse_args(argv):
                 parser.error("--%s has an invalid value" % name.replace("_", "-"))
         if args.max_jobs is not None and args.max_jobs < 1:
             parser.error("--max-jobs must be positive")
+        if not math.isfinite(args.warmup_threshold_percent) or args.warmup_threshold_percent <= 0:
+            parser.error("--warmup-threshold-percent must be finite and positive")
+        if args.warmup_max_retries < 0:
+            parser.error("--warmup-max-retries must be nonnegative")
+        if args.phase in ("all", "stages") and not args.stage_benchmark:
+            parser.error("--stage-benchmark is required for stages/all")
+        if args.phase in ("all", "profiles") and not args.cjxl:
+            parser.error("--cjxl is required for profiles/all")
     return args
 
 
