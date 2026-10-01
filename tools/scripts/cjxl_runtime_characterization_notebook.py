@@ -576,7 +576,7 @@ def configure_style():
     matplotlib.rcParams.update(
         {
             "figure.dpi": 120,
-            "savefig.dpi": 180,
+            "savefig.dpi": 360,
             "font.size": 10,
             "axes.titleweight": "bold",
             "axes.spines.top": False,
@@ -2721,6 +2721,8 @@ def plot_bd_rate(report, by_resolution=False, *, show_headers=False,
 def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
                         show_missing_data=False, show_effort_links=False, show_legend=False):
     """Draw complete fixed-cohort points, preserving effort order and omissions."""
+    from matplotlib.ticker import LogLocator, NullFormatter
+
     points = report["points"]
     low, high = report["quality_range"]
     panel_width, panel_height = 3.4, 2.8
@@ -2849,9 +2851,15 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
                  ylabel=f"BD-rate vs. {baseline['encoder']} e{baseline['effort']} (%)")
         axis.margins(x=0.2, y=0.28)
         axis.minorticks_off()
+        axis.xaxis.set_minor_locator(LogLocator(base=10, subs=range(2, 10)))
+        axis.xaxis.set_minor_formatter(NullFormatter())
         axis.tick_params(axis="both", which="major", length=3, width=0.7)
+        axis.tick_params(axis="x", which="minor", bottom=True, top=False,
+                         length=2, width=0.5)
         axis.set_axisbelow(True)
         axis.grid(axis="y", color="0.88", linewidth=0.5)
+        axis.grid(axis="x", which="major", color="0.88", linewidth=0.5)
+        axis.grid(axis="x", which="minor", color="0.93", linewidth=0.4)
         if not any(point["status"] == "ready" for point in group):
             axis.set(xlim=(1, 10), ylim=(-1, 1))
             axis.text(0.5, 0.5, "No complete points\nfor this interval and cohort",
