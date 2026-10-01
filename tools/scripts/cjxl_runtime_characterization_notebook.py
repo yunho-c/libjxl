@@ -54,6 +54,7 @@
 
 # %%
 import argparse
+import json
 import math
 import os
 import pathlib
@@ -189,6 +190,12 @@ BD_RATE_BASELINE = ("libjxl", 7)
 BD_RATE_EFFORTS = None  # None reads every configured effort; incomplete points are omitted.
 BD_RATE_IMAGE_IDS = None  # None preserves the baseline study's full image cohort.
 BD_RATE_COMPARE_RUN = GJXL_FIXED_RUN  # Set to None for libjxl only.
+# Rate-only table inputs can differ from the speed/BD-rate plot inputs.
+BD_RATE_TABLE_RUN = QUALITY_RUN
+BD_RATE_TABLE_COMPARE_RUN = BD_RATE_COMPARE_RUN
+BD_RATE_TABLE_EFFORTS = BD_RATE_EFFORTS
+BD_RATE_TABLE_IMAGE_IDS = BD_RATE_IMAGE_IDS
+BD_RATE_TABLE_DECODER_COMPATIBILITY = None  # Optional documented, study-scoped assumption JSON.
 # Presentation controls for both saved figures and their inline previews.
 BD_RATE_SHOW_HEADERS = False
 BD_RATE_SHOW_MISSING_DATA = False
@@ -291,6 +298,22 @@ if LOCAL_WINDOWS_INSPECTION:
     GJXL_FIXED_RUN = pathlib.Path(os.environ.get("CJXL_GJXL_FIXED_RUN", CUDA_FIXED_RUN)).expanduser()
     GJXL_RUN = pathlib.Path(os.environ.get("CJXL_GJXL_RUN", CUDA_RUN)).expanduser()
     BD_RATE_COMPARE_RUN = None
+    BD_RATE_TABLE_RUN = pathlib.Path(os.environ.get(
+        "CJXL_BD_RATE_TABLE_RUN",
+        _cuda_workspace / "libjxl-cpu-quality-review-2026-09-27/scores",
+    )).expanduser()
+    BD_RATE_TABLE_DECODER_COMPATIBILITY = pathlib.Path(os.environ.get(
+        "CJXL_BD_RATE_TABLE_DECODER_COMPATIBILITY",
+        _cuda_workspace / "libjxl-decoder-compatibility-2026-09-30/accepted-compatibility.json",
+    )).expanduser()
+    BD_RATE_TABLE_COMPARE_RUN = (pathlib.Path(os.environ.get(
+        "CJXL_BD_RATE_TABLE_COMPARE_RUN", CUDA_FIXED_RUN,
+    )).expanduser() if BD_RATE_TABLE_DECODER_COMPATIBILITY.is_file() else None)
+    BD_RATE_TABLE_EFFORTS = tuple(range(1, 9))  # Retained CPU fixed scores cover E1–E8.
+    if (BD_RATE_TABLE_RUN / "metadata.json").is_file():
+        BD_RATE_TABLE_IMAGE_IDS = [image["image_id"] for image in
+            json.loads((BD_RATE_TABLE_RUN / "metadata.json").read_text())["images"]
+            if image["resolution_class"] != "48mp"]  # Same 62 images for every row and encoder.
     THROUGHPUT_LIBJXL_RUN = QUALITY_RUN
     THROUGHPUT_GJXL_RUN = None
     DEBUG_BD_RATE_SOURCE_COMPARISON = False
@@ -318,7 +341,7 @@ if LOCAL_WINDOWS_INSPECTION:
     print(f"CUDA fixed results: {GJXL_FIXED_RUN}")
     if (CUDA_STUDY_ROOT / "ARCHIVED.md").is_file():
         print("CUDA study archived: noncanonical corpus.")
-    print("Fixed-sweep BD-rate awaits CPU scores from the current pinned decoder.")
+    print(f"Same-effort fixed-sweep BD-rate input: {BD_RATE_TABLE_RUN}")
     print(f"Calibrated BD-rate preview input: {CALIBRATED_BD_RATE_RUN}")
     print(f"Plot exports: {OUTPUT_DIR}")
 
@@ -2963,16 +2986,28 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
 # %%
 def generate_same_effort_bd_rate_table(libjxl_run, gjxl_run, output_dir, *,
                                       quality_range=(75, 85), efforts=None,
-                                      image_ids=None, show=False):
+                                      image_ids=None, decoder_compatibility=None, show=False):
     """Export a rate-only same-effort comparison from validated saved curves."""
     import html
     import json
 
     helper = load_bd_rate_helpers()
+    studies = helper.load_studies([libjxl_run, gjxl_run])
     report = helper.analyze_same_effort(
-        helper.load_studies([libjxl_run, gjxl_run]),
-        quality_range=quality_range, efforts=efforts, image_ids=image_ids,
+        studies, quality_range=quality_range, efforts=efforts, image_ids=image_ids,
+        decoder_compatibility=decoder_compatibility,
     )
+    cohort = next(point["cohort"] for point in report["points"] if point["scope"] == "all")
+    manifest = studies[0]["config"]["images"]
+    report["cohort_selection"] = {
+        "mode": "explicit-image-selection" if image_ids is not None else "full-manifest",
+        "manifest_image_count": len(manifest), "included_image_ids": cohort,
+        "included_image_count": len(cohort),
+        "excluded_images": [{"image_id": image["image_id"],
+                             "resolution_class": image["resolution_class"],
+                             "reason": "outside-selected-cohort"}
+                            for image in manifest if image["image_id"] not in cohort],
+    }
     rows = []
     for point in report["points"]:
         if point["scope"] != "all":
@@ -3002,6 +3037,9 @@ def generate_same_effort_bd_rate_table(libjxl_run, gjxl_run, output_dir, *,
         "error bound or confidence interval. Images shows valid/selected pairs. "
         "Incomplete rate coverage leaves BD-rate blank; incomplete timing does not."
     )
+    if report["decoder_compatibility"] is not None:
+        caption += (" Decoder-build equivalence is an explicit assumption supported by "
+                    "the source comparison and sampled pixel checks documented in the report.")
     display_table = pd.DataFrame({
         "Effort": table["effort"],
         "BD-rate (%)": table["bd_rate_percent"],
@@ -4003,8 +4041,10 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
 # does not use the plot's common `BD_RATE_BASELINE` (libjxl e7) or subtract its
 # aggregate percentages. Negative BD-rate means fewer bytes for GJXL.
 #
-# The table uses `QUALITY_RUN`, `BD_RATE_COMPARE_RUN`, `BD_RATE_EFFORTS`, and
-# `BD_RATE_IMAGE_IDS`. By default all 65 manifest images receive equal weight,
+# The table uses `BD_RATE_TABLE_RUN`, `BD_RATE_TABLE_COMPARE_RUN`,
+# `BD_RATE_TABLE_EFFORTS`, and `BD_RATE_TABLE_IMAGE_IDS`. These initially mirror
+# the fixed-sweep plot inputs, but can be selected independently. By default
+# all manifest images receive equal weight,
 # including Kodak and 48 MP images; this is independent of the throughput
 # table's resolution filter and the separate batch study's 48 MP exclusion.
 # Each image contributes a directly computed PCHIP BD-rate percentage. At least
@@ -4017,24 +4057,35 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
 # The report retains both methods, per-image results, coverage, and source
 # identities. The selected saved GJXL revision can differ from the historical
 # batch run; this table does not imply that their source builds are identical.
+# `BD_RATE_TABLE_DECODER_COMPATIBILITY` optionally selects a documented decoder
+# equivalence assumption bound to the exact study, score-ledger, decoder and
+# scorer hashes. Without it, different decoder binaries are rejected. The JSON
+# report retains both original decoder identities and the supporting evidence;
+# sampled checks are not represented as exhaustive verification.
+#
+# The local CUDA view reuses CPU fixed scores E1–E8 with the accepted same-source
+# decoder assumption. Every row uses the same 62 images, excluding all three
+# 48 MP images from both encoders because higher CUDA efforts ran out of memory.
+# Kodak remains included. CPU E9/E10 fixed scores are unavailable; their calibrated
+# observations do not supply additional rows in this fixed-sweep table.
 # Only saved data is read; no encoding, scoring, or calibration is launched.
 #
 # Exports: `bd-rate-same-effort.csv`, `.tex`, `.html`, and `-report.json`.
 
 # %%
 if (__name__ == "__main__" and "ipykernel" in sys.modules
-        and BD_RATE_COMPARE_RUN is not None
-        and (QUALITY_RUN / "metadata.json").is_file()
-        and (BD_RATE_COMPARE_RUN / "metadata.json").is_file()):
+        and BD_RATE_TABLE_COMPARE_RUN is not None
+        and (BD_RATE_TABLE_RUN / "metadata.json").is_file()
+        and (BD_RATE_TABLE_COMPARE_RUN / "metadata.json").is_file()):
     same_effort_bd_rate_table = generate_same_effort_bd_rate_table(
-        QUALITY_RUN, BD_RATE_COMPARE_RUN, OUTPUT_DIR, show=True,
-        quality_range=BD_RATE_QUALITY_RANGE, efforts=BD_RATE_EFFORTS,
-        image_ids=BD_RATE_IMAGE_IDS,
+        BD_RATE_TABLE_RUN, BD_RATE_TABLE_COMPARE_RUN, OUTPUT_DIR, show=True,
+        quality_range=BD_RATE_QUALITY_RANGE, efforts=BD_RATE_TABLE_EFFORTS,
+        image_ids=BD_RATE_TABLE_IMAGE_IDS,
+        decoder_compatibility=BD_RATE_TABLE_DECODER_COMPATIBILITY,
     )
 elif __name__ == "__main__" and "ipykernel" in sys.modules:
-    print("Same-effort fixed-sweep BD-rate table unavailable: compatible CPU fixed-sweep "
-          "scores are required. The retained September 27 review uses a different pinned "
-          "decoder from the current CUDA study. Calibrated results remain separate.")
+    print("Same-effort fixed-sweep BD-rate table unavailable: select saved fixed-score "
+          "studies and, for different decoder builds, a documented compatibility record.")
 
 
 # %% [markdown]

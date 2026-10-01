@@ -9,6 +9,7 @@ are log-linearly interpolated on a common score grid, then averaged in ms.
 """
 
 from collections import Counter, defaultdict
+import json
 import math
 from pathlib import Path
 import statistics
@@ -189,7 +190,38 @@ def load_calibrated_studies(runs):
     return result
 
 
-def _validate_studies(studies, baseline_encoder, baseline_effort, image_ids):
+def _decoder_compatibility(studies, path):
+    """Read an explicit, study-scoped assumption; never rewrite tool identities."""
+    if path is None:
+        return None
+    path = Path(path).expanduser().resolve()
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if (record.get("decision") != "assume-equivalent"
+            or not isinstance(record.get("reason"), str) or not record["reason"].strip()
+            or not record.get("decoder_source_revision")
+            or not record.get("evidence")):
+        raise ValueError("Decoder compatibility requires a documented assumption and evidence")
+    expected = sorted([
+        {"encoder": study.encoder_name(item["config"]),
+         "configuration_id": item["config"]["configuration_id"],
+         "scores_sha256": item.get("scores_sha256"),
+         "decoder_sha256": item["config"]["tool_hashes"][item["config"]["djxl"]],
+         "scorer_sha256": item["config"]["tool_hashes"][item["config"]["scorer"]]}
+        for item in studies], key=lambda row: row["encoder"])
+    if (record.get("studies") != expected
+            or any(not row["scores_sha256"] for row in expected)
+            or len({row["scorer_sha256"] for row in expected}) != 1):
+        raise ValueError("Decoder compatibility does not match the selected studies, scores or tools")
+    for evidence in record["evidence"]:
+        evidence_path = Path(evidence["path"])
+        if not evidence_path.is_absolute():
+            evidence_path = path.parent / evidence_path
+        study.verify_file(evidence_path, evidence["sha256"])
+    return {**record, "record_path": str(path), "record_sha256": study.digest(path)}
+
+
+def _validate_studies(studies, baseline_encoder, baseline_effort, image_ids,
+                      decoder_compatibility=None):
     if not studies:
         raise ValueError("Select at least one saved study")
     encoders = [study.encoder_name(item["config"]) for item in studies]
@@ -213,7 +245,8 @@ def _validate_studies(studies, baseline_encoder, baseline_effort, image_ids):
                     "repetitions", "warmups"):
             if config[key] != baseline[key]:
                 raise ValueError("Incompatible study configuration: " + key)
-        if config["tool_hashes"][config["djxl"]] != baseline["tool_hashes"][baseline["djxl"]]:
+        if (config["tool_hashes"][config["djxl"]] != baseline["tool_hashes"][baseline["djxl"]]
+                and decoder_compatibility is None):
             raise ValueError("Studies require the same pinned decoder")
         images = {image["image_id"]: image for image in config["images"]}
         if len(images) != len(config["images"]) or not set(selected) <= images.keys():
@@ -285,14 +318,15 @@ def _curve(rows, quality_range, repetitions, grid, minimum_points=4,
 
 def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
             quality_range=(75, 85), efforts=None, image_ids=None, grid_size=101,
-            *, minimum_points=4, minimum_timing_samples=None):
+            *, minimum_points=4, minimum_timing_samples=None, decoder_compatibility=None):
     """Return JSON-ready per-image results and fixed-cohort coverage diagnostics."""
     quality_range = _interval(quality_range)
     if minimum_points not in (2, 3, 4):
         raise ValueError("minimum_points must be 2, 3, or 4")
     if not isinstance(grid_size, int) or grid_size < 2:
         raise ValueError("grid_size must be an integer >= 2")
-    images = _validate_studies(studies, baseline_encoder, baseline_effort, image_ids)
+    compatibility = _decoder_compatibility(studies, decoder_compatibility)
+    images = _validate_studies(studies, baseline_encoder, baseline_effort, image_ids, compatibility)
     if minimum_timing_samples is not None and (
             not isinstance(minimum_timing_samples, int)
             or not 1 <= minimum_timing_samples <= min(s["config"]["repetitions"] for s in studies)):
@@ -389,6 +423,7 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
                             if minimum_timing_samples is None else
                             f"preview: at least {minimum_timing_samples} repetitions per retained support; partial points flagged"),
         "minimum_timing_samples": minimum_timing_samples,
+        "decoder_compatibility": compatibility,
         "efforts": selected_efforts,
         "sources": [{
             "run": item["run"], "encoder": study.encoder_name(item["config"]),
@@ -403,6 +438,7 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
             "warmups": item["config"]["warmups"],
             "num_threads": item["config"]["num_threads"],
             "scores_sha256": item.get("scores_sha256"),
+            "decoder_sha256": item["config"]["tool_hashes"][item["config"]["djxl"]],
             "timing_source": item.get("timing_source"),
             "observation_source": item.get("observation_source", "fixed"),
             "calibration_coverage": item.get("calibration_coverage"),
@@ -411,7 +447,8 @@ def analyze(studies, baseline_encoder="libjxl", baseline_effort=7,
     }
 
 
-def analyze_same_effort(studies, quality_range=(75, 85), efforts=None, image_ids=None):
+def analyze_same_effort(studies, quality_range=(75, 85), efforts=None, image_ids=None,
+                        *, decoder_compatibility=None):
     """Compare GJXL directly with libjxl at each numbered effort.
 
     Reuse the fixed-sweep curve, identity, and cohort guards. Each effort gets
@@ -432,7 +469,8 @@ def analyze_same_effort(studies, quality_range=(75, 85), efforts=None, image_ids
         raise ValueError("efforts must be unique integers in 1..10")
     selected.sort()
     reports = [analyze(studies, baseline_effort=effort, quality_range=quality_range,
-                       efforts=[effort], image_ids=image_ids) for effort in selected]
+                       efforts=[effort], image_ids=image_ids,
+                       decoder_compatibility=decoder_compatibility) for effort in selected]
     report = dict(reports[0])
     report.update(
         baseline={"encoder": "libjxl", "effort": "same as test"},

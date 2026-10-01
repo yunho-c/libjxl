@@ -295,6 +295,33 @@ can yield BD-rate even when timings are incomplete. Preserve manifests and
 ledgers unchanged; do not edit configuration identities or substitute old Mac
 measurements.
 
+The notebook's same-effort BD-rate table has independent input controls:
+`BD_RATE_TABLE_RUN`, `BD_RATE_TABLE_COMPARE_RUN`, `BD_RATE_TABLE_EFFORTS`, and
+`BD_RATE_TABLE_IMAGE_IDS`. They initially mirror the fixed-sweep plot inputs.
+The local CUDA view selects retained CPU E1–E8 fixed scores and the catch-up
+CUDA fixed study on 62 common images, excluding all three 48 MP images from
+both encoders at every effort. Kodak remains included. CPU fixed scores for
+E9/E10 are not supplied by calibrated observations.
+
+Different decoder binaries are rejected by default. For a reviewed pair of
+builds, `BD_RATE_TABLE_DECODER_COMPATIBILITY` can name an explicit compatibility
+assumption JSON; the Python APIs expose it as `decoder_compatibility`. The
+record contains `decision: "assume-equivalent"`, a reason, the decoder source
+revision, and `studies` sorted by encoder. Each study entry binds its encoder,
+configuration ID, score-ledger SHA-256, decoder SHA-256, and scorer SHA-256.
+The scorer hashes must match. Its `evidence` entries contain paths and SHA-256
+hashes; relative paths resolve beside the record. Changed study identities,
+scores, tools, or evidence invalidate that selection. Reference, quality-curve,
+metric, and cohort checks remain in effect.
+
+The CUDA selection uses the explicitly accepted assumption that two builds of
+libjxl `e8ff0976` are numerically equivalent, supported by identical decoder
+compiler settings and 130 byte-identical sampled decodes. This is sampled
+evidence, not an exhaustive guarantee. The exported report retains the complete
+assumption and both original decoder hashes; source manifests and score ledgers
+are never relabelled or rewritten. No re-encoding or rescoring is needed to
+generate this table.
+
 ## GJXL matched-quality comparison
 
 The collector also supports `--encoder gjxl`. It uses a separate run directory
