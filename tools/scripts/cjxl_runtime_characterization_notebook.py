@@ -2869,7 +2869,7 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
                       ha="center", transform=axis.transAxes, fontsize=8)
         axis.invert_yaxis()
         if dcc_layout:
-            axis.set(xlim=(10, 10000), ylim=(15, -7.5),
+            axis.set(xlim=(10, 20000), ylim=(15, -7.5),
                      xlabel="Encode time (ms)", ylabel="BD-Rate (%)")
         if show_headers and not dcc_layout:
             axis.text(0.02, 0.97, "Upper left is better", transform=axis.transAxes,
@@ -3891,7 +3891,7 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # plus `speed-bd-rate-report.json` with per-image values, coverage reasons,
 # configuration/ledger identities, and PCHIP–Akima differences.
 # The primary figure uses the updated DCC scatter layout: a
-# 3.375 × 2.25 inch canvas, logarithmic encode time from 10 to 10,000 ms, and BD-rate
+# 3.375 × 2.25 inch canvas, logarithmic encode time from 10 to 20,000 ms, and BD-rate
 # from +15% at the bottom to −7.5% at the top. Exports retain the exact canvas
 # size; points outside these fixed limits are clipped, not removed from the report.
 # Resolution panels and calibrated previews retain their independent layout.
