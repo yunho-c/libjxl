@@ -201,6 +201,7 @@ BD_RATE_SHOW_HEADERS = False
 BD_RATE_SHOW_MISSING_DATA = False
 BD_RATE_SHOW_LEGEND = False  # Set True to show encoder and provisional-timing keys.
 BD_RATE_SHOW_EFFORT_LINKS = True
+BD_RATE_SHOW_FULL_BORDER = False  # Set True for all four sides of the fixed-sweep plots.
 # Independent sparse-curve diagnostic; both sources use this same interval.
 DEBUG_BD_RATE_SOURCE_COMPARISON = True
 DEBUG_BD_RATE_QUALITY_RANGE = (75.0, 84.5)  # Inside accepted target 85 +/- 0.5.
@@ -2708,9 +2709,12 @@ def load_bd_rate_helpers():
 
 def plot_bd_rate(report, by_resolution=False, *, show_headers=False,
                  show_missing_data=False, show_effort_links=False, show_legend=False,
-                 dcc_layout=False):
+                 dcc_layout=False, show_full_border=False):
     """Paper-style BD-rate figure; consumes an already computed report only."""
     style = {**paper_plot_style(), "mathtext.fontset": "dejavuserif"}
+    if show_full_border:
+        style.update({f"axes.spines.{side}": True
+                      for side in ("left", "right", "top", "bottom")})
     with matplotlib.rc_context(style):
         return _plot_bd_rate_paper(
             report, by_resolution=by_resolution, show_headers=show_headers,
@@ -2728,7 +2732,7 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
     points = report["points"]
     low, high = report["quality_range"]
     dcc_layout = dcc_layout and not by_resolution
-    panel_width, panel_height = (3.375, 2.25) if dcc_layout else (3.4, 2.8)
+    panel_width, panel_height = (3.375, 2.75) if dcc_layout else (3.4, 2.8)
     if by_resolution:
         available = {point["scope"] for point in points} - {"all"}
         scopes = ([scope for scope in RESOLUTION_NAMES if scope in available]
@@ -2965,7 +2969,8 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
                              compare_run=None, baseline_encoder="libjxl", baseline_effort=7,
                              quality_range=(75, 85), efforts=None, image_ids=None, *,
                              show_headers=False, show_missing_data=False,
-                             show_effort_links=False, show_legend=False):
+                             show_effort_links=False, show_legend=False,
+                             show_full_border=False):
     """Generate independent saved-sweep plots and a per-image JSON coverage report."""
     import json
 
@@ -2977,13 +2982,14 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
     )
     configure_style()
     plot_options = {"show_headers": show_headers, "show_missing_data": show_missing_data,
-                    "show_effort_links": show_effort_links, "show_legend": show_legend}
+                    "show_effort_links": show_effort_links, "show_legend": show_legend,
+                    "show_full_border": show_full_border}
     figures = {
         "speed-bd-rate": plot_bd_rate(report, dcc_layout=True, **plot_options),
         "speed-bd-rate-by-resolution": plot_bd_rate(report, by_resolution=True, **plot_options),
     }
     for name, figure in figures.items():
-        # Preserve the specified 3.375 x 2.25 inch canvas for the primary DCC figure.
+        # Preserve the specified 3.375 x 2.75 inch canvas for the primary DCC figure.
         save_figure(figure, output_dir, name, formats,
                     bbox_inches=None if name == "speed-bd-rate" else "tight")
     output_dir = pathlib.Path(output_dir).expanduser().resolve()
@@ -3891,7 +3897,7 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # plus `speed-bd-rate-report.json` with per-image values, coverage reasons,
 # configuration/ledger identities, and PCHIP–Akima differences.
 # The primary figure uses the updated DCC scatter layout: a
-# 3.375 × 2.25 inch canvas, logarithmic encode time from 10 to 20,000 ms, and BD-rate
+# 3.375 × 2.75 inch canvas, logarithmic encode time from 10 to 20,000 ms, and BD-rate
 # from +15% at the bottom to −7.5% at the top. Exports retain the exact canvas
 # size; points outside these fixed limits are clipped, not removed from the report.
 # Resolution panels and calibrated previews retain their independent layout.
@@ -3903,6 +3909,8 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # `BD_RATE_SHOW_EFFORT_LINKS = True` connects matching libjxl/GJXL effort numbers
 # with light dotted lines behind the curves. Set it to False to hide these links.
 # A link requires complete points from both encoders within the same panel.
+# Set `BD_RATE_SHOW_FULL_BORDER = True` to show all four border sides on the
+# fixed-sweep figures. False retains the left and bottom borders.
 #
 # **Interpolation sensitivity:** markers use PCHIP; vertical spans show the
 # difference between PCHIP and Akima. These spans indicate method sensitivity,
@@ -3922,6 +3930,7 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
         show_missing_data=BD_RATE_SHOW_MISSING_DATA,
         show_legend=BD_RATE_SHOW_LEGEND,
         show_effort_links=BD_RATE_SHOW_EFFORT_LINKS,
+        show_full_border=BD_RATE_SHOW_FULL_BORDER,
     )
 elif __name__ == "__main__" and "ipykernel" in sys.modules:
     print(f"Fixed-sweep BD-rate skipped: study metadata is missing at {QUALITY_RUN} "
