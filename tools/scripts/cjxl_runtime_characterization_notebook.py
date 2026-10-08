@@ -2728,7 +2728,7 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
     points = report["points"]
     low, high = report["quality_range"]
     dcc_layout = dcc_layout and not by_resolution
-    panel_width, panel_height = (4.5, 3.0) if dcc_layout else (3.4, 2.8)
+    panel_width, panel_height = (3.375, 2.25) if dcc_layout else (3.4, 2.8)
     if by_resolution:
         available = {point["scope"] for point in points} - {"all"}
         scopes = ([scope for scope in RESOLUTION_NAMES if scope in available]
@@ -2983,7 +2983,7 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
         "speed-bd-rate-by-resolution": plot_bd_rate(report, by_resolution=True, **plot_options),
     }
     for name, figure in figures.items():
-        # Preserve the specified 4.5 x 3 inch canvas for the primary DCC figure.
+        # Preserve the specified 3.375 x 2.25 inch canvas for the primary DCC figure.
         save_figure(figure, output_dir, name, formats,
                     bbox_inches=None if name == "speed-bd-rate" else "tight")
     output_dir = pathlib.Path(output_dir).expanduser().resolve()
@@ -3891,7 +3891,7 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # plus `speed-bd-rate-report.json` with per-image values, coverage reasons,
 # configuration/ledger identities, and PCHIP–Akima differences.
 # The primary figure uses the updated DCC scatter layout: a
-# 4.5 × 3 inch canvas, logarithmic encode time from 10 to 10,000 ms, and BD-rate
+# 3.375 × 2.25 inch canvas, logarithmic encode time from 10 to 10,000 ms, and BD-rate
 # from +15% at the bottom to −7.5% at the top. Exports retain the exact canvas
 # size; points outside these fixed limits are clipped, not removed from the report.
 # Resolution panels and calibrated previews retain their independent layout.
