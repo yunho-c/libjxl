@@ -602,7 +602,7 @@ def subplot_grid(count, columns=3, width=5.1, height=3.7):
     return figure, flattened[:count]
 
 
-def save_figure(figure, output_dir, name, formats=("png", "svg")):
+def save_figure(figure, output_dir, name, formats=("png", "svg"), *, bbox_inches="tight"):
     output_dir = pathlib.Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = []
@@ -611,7 +611,7 @@ def save_figure(figure, output_dir, name, formats=("png", "svg")):
         if extension not in ("png", "svg", "pdf"):
             raise ValueError("unsupported output format: %s" % extension)
         path = output_dir / (name + "." + extension)
-        figure.savefig(path, bbox_inches="tight")
+        figure.savefig(path, bbox_inches=bbox_inches)
         paths.append(path)
     return paths
 
@@ -2707,25 +2707,28 @@ def load_bd_rate_helpers():
 
 
 def plot_bd_rate(report, by_resolution=False, *, show_headers=False,
-                 show_missing_data=False, show_effort_links=False, show_legend=False):
+                 show_missing_data=False, show_effort_links=False, show_legend=False,
+                 dcc_layout=False):
     """Paper-style BD-rate figure; consumes an already computed report only."""
     style = {**paper_plot_style(), "mathtext.fontset": "dejavuserif"}
     with matplotlib.rc_context(style):
         return _plot_bd_rate_paper(
             report, by_resolution=by_resolution, show_headers=show_headers,
             show_missing_data=show_missing_data, show_effort_links=show_effort_links,
-            show_legend=show_legend,
+            show_legend=show_legend, dcc_layout=dcc_layout,
         )
 
 
 def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
-                        show_missing_data=False, show_effort_links=False, show_legend=False):
+                        show_missing_data=False, show_effort_links=False, show_legend=False,
+                        dcc_layout=False):
     """Draw complete fixed-cohort points, preserving effort order and omissions."""
     from matplotlib.ticker import LogLocator, NullFormatter
 
     points = report["points"]
     low, high = report["quality_range"]
-    panel_width, panel_height = 3.4, 2.8
+    dcc_layout = dcc_layout and not by_resolution
+    panel_width, panel_height = (4.5, 3.0) if dcc_layout else (3.4, 2.8)
     if by_resolution:
         available = {point["scope"] for point in points} - {"all"}
         scopes = ([scope for scope in RESOLUTION_NAMES if scope in available]
@@ -2824,7 +2827,7 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
                     effort_label, (x, y), xytext=(0, direction * 7),
                     textcoords="offset points", ha="center",
                     va="bottom" if direction > 0 else "top",
-                    color=colors[encoder], fontsize=7,
+                    color=colors[encoder], fontsize=6.5 if dcc_layout else 7,
                     bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
                           "boxstyle": "square,pad=0.1"},
                     arrowprops={"arrowstyle": "-", "color": colors[encoder],
@@ -2865,7 +2868,10 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
             axis.text(0.5, 0.5, "No complete points\nfor this interval and cohort",
                       ha="center", transform=axis.transAxes, fontsize=8)
         axis.invert_yaxis()
-        if show_headers:
+        if dcc_layout:
+            axis.set(xlim=(10, 10000), ylim=(15, -7.5),
+                     xlabel="Encode time (ms)", ylabel="BD-Rate (%)")
+        if show_headers and not dcc_layout:
             axis.text(0.02, 0.97, "Upper left is better", transform=axis.transAxes,
                       va="top", fontsize=6.5, color="0.4")
         if show_missing_data and coverage:
@@ -2899,6 +2905,9 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
     # Resolve label collisions in display coordinates, including across encoders.
     # Keep leaders for displaced labels so tightly spaced efforts remain readable.
     figure.canvas.draw()
+    if dcc_layout:
+        # Keep this layout stable when exporting the exact canvas at another DPI.
+        figure.set_layout_engine("none")
     renderer = figure.canvas.get_renderer()
     annotation_labels = {label for label, _ in annotations}
     occupied = {
@@ -2920,12 +2929,16 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
         best = None
         inside = label.axes.get_window_extent(renderer)
         # Try horizontal shifts first, then move farther out on the encoder's side.
-        # Every candidate, including the fallback, keeps the label on that side.
+        # The fixed DCC limits also need inward labels near either plot boundary.
         offsets = [original[1] + direction * 9 * level for level in range(7)]
+        if dcc_layout:
+            offsets = [sign * offset for offset in offsets for sign in (1, -1)]
         for vertical in offsets:
             placed = False
             for horizontal in (0, -12, 12, -24, 24, -36, 36):
                 label.set_position((horizontal, vertical))
+                if dcc_layout:
+                    label.set_verticalalignment("bottom" if vertical > 0 else "top")
                 # Text extent excludes the leader line when checking collisions.
                 box = matplotlib.text.Text.get_window_extent(label, renderer).padded(1.5)
                 contained = inside.contains(box.x0, box.y0) and inside.contains(box.x1, box.y1)
@@ -2941,6 +2954,8 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
         if not placed:
             _, position, box = best
             label.set_position(position)
+            if dcc_layout:
+                label.set_verticalalignment("bottom" if position[1] > 0 else "top")
         occupied[label.axes].append(box)
         label.arrow_patch.set_visible(label.get_position() != original)
     return figure
@@ -2964,11 +2979,13 @@ def generate_bd_rate_figures(run, output_dir, formats=SAVE_FORMATS, show=False,
     plot_options = {"show_headers": show_headers, "show_missing_data": show_missing_data,
                     "show_effort_links": show_effort_links, "show_legend": show_legend}
     figures = {
-        "speed-bd-rate": plot_bd_rate(report, **plot_options),
+        "speed-bd-rate": plot_bd_rate(report, dcc_layout=True, **plot_options),
         "speed-bd-rate-by-resolution": plot_bd_rate(report, by_resolution=True, **plot_options),
     }
     for name, figure in figures.items():
-        save_figure(figure, output_dir, name, formats)
+        # Preserve the specified 4.5 x 3 inch canvas for the primary DCC figure.
+        save_figure(figure, output_dir, name, formats,
+                    bbox_inches=None if name == "speed-bd-rate" else "tight")
     output_dir = pathlib.Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "speed-bd-rate-report.json"
@@ -3873,6 +3890,11 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # Outputs: `speed-bd-rate`, `speed-bd-rate-by-resolution` in `SAVE_FORMATS`,
 # plus `speed-bd-rate-report.json` with per-image values, coverage reasons,
 # configuration/ledger identities, and PCHIP–Akima differences.
+# The primary figure uses the updated DCC scatter layout: a
+# 4.5 × 3 inch canvas, logarithmic encode time from 10 to 10,000 ms, and BD-rate
+# from +15% at the bottom to −7.5% at the top. Exports retain the exact canvas
+# size; points outside these fixed limits are clipped, not removed from the report.
+# Resolution panels and calibrated previews retain their independent layout.
 # Set `BD_RATE_SHOW_HEADERS` and `BD_RATE_SHOW_MISSING_DATA` to show subplot
 # headers and omitted-effort notes. Both default to False for saved files and
 # inline previews; full coverage remains in the report and printed output.
