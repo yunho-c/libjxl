@@ -219,8 +219,9 @@ has a value. Missing repetitions leave dashes and appear in the coverage CSV.
 An empty common cohort raises an error. Invalid or mismatched records still
 raise in either mode, even for images that would otherwise be excluded.
 Selecting fewer efforts can retain more images if later efforts are incomplete.
-The notebook currently selects E1–E9; set `THROUGHPUT_EFFORTS = None` to select
-every effort in the libjxl manifest.
+Set `THROUGHPUT_EFFORTS = None` to select every effort in the libjxl manifest.
+The completed October 6 local refresh does this for E1–E10; the older snapshot
+selects E1–E9 while its E10 timings remain partial.
 
 The loader checks input hashes/geometry, requested distances, timing protocol,
 revision/configuration identities, repetitions, and codestream consistency.
@@ -298,10 +299,43 @@ measurements.
 The notebook's same-effort BD-rate table has independent input controls:
 `BD_RATE_TABLE_RUN`, `BD_RATE_TABLE_COMPARE_RUN`, `BD_RATE_TABLE_EFFORTS`, and
 `BD_RATE_TABLE_IMAGE_IDS`. They initially mirror the fixed-sweep plot inputs.
-The local CUDA view selects retained CPU E1–E8 fixed scores and the catch-up
-CUDA fixed study on 62 common images, excluding all three 48 MP images from
-both encoders at every effort. Kodak remains included. CPU fixed scores for
-E9/E10 are not supplied by calibrated observations.
+The completed October 6 local CUDA refresh selects CPU E1–E10 fixed scores and
+the catch-up CUDA fixed study on 62 common images, excluding all three 48 MP
+images from both encoders at every effort. Kodak remains included. CPU E1–E8
+scores are reused only after checking reference and codestream identities;
+E9/E10 retained outputs are decoded and scored with the same pinned tools.
+Calibrated observations are never substituted for fixed scores. The older
+September 30 snapshot remains available with E1–E8 fixed scores.
+
+The refresh also combines the same-build CPU calibrated E1–E9 and E10
+continuations in an analysis-only input. Original ledgers remain unchanged;
+`analysis_sources` records their metadata and ledger hashes, and each copied
+observation retains its source configuration in `analysis_origin`. All
+accepted settings have five timing repetitions. Unresolved quality targets
+remain explicit and the common-cohort plots exclude affected images consistently.
+Nominal throughput now includes E10 on the same 38 images of at least 1 MP.
+
+The October 9 local calibrated preview uses an analysis-only GJXL composite:
+new E1–E4 measurements at `38cac3e`, updated E5 at `e1e4cc6d`, and
+E6–E10 retained at `8956a87`. The earlier E1–E4-only refresh stays available.
+The sources have the same corpus, metric, decoder/scorer binaries, eight-thread
+protocol, and five timing repetitions. Source revisions and ledger hashes are
+recorded by effort; this is not a single-build sweep. Unresolved calibrations
+and OOM outcomes remain explicit, and the shared cohort is recomputed for both
+encoders. The fixed-sweep tables still use the September 27 GJXL study.
+
+The primary calibrated BD-rate preview now shares the fixed-sweep DCC layout:
+3.375 × 2.75 inches, encode time 10–20,000 ms, inverted BD-rate −7.5% to +15%,
+and an exact uncropped export canvas. PNG export remains 360 DPI.
+`CALIBRATED_BD_RATE_DCC_LAYOUT = False` restores automatic axis limits;
+resolution panels retain their own layout. `BD_RATE_SHOW_FULL_BORDER = True`
+enables all four borders for both fixed and calibrated figures. CUDA uses green
+triangle markers; libjxl retains circles and Metal retains blue squares.
+Headers, coverage notes, and the legend remain hidden by default; detailed
+provenance and exclusions stay in JSON.
+Set `BD_RATE_SHOW_LEGEND = True` to show a compact encoder legend inside the
+lower-right corner of each BD-rate panel. Composite build revisions remain in
+the report instead of the legend.
 
 Different decoder binaries are rejected by default. For a reviewed pair of
 builds, `BD_RATE_TABLE_DECODER_COMPATIBILITY` can name an explicit compatibility

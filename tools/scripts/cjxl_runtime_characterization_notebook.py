@@ -201,7 +201,7 @@ BD_RATE_SHOW_HEADERS = False
 BD_RATE_SHOW_MISSING_DATA = False
 BD_RATE_SHOW_LEGEND = False  # Set True to show encoder and provisional-timing keys.
 BD_RATE_SHOW_EFFORT_LINKS = True
-BD_RATE_SHOW_FULL_BORDER = False  # Set True for all four sides of the fixed-sweep plots.
+BD_RATE_SHOW_FULL_BORDER = True  # Set False to retain only the left and bottom borders.
 # Independent sparse-curve diagnostic; both sources use this same interval.
 DEBUG_BD_RATE_SOURCE_COMPARISON = True
 DEBUG_BD_RATE_QUALITY_RANGE = (75.0, 84.5)  # Inside accepted target 85 +/- 0.5.
@@ -210,6 +210,7 @@ CALIBRATED_BD_RATE_COMPARE_RUN = None
 CALIBRATED_BD_RATE_QUALITY_RANGE = (75.0, 84.5)
 CALIBRATED_BD_RATE_COMMON_COHORT = True  # Continuous trend on one shared image subset.
 CALIBRATED_BD_RATE_MIN_TIMING_SAMPLES = 3  # Partial repetitions are explicitly marked.
+CALIBRATED_BD_RATE_DCC_LAYOUT = True  # Match the primary fixed-sweep canvas and axis limits.
 
 # Direct calibrated comparison, independent of the fixed-sweep BD-rate plot.
 CALIBRATED_SIZE_RUN = QUALITY_RUN
@@ -248,11 +249,10 @@ PAPER_BATCH_RUN = pathlib.Path(os.environ.get(
 # %% [markdown]
 # ### Saved results on this Windows CUDA machine
 #
-# When the local September 24 CPU snapshot exists, the main runtime figures use
-# `libjxl-cpu-study-2026-09-24/fixed/summary/image-tuples.partial.csv`.
-# This is a partial fixed-sweep timing snapshot; fixed-sweep quality scores and
-# stage profiles remain unavailable. The separate September 29 CPU calibrated
-# run supplies the calibrated BD-rate preview below, including partial coverage.
+# The main runtime figures prefer the completed September 24 CPU fixed summary,
+# falling back to its partial snapshot when necessary. The October 6 refresh
+# combines the completed CPU calibrated E1–E9 and E10 continuations and extends
+# retained fixed-output scoring through E10. Original study ledgers stay intact.
 #
 # The GJXL fixed plots and Section 12 select the newest initialized, nonarchived
 # CUDA study, with explicit environment overrides taking precedence. Before a new
@@ -260,31 +260,43 @@ PAPER_BATCH_RUN = pathlib.Path(os.environ.get(
 # That fallback is archived because two 48 MP reference hashes differ from the
 # canonical corpus; see its `ARCHIVED.md`. The September 27 catch-up study uses
 # the corrected canonical corpus and production defaults at `8956a87`.
-# Fixed-sweep comparisons remain disabled without CPU fixed-sweep scores.
-# The calibrated preview uses its own saved scores and timing repetitions.
+# Fixed-sweep comparisons require compatible CPU fixed-sweep scores. The
+# calibrated preview uses its own saved scores and timing repetitions.
 # Earlier historical sections retain their original descriptions.
 #
-# Run All displays the available plots and exports them under
-# `libjxl-cpu-study-2026-09-24/plots/local-inspection/`; archived CUDA exports are
-# named `gjxl-cuda-archived`, and current CUDA exports `gjxl-cuda`.
+# Run All exports to the October 9 redraw when its composite is ready, otherwise
+# to the completed October 6 refresh or the older local-inspection directory. Archived
+# CUDA exports are named `gjxl-cuda-archived`, and current exports `gjxl-cuda`.
 # No collection is started. Environment path overrides
-# still take precedence. The CPU CSV is a saved snapshot; regenerate it with
-# `cjxl_runtime_characterization.py summarize
-# --run <CPU-study>/fixed --partial` after further collection.
+# still take precedence. No encodes or scoring are launched by this notebook.
 
 # %%
-# Local inspection defaults; paired comparisons await completed canonical CPU data.
+# Local inspection defaults retain the older snapshot until refreshed inputs are ready.
 _local_cpu_study = _cuda_workspace / "libjxl-cpu-study-2026-09-24"
-_local_cpu_csv = _local_cpu_study / "fixed/summary/image-tuples.partial.csv"
+_local_cpu_csv = _local_cpu_study / "fixed/summary/image-tuples.csv"
+if not _local_cpu_csv.is_file():
+    _local_cpu_csv = _local_cpu_study / "fixed/summary/image-tuples.partial.csv"
+_local_refresh = _cuda_workspace / (
+    "libjxl-cpu-calibrated-e1-9-2026-09-29/plots/notebook-refresh-2026-10-06")
+_local_refresh_ready = (_local_refresh / "refresh-ready.json").is_file()
+_local_cuda_preview_refresh = _cuda_workspace / (
+    "libjxl-cpu-calibrated-e1-9-2026-09-29/plots/notebook-refresh-2026-10-09")
+_local_cuda_e5_refresh = _local_cuda_preview_refresh.with_name("notebook-refresh-2026-10-09-e5")
+if (_local_cuda_e5_refresh / "preview-ready.json").is_file():
+    _local_cuda_preview_refresh = _local_cuda_e5_refresh
+_local_cuda_preview_ready = (_local_cuda_preview_refresh / "preview-ready.json").is_file()
 _local_archived_cuda = _cuda_workspace / "gjxl-cuda-integration-study-2026-09-21"
 LOCAL_WINDOWS_INSPECTION = _local_cpu_csv.is_file()
 if LOCAL_WINDOWS_INSPECTION:
     INPUT_CSV = pathlib.Path(os.environ.get("CJXL_IMAGE_TUPLES_CSV", _local_cpu_csv)).expanduser()
     OUTPUT_DIR = pathlib.Path(os.environ.get(
-        "CJXL_CHARACTERIZATION_PLOT_DIR", _local_cpu_study / "plots/local-inspection",
+        "CJXL_CHARACTERIZATION_PLOT_DIR",
+        _local_cuda_preview_refresh if _local_cuda_preview_ready else
+        _local_refresh if _local_refresh_ready else _local_cpu_study / "plots/local-inspection",
     )).expanduser()
     QUALITY_RUN = pathlib.Path(os.environ.get(
-        "CJXL_QUALITY_RUN", _local_cpu_study / "calibrated",
+        "CJXL_QUALITY_RUN", _local_refresh / "inputs/cpu-calibrated"
+        if _local_refresh_ready else _local_cpu_study / "calibrated",
     )).expanduser()
     if (not (CUDA_FIXED_RUN / "metadata.json").is_file()
             and not any(key in os.environ for key in
@@ -301,16 +313,18 @@ if LOCAL_WINDOWS_INSPECTION:
     BD_RATE_COMPARE_RUN = None
     BD_RATE_TABLE_RUN = pathlib.Path(os.environ.get(
         "CJXL_BD_RATE_TABLE_RUN",
+        _local_refresh / "inputs/cpu-fixed" if _local_refresh_ready else
         _cuda_workspace / "libjxl-cpu-quality-review-2026-09-27/scores",
     )).expanduser()
     BD_RATE_TABLE_DECODER_COMPATIBILITY = pathlib.Path(os.environ.get(
         "CJXL_BD_RATE_TABLE_DECODER_COMPATIBILITY",
+        _local_refresh / "decoder-compatibility.json" if _local_refresh_ready else
         _cuda_workspace / "libjxl-decoder-compatibility-2026-09-30/accepted-compatibility.json",
     )).expanduser()
     BD_RATE_TABLE_COMPARE_RUN = (pathlib.Path(os.environ.get(
         "CJXL_BD_RATE_TABLE_COMPARE_RUN", CUDA_FIXED_RUN,
     )).expanduser() if BD_RATE_TABLE_DECODER_COMPATIBILITY.is_file() else None)
-    BD_RATE_TABLE_EFFORTS = tuple(range(1, 9))  # Retained CPU fixed scores cover E1–E8.
+    BD_RATE_TABLE_EFFORTS = None if _local_refresh_ready else tuple(range(1, 9))
     if (BD_RATE_TABLE_RUN / "metadata.json").is_file():
         BD_RATE_TABLE_IMAGE_IDS = [image["image_id"] for image in
             json.loads((BD_RATE_TABLE_RUN / "metadata.json").read_text())["images"]
@@ -320,18 +334,25 @@ if LOCAL_WINDOWS_INSPECTION:
     DEBUG_BD_RATE_SOURCE_COMPARISON = False
     CALIBRATED_BD_RATE_RUN = pathlib.Path(os.environ.get(
         "CJXL_CALIBRATED_BD_RATE_RUN",
+        _local_refresh / "inputs/cpu-calibrated" if _local_refresh_ready else
         _cuda_workspace / "libjxl-cpu-calibrated-e1-9-2026-09-29/calibrated",
     )).expanduser()
     CALIBRATED_BD_RATE_COMPARE_RUN = pathlib.Path(os.environ.get(
-        "CJXL_CALIBRATED_BD_RATE_COMPARE_RUN", CUDA_RUN,
+        "CJXL_CALIBRATED_BD_RATE_COMPARE_RUN",
+        _local_cuda_preview_refresh / "inputs/gjxl-calibrated"
+        if _local_cuda_preview_ready else CUDA_RUN,
     )).expanduser()
     CALIBRATED_SIZE_RUN = CALIBRATED_BD_RATE_RUN
     CALIBRATED_SIZE_COMPARE_RUN = CALIBRATED_BD_RATE_COMPARE_RUN
-    # Direct size/time panels require all five repetitions; E9 is still partial.
-    CALIBRATED_SIZE_EFFORTS = tuple(range(1, 9))
-    _local_cpu_table_input = _cuda_workspace / (
-        "libjxl-cpu-calibrated-e1-9-2026-09-29/plots/"
-        "notebook-refresh-2026-09-30/inputs/cpu-fixed")
+    # Completed continuation supports E1–E10, with five repetitions per accepted target.
+    CALIBRATED_SIZE_EFFORTS = None if _local_refresh_ready else tuple(range(1, 9))
+    if _local_refresh_ready:
+        CALIBRATED_BD_RATE_MIN_TIMING_SAMPLES = EXPECTED_TIMING_SAMPLES
+        THROUGHPUT_EFFORTS = None
+    _local_cpu_table_input = (
+        _local_refresh / "inputs/cpu-fixed" if _local_refresh_ready else _cuda_workspace / (
+            "libjxl-cpu-calibrated-e1-9-2026-09-29/plots/"
+            "notebook-refresh-2026-09-30/inputs/cpu-fixed"))
     THROUGHPUT_LIBJXL_RUN = pathlib.Path(os.environ.get(
         "CJXL_THROUGHPUT_LIBJXL_RUN", _local_cpu_table_input,
     )).expanduser()
@@ -2454,19 +2475,20 @@ def generate_encoder_comparison(libjxl_run, gjxl_run, output_dir,
             return {}
     study = load_quality_helpers()
     points = study.encoder_comparison_points(libjxl_run, gjxl_run)
+    backend = study.load_config(pathlib.Path(gjxl_run)).get("backend", "metal").upper()
     figure = plot_pareto(points, "measured")
     warmup_report = pathlib.Path(gjxl_run) / "warmup-check-summary.json"
     if warmup_report.is_file():
         import json
         if any(row["needs_review"] for row in json.loads(warmup_report.read_text())["results"]):
             figure.suptitle(
-                "MEASURED PILOT: libjxl versus fully-resident Metal GJXL\n"
+                f"MEASURED PILOT: libjxl versus fully-resident {backend} GJXL\n"
                 "Matched perceptual quality; upper-left is better\n"
                 "Warmup sensitivity flagged: consult warmup-check-summary.json",
                 fontsize=13,
             )
     figure.text(0.99, 0.01,
-                "Warm complete calls; libjxl: 8 workers; GJXL: CPU participant cap 8 + Metal",
+                f"Warm complete calls; libjxl: 8 workers; GJXL: CPU participant cap 8 + {backend}",
                 ha="right", fontsize=8)
     name = "pareto-measured-libjxl-vs-gjxl"
     save_figure(figure, pathlib.Path(output_dir), name, formats)
@@ -2750,6 +2772,7 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
     for source in report["sources"]:
         if source["encoder"] == "gjxl" and source.get("backend") == "cuda":
             colors["gjxl"] = "#228833"  # CUDA green; Metal retains blue.
+            markers["gjxl"] = "^"  # CUDA triangles; Metal retains squares.
         if source.get("display_label"):
             labels[source["encoder"]] = source["display_label"]
     baseline = report["baseline"]
@@ -2888,6 +2911,9 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
                       bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
                             "boxstyle": "square,pad=0.2"})
     handles, legend_labels = axes[0].get_legend_handles_labels()
+    # Put GJXL above libjxl, matching their usual vertical order in the plot.
+    handles.reverse()
+    legend_labels.reverse()
     provisional = [p for p in points if p["status"] == "ready" and p.get("timing_provisional")]
     if provisional:
         lo = min(p["timing_sample_min"] for p in provisional)
@@ -2898,14 +2924,13 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
         required = max(source["repetitions"] for source in report["sources"])
         legend_labels.append("† provisional timing" + (
             f" ({count} of {required} repetitions)" if show_headers else ""))
-    from textwrap import fill
-
-    # Preserve composite-build provenance labels while allowing them to wrap.
+    # Keep the in-axis key compact; full composite-build provenance stays in the report.
     if show_legend:
-        figure.legend(handles, [fill(label, 46) for label in legend_labels],
-                      loc="outside lower center",
-                      ncols=((3 if by_resolution else 1) if provisional else min(2, len(handles))),
-                      handlelength=2.4, columnspacing=2.0, fontsize=8)
+        legend_labels = [label.split(" composite:", 1)[0].replace("GJXL", "gjxl", 1)
+                         for label in legend_labels]
+        for axis in axes:
+            axis.legend(handles, legend_labels,
+                        loc="lower right", ncols=1, handlelength=2.4, fontsize=8)
     # Resolve label collisions in display coordinates, including across encoders.
     # Keep leaders for displaced labels so tightly spaced efforts remain readable.
     figure.canvas.draw()
@@ -2919,6 +2944,9 @@ def _plot_bd_rate_paper(report, by_resolution=False, *, show_headers=False,
                if text not in annotation_labels]
         for axis in axes
     }
+    for axis in axes:
+        if axis.get_legend() is not None:
+            occupied[axis].append(axis.get_legend().get_window_extent(renderer).padded(2))
     for axis in axes:
         for line in axis.lines:
             if line.get_marker() not in (None, "", "None"):
@@ -3111,7 +3139,8 @@ def generate_calibrated_bd_rate_figures(run, compare_run, output_dir,
                                        quality_range=(75, 84.5), common_cohort=True,
                                        minimum_timing_samples=3, *, show_headers=False,
                                        show_missing_data=False, show_effort_links=False,
-                                       show_legend=False):
+                                       show_legend=False, dcc_layout=True,
+                                       show_full_border=False):
     """Render a labelled sparse calibrated preview without running collectors."""
     import json
 
@@ -3149,8 +3178,9 @@ def generate_calibrated_bd_rate_figures(run, compare_run, output_dir,
             source["backend"] = config.get("backend", "cpu")
             source["encoder_revision"] = config.get("encoder_revision", config.get("libjxl_revision"))
             source["efforts"] = config["efforts"]
-            source["display_label"] = ("libjxl (CPU)" if source["encoder"] == "libjxl"
-                                       else f"GJXL ({source['backend'].upper()})")
+            source["display_label"] = config.get("display_label") or (
+                "libjxl (CPU)" if source["encoder"] == "libjxl"
+                else f"GJXL ({source['backend'].upper()})")
     configure_style()
     figures = {}
     for prefix, current in reports.items():
@@ -3161,11 +3191,13 @@ def generate_calibrated_bd_rate_figures(run, compare_run, output_dir,
             name = prefix + ("-by-resolution" if by_resolution else "")
             figure = plot_bd_rate(current, by_resolution=by_resolution,
                                   show_headers=show_headers, show_missing_data=show_missing_data,
-                                  show_effort_links=show_effort_links, show_legend=show_legend)
+                                  show_effort_links=show_effort_links, show_legend=show_legend,
+                                  dcc_layout=dcc_layout, show_full_border=show_full_border)
             if show_headers:
                 figure.suptitle(title + "\n2–3 quality supports", fontsize=9)
             figure.canvas.draw()
-            save_figure(figure, output_dir, name, formats)
+            save_figure(figure, output_dir, name, formats,
+                        bbox_inches=None if dcc_layout and not by_resolution else "tight")
             figures[name] = figure
         report_path = pathlib.Path(output_dir) / (prefix + "-report.json")
         report_path.write_text(json.dumps(current, indent=2, allow_nan=False) + "\n", encoding="utf-8")
@@ -3803,7 +3835,8 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
 # The complete image × quality grid is required for each resolution/effort
 # before selecting a quality. Incomplete groups are listed in
 # `stage_wall_coverage` and excluded from every view; missing data never becomes
-# zero. The current snapshot supports E1–E9. E10 is incomplete.
+# zero. Stage-profile coverage is independent of fixed timing coverage; the
+# local CPU sweep has complete timings but no stage profiles.
 #
 # This cell reads `INPUT_CSV` independently, exports `stage-wall-selected.csv`,
 # `stage-wall-percent.csv`, `stage-wall-ms.csv`, `stage-wall-coverage.csv`,
@@ -3900,12 +3933,14 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # 3.375 × 2.75 inch canvas, logarithmic encode time from 10 to 20,000 ms, and BD-rate
 # from +15% at the bottom to −7.5% at the top. Exports retain the exact canvas
 # size; points outside these fixed limits are clipped, not removed from the report.
-# Resolution panels and calibrated previews retain their independent layout.
+# Resolution panels retain their independent layout. Calibrated primary previews
+# use the same DCC layout unless `CALIBRATED_BD_RATE_DCC_LAYOUT` is False.
 # Set `BD_RATE_SHOW_HEADERS` and `BD_RATE_SHOW_MISSING_DATA` to show subplot
 # headers and omitted-effort notes. Both default to False for saved files and
 # inline previews; full coverage remains in the report and printed output.
 # Set `BD_RATE_SHOW_LEGEND = True` to show the legend in both fixed and
-# calibrated BD-rate figures; it is hidden by default.
+# calibrated BD-rate figures; it is hidden by default. The compact encoder key
+# sits inside the lower-right corner of each axes; build revisions stay in the report.
 # `BD_RATE_SHOW_EFFORT_LINKS = True` connects matching libjxl/GJXL effort numbers
 # with light dotted lines behind the curves. Set it to False to hide these links.
 # A link requires complete points from both encoders within the same panel.
@@ -3962,6 +3997,13 @@ elif __name__ == "__main__" and "ipykernel" in sys.modules:
 # Resolution panels use the corresponding subsets. A full-cohort companion keeps
 # all images and still requires all five repetitions, retaining its omissions.
 # Set `CALIBRATED_BD_RATE_COMMON_COHORT = False` to use only that strict view.
+# Primary previews use the fixed 3.375 × 2.75 inch DCC canvas and axis limits;
+# set `CALIBRATED_BD_RATE_DCC_LAYOUT = False` for the previous automatic limits.
+# `BD_RATE_SHOW_FULL_BORDER` also applies to these calibrated figures.
+# The updated October 9 composite uses CUDA E1–E4 at 38cac3e, E5 at e1e4cc6d,
+# and retained E6–E10 at 8956a87. Original records and failures remain in their source
+# studies; the composite metadata and plot reports record the revision by effort.
+# Fixed-sweep tables and CUDA runtime panels still use the September 27 study.
 # Paper-style figures honor `BD_RATE_SHOW_HEADERS` and
 # `BD_RATE_SHOW_MISSING_DATA`, both off by default. Resolution panels retain
 # short names; cohort counts, quality supports, interval, and timing completeness
@@ -3980,6 +4022,8 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
         quality_range=CALIBRATED_BD_RATE_QUALITY_RANGE,
         common_cohort=CALIBRATED_BD_RATE_COMMON_COHORT,
         minimum_timing_samples=CALIBRATED_BD_RATE_MIN_TIMING_SAMPLES,
+        dcc_layout=CALIBRATED_BD_RATE_DCC_LAYOUT,
+        show_full_border=BD_RATE_SHOW_FULL_BORDER,
         show_headers=BD_RATE_SHOW_HEADERS,
         show_missing_data=BD_RATE_SHOW_MISSING_DATA,
         show_legend=BD_RATE_SHOW_LEGEND,
@@ -4102,11 +4146,13 @@ if (__name__ == "__main__" and "ipykernel" in sys.modules
 # report retains both original decoder identities and the supporting evidence;
 # sampled checks are not represented as exhaustive verification.
 #
-# The local CUDA view reuses CPU fixed scores E1–E8 with the accepted same-source
-# decoder assumption. Every row uses the same 62 images, excluding all three
-# 48 MP images from both encoders because higher CUDA efforts ran out of memory.
-# Kodak remains included. CPU E9/E10 fixed scores are unavailable; their calibrated
-# observations do not supply additional rows in this fixed-sweep table.
+# The refreshed local CUDA view covers CPU/GJXL E1–E10, retaining CPU E1–E8
+# scores and newly scoring E9/E10 outputs with the same pinned tools. It uses
+# the accepted same-source decoder assumption. Every row uses the same 62 images,
+# excluding all three 48 MP images from both encoders because higher CUDA efforts
+# ran out of memory.
+# Kodak remains included. Calibrated observations remain separate from this
+# fixed-sweep table. The older local snapshot covers E1–E8 only.
 # Only saved data is read; no encoding, scoring, or calibration is launched.
 #
 # Exports: `bd-rate-same-effort.csv`, `.tex`, `.html`, and `-report.json`.
@@ -4246,8 +4292,8 @@ if __name__ == "__main__" and "ipykernel" in sys.modules:
 # %% [markdown]
 # ## 9. Measured libjxl versus GJXL
 #
-# GJXL_RUN selects a separate forced fully-resident Metal study. The comparison
-# uses the configured saved 65-image study alongside the paused libjxl baseline.
+# GJXL_RUN selects a separate fully-resident GPU study (CUDA on this machine).
+# The comparison uses the configured saved 65-image study and libjxl baseline.
 # A composite may combine separately measured builds by effort; consult its
 # metadata.json for the exact revision and source ledger for each effort.
 # Unresolved targets retain their original coverage limits;
